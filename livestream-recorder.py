@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, signal, threading, ctypes, urllib.parse
+import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, signal, threading, ctypes, urllib.parse, browser_cookie3
 from pathlib import Path
 from chat_downloader import ChatDownloader
 from yt_dlp.utils import sanitize_filename
@@ -30,10 +30,9 @@ class LivestreamRecorder:
             "output"            : "/mnt/nvme/livestream-recorder/tempfiles",
             "obsidian"          : "/mnt/nas/edit-video_library/Tenma Maemi/notes/MaemiArchive/Tenma Maemi Livestreams.md",
             "nas_path"          : "/mnt/nas/edit-video_library/Tenma Maemi/raws",
-            "cookies_file"      : "/mnt/nvme/livestream-recorder/cookies.txt",
             "check_interval"    : 120,
             "cleanup_hour"      :   3, # Hour to run daily cleanup (3 AM)
-            "cooldown_duration" : 300  # Block monitoring post termination (seconds)
+            "cooldown_duration" : 30  # Block monitoring post termination (seconds)
         }
         
         # Intitial checks
@@ -119,7 +118,7 @@ class LivestreamRecorder:
         
         for platform, service_config in services.items():
             try:
-                cmd = ["yt-dlp", "--dump-json"] + service_config['extra_args'] + [service_config['url']]
+                cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json"] + service_config['extra_args'] + [service_config['url']]
                 process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                 
                 if process.returncode != 0:
@@ -216,14 +215,9 @@ class LivestreamRecorder:
                 "--fragment-retries",     "10",
                 "--retry-sleep",          "5",
                 "--socket-timeout",       "120",
+                "--cookies-from-browser", "firefox",
                 "--live-from-start",
             ]
-            if os.path.exists(self.config["cookies_file"]):
-                cmd.extend(["--cookies", self.config["cookies_file"]])
-                logger.info(f"Using cookies file: {self.config['cookies_file']}")
-            else:
-                logger.warning(f"Cookies file not found: {self.config['cookies_file']}")
-                logger.warning("Some streams might not be accessible without authentication")
             cmd.append(url)
             
             process = subprocess.Popen(cmd, cwd=self.config["output"])
@@ -545,8 +539,12 @@ class LivestreamRecorder:
                 # If we have active streams, show status
                 if self.active_streams:
                     self.first_void_ping = True
-                    active_count = len(self.active_streams)
-                    logger.info(f"Active streams: {active_count}")
+
+                    if self.first_stream_ping:
+                        active_count = len(self.active_streams)
+                        logger.info(f"Active streams: {active_count}")
+                        self.first_stream_ping = False
+
                 else:
                     # Check if we're in cooldown period
                     if not self.is_monitoring_allowed():
@@ -562,6 +560,7 @@ class LivestreamRecorder:
                         logger.info("No active streams, checking for new livestreams")
                         print()
                         self.first_void_ping = False
+                        self.first_stream_ping = True
                     
                     # Reset status line count to ensure proper overwriting
                     self.last_status_line_count = 1
