@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, signal, threading, ctypes, urllib.parse, browser_cookie3
+import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, signal, threading, ctypes, urllib.parse
 from pathlib import Path
 from chat_downloader import ChatDownloader
 from yt_dlp.utils import sanitize_filename
@@ -533,8 +533,11 @@ class LivestreamRecorder:
                 # Check if we should run daily cleanup
                 now = datetime.datetime.now()
                 if (now.hour == self.config["cleanup_hour"] and self.last_cleanup_date != now.date()):
-                    self.daily_maintenance()
-                    self.last_cleanup_date = datetime.datetime.now().date()
+                    if self.active_streams:
+                        logger.info("Skipping daily maintenance - active streams in progress")
+                    else:
+                        self.daily_maintenance()
+                        self.last_cleanup_date = datetime.datetime.now().date()
                 
                 # If we have active streams, show status
                 if self.active_streams:
