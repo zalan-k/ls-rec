@@ -2,8 +2,8 @@
 
 import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, signal, threading, ctypes, urllib.parse
 from pathlib import Path
-from chat_downloader import ChatDownloader
 from yt_dlp.utils import sanitize_filename
+from chat_downloader import ChatDownloader
 
 # Setup logging with proper UTF-8 encoding
 logging.basicConfig(
@@ -28,11 +28,11 @@ class LivestreamRecorder:
             "youtube"           : '@TenmaMaemi',
             "twitch"            : 'tenma',
             "output"            : "/mnt/nvme/livestream-recorder/tempfiles",
-            "obsidian"          : "/mnt/nas/edit-video_library/Tenma Maemi/notes/MaemiArchive/Tenma Maemi Livestreams.md",
-            "nas_path"          : "/mnt/nas/edit-video_library/Tenma Maemi/raws",
-            "check_interval"    : 120,
+            "obsidian"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/Tenma Maemi Livestreams.md",
+            "nas_path"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/raws",
+            "check_interval"    : 120, # Check every 2 minutes
             "cleanup_hour"      :   3, # Hour to run daily cleanup (3 AM)
-            "cooldown_duration" : 30  # Block monitoring post termination (seconds)
+            "cooldown_duration" :  30  # Block monitoring post termination (seconds)
         }
         
         # Intitial checks
@@ -134,11 +134,13 @@ class LivestreamRecorder:
                         if platform == 'youtube':
                             stream_url = f"https://www.youtube.com/watch?v={video_id}"
                             obsidian_title = stream_data.get('fulltitle')
+                            obsidian_url = stream_url
                             raw_title = f"{obsidian_title} [{video_id}] @ {timestamp}"
                             stream_title = sanitize_filename(raw_title)
                         else:  # twitch
                             stream_url = service_config['url']
                             obsidian_title = stream_data.get('description')
+                            obsidian_url = f"{service_config['url']}/video/{video_id.lstrip('v')}"
                             raw_title = f"{obsidian_title} [{video_id}] @ {timestamp}"
                             stream_title = sanitize_filename(raw_title)
                             
@@ -146,7 +148,7 @@ class LivestreamRecorder:
 
                         stream_key = f"{platform}_{video_id}"
                         if stream_key not in self.active_streams:
-                            self.start_stream_recording(stream_url, platform, video_id, stream_title, obsidian_title)
+                            self.start_stream_recording(stream_url, platform, video_id, stream_title, obsidian_title, obsidian_url)
                         
                 except json.JSONDecodeError:
                     logger.warning(f"Could not parse yt-dlp output for {platform}")
@@ -156,12 +158,12 @@ class LivestreamRecorder:
             except Exception as e:
                 logger.error(f"Error checking {platform}: {str(e)}")
 
-    def start_stream_recording(self, url, platform, identifier, stream_title, obsidian_title):
+    def start_stream_recording(self, url, platform, identifier, stream_title, obsidian_title, obsidian_url):
         """Start recording a complete stream (video + chat) in separate threads"""
         logger.info(f"Starting stream recording for {platform}: {stream_title}")
         
         # Update Obsidian log immediately when stream is detected
-        obsidian_entry_info = self.update_obsidian_log(obsidian_title, url)
+        obsidian_entry_info = self.update_obsidian_log(obsidian_title, obsidian_url)
 
         # Create unified stream entry
         stream_key = f"{platform}_{identifier}"
@@ -259,56 +261,100 @@ class LivestreamRecorder:
         stream = self.active_streams[stream_key]
         url = stream["url"]
         platform = stream["platform"]
-        
-        stream_start = int(stream["start_time"].timestamp() * 1_000_000)
-        output_path = os.path.join(self.config["output"], f"{stream['stream_title']}.json")
-        
+        stream_title = stream["stream_title"]
         try:
-            chat_downloader = ChatDownloader()
             stop_event = threading.Event()
             self.active_streams[stream_key]["chat_stop_event"] = stop_event
-            
-            def chat_download_thread():
-                try:
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        f.write('[\n')  # Start JSON array
-                        first_message = True
+
+            if platform == "twitch":
+                stream_start = int(stream["start_time"].timestamp() * 1_000_000)
+                output_path = os.path.join(self.config["output"], f"{stream_title}.json")
+                
+                def chat_download_thread():
+                    try:
+                        chat_downloader = ChatDownloader()
+                        with open(output_path, 'w', encoding='utf-8') as f:
+                            f.write('[\n')  # Start JSON array
+                            first_message = True
+                            
+                            chat = chat_downloader.get_chat(
+                                url=url,
+                                message_groups=['all'],
+                                sort_keys=True,
+                                indent=4
+                            )
+                            
+                            for message in chat:
+                                if stop_event.is_set():
+                                    logger.info("Chat download terminated by stop event")
+                                    break
+                                
+                                # Adjust timestamp to be relative to stream start
+                                if 'timestamp' in message:
+                                    original_timestamp = message['timestamp']
+                                    message['timestamp'] = original_timestamp - stream_start
+                                    message['original_timestamp'] = original_timestamp
+                                
+                                # Write message immediately
+                                if not first_message:
+                                    f.write(',\n')
+                                json.dump(message, f, ensure_ascii=False)
+                                f.flush()  # Ensure immediate write
+                                first_message = False
+                                
+                            f.write('\n]')  # Close JSON array
+                            logger.info(f"Chat download completed for: {stream_title}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error in chat download thread: {str(e)}")
+            else:
+                def chat_download_thread():
+                    try:
+                        cmd = [
+                            "yt-dlp",
+                            "--skip-download",
+                            "--write-subs",
+                            "--sub-langs", "live_chat",
+                            "--cookies-from-browser", "firefox",
+                            "-o", f"{stream_title}.%(ext)s",
+                            url
+                        ]
                         
-                        chat = chat_downloader.get_chat(
-                            url=url,
-                            message_groups=['all'],
-                            sort_keys=True,
-                            indent=4
+                        process = subprocess.Popen(
+                            cmd,
+                            cwd=self.config["output"],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True
                         )
                         
-                        for message in chat:
-                            if stop_event.is_set():
-                                logger.info("Chat download terminated by stop event")
-                                break
-                            
-                            # Adjust timestamp to be relative to stream start
-                            if 'timestamp' in message:
-                                original_timestamp = message['timestamp']
-                                message['timestamp'] = original_timestamp - stream_start
-                                message['original_timestamp'] = original_timestamp
-                            
-                            # Write message immediately
-                            if not first_message:
-                                f.write(',\n')
-                            json.dump(message, f, ensure_ascii=False)
-                            f.flush()  # Ensure immediate write
-                            first_message = False
-                            
-                        f.write('\n]')  # Close JSON array
+                        self.active_streams[stream_key]["chat_process"] = process
                         
-                except Exception as e:
-                    logger.error(f"Error in chat download thread: {str(e)}")
-            
+                        # Wait for process to complete or stop event
+                        while process.poll() is None:
+                            if stop_event.is_set():
+                                logger.info("Chat download termination requested")
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                break
+                            time.sleep(0.5)
+                        
+                        if process.returncode == 0:
+                            logger.info(f"Chat download completed for: {stream_title}")
+                        elif not stop_event.is_set():
+                            logger.warning(f"Chat download ended with code {process.returncode}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error in chat download thread: {str(e)}")
+
             thread = threading.Thread(target=chat_download_thread, daemon=True)
             thread.start()
             self.active_streams[stream_key]["chat_thread"] = thread
             logger.info(f"Started chat recording for {platform} stream")
-            
+ 
         except Exception as e:
             logger.error(f"Error starting chat recording for {url}: {str(e)}")
 
@@ -406,8 +452,13 @@ class LivestreamRecorder:
     
     def update_obsidian_log(self, stream_title=None, stream_url=None, 
                             local_file_path=None, update_path_only=False, entry_info=None):
-        """Update Obsidian log using content-based matching"""
-        today = datetime.datetime.now().strftime("%Y.%m.%d")
+        # Get time and timezone info
+        now = datetime.datetime.now()
+        utc_offset = now.astimezone().utcoffset()
+        hours_offset = int(utc_offset.total_seconds() / 3600)
+        tz_str = f"GMT{hours_offset:+d}"
+
+        today = now.strftime(f"%Y.%m.%d %H:%M ({tz_str})")
 
         if not os.path.exists(os.path.dirname(self.config["obsidian"])):
             logger.warning(f"NAS path unavailable: {os.path.dirname(self.config['obsidian'])}")
@@ -430,10 +481,10 @@ class LivestreamRecorder:
                 return None
             
             # Create the new date line with updated path
-            formatted_path = 'file://' + urllib.parse.quote(local_file_path)
+            relative_path = f"raws/{os.path.basename(local_file_path)}"
             new_date_line = re.sub(r'\[📁\]\(.*?\)', 
-                                f'[📁]({formatted_path})', 
-                                original_date_line)
+                    f'[📁]({relative_path})', 
+                    original_date_line)
             
             # Replace only the file path portion in the original content block
             content_block = original_entry + original_date_line
@@ -524,7 +575,7 @@ class LivestreamRecorder:
         """Main loop to check for livestreams and manage recordings"""
         logger.info("Starting Enhanced Livestream Recorder")
         logger.info(f"Checking every {self.config['check_interval']} seconds")
-        logger.info(f"Daily cleanup scheduled for {self.config['cleanup_hour']}:00")
+        # logger.info(f"Weekly cleanup scheduled for {self.config['cleanup_hour']}:00")
         logger.info(f"Manual termination cooldown: {self.config['cooldown_duration']} seconds")
         print('-' * 100)
         
@@ -536,7 +587,7 @@ class LivestreamRecorder:
                     if self.active_streams:
                         logger.info("Skipping daily maintenance - active streams in progress")
                     else:
-                        self.daily_maintenance()
+                        # self.daily_maintenance()
                         self.last_cleanup_date = datetime.datetime.now().date()
                 
                 # If we have active streams, show status
