@@ -218,8 +218,10 @@ class LivestreamRecorder:
                 "--retry-sleep",          "5",
                 "--socket-timeout",       "120",
                 "--cookies-from-browser", "firefox",
-                "--live-from-start",
             ]
+            if platform == "youtube":
+                cmd.append("--live-from-start")
+
             cmd.append(url)
             
             process = subprocess.Popen(cmd, cwd=self.config["output"])
