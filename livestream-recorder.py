@@ -220,7 +220,7 @@ class LivestreamRecorder:
                 "--cookies-from-browser", "firefox",
             ]
             if platform == "youtube":
-                cmd.append("--live-from-start")
+                cmd.extend(["--live-from-start", "--js-runtimes", "node"])
 
             cmd.append(url)
             
@@ -318,6 +318,7 @@ class LivestreamRecorder:
                             "--write-subs",
                             "--sub-langs", "live_chat",
                             "--cookies-from-browser", "firefox",
+                            "--js-runtimes", "node"
                             "-o", f"{stream_title}.%(ext)s",
                             url
                         ]
