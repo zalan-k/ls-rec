@@ -27,12 +27,14 @@ class LivestreamRecorder:
         self.config = {
             "youtube"           : '@TenmaMaemi',
             "twitch"            : 'tenma',
+            "priority"          : "youtube",
             "output"            : "/mnt/nvme/livestream-recorder/tempfiles",
             "obsidian"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/Tenma Maemi Livestreams.md",
             "nas_path"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/raws",
-            "check_interval"    : 120, # Check every 2 minutes
-            "cleanup_hour"      :   3, # Hour to run daily cleanup (3 AM)
-            "cooldown_duration" :  30  # Block monitoring post termination (seconds)
+            "check_interval"    : 120,
+            "cleanup_hour"      :   3,
+            "cooldown_duration" :  30,
+            "dual_stream_cycle" :   3
         }
         
         # Intitial checks
@@ -41,6 +43,7 @@ class LivestreamRecorder:
         self.check_disk_space()
         
         # Initialize variables for cleaner console output
+        self.first_stream_ping = True
         self.last_status_line_count = 0
         self.first_void_ping = True
         self.last_cleanup_date = None
@@ -143,12 +146,30 @@ class LivestreamRecorder:
                             obsidian_url = f"{service_config['url']}/video/{video_id.lstrip('v')}"
                             raw_title = f"{obsidian_title} [{video_id}] @ {timestamp}"
                             stream_title = sanitize_filename(raw_title)
-                            
-                        logger.info(f"Found active {platform.capitalize()} livestream: {stream_title} ({stream_url})")
+
 
                         stream_key = f"{platform}_{video_id}"
                         if stream_key not in self.active_streams:
-                            self.start_stream_recording(stream_url, platform, video_id, stream_title, obsidian_title, obsidian_url)
+                            logger.info(f"Found new active {platform.capitalize()} livestream: {stream_title} ({stream_url})")
+
+                            # Dual-stream detection
+                            mode_overrides = {}
+                            other_platform = "twitch" if platform == "youtube" else "youtube"
+                            window_seconds = self.config["dual_stream_cycle"] * self.config["check_interval"]
+                            for existing_key, existing_stream in self.active_streams.items():
+                                if existing_stream["platform"] != other_platform:
+                                    continue
+                                
+                                time_diff = (datetime.datetime.now() - existing_stream["start_time"]).total_seconds()
+                                if time_diff > window_seconds:
+                                    continue
+                                
+                                if platform == self.config['priority']:
+                                    self._update_stream_mode(existing_key, download_video=False) # YouTube starting, demote Twitch
+                                else:
+                                    mode_overrides["download_video"] = False # Twitch starting, skip video for this one
+
+                            self.start_stream_recording(stream_url, platform, video_id, stream_title, obsidian_title, obsidian_url, **mode_overrides)
                         
                 except json.JSONDecodeError:
                     logger.warning(f"Could not parse yt-dlp output for {platform}")
@@ -158,12 +179,55 @@ class LivestreamRecorder:
             except Exception as e:
                 logger.error(f"Error checking {platform}: {str(e)}")
 
-    def start_stream_recording(self, url, platform, identifier, stream_title, obsidian_title, obsidian_url):
+    def _update_stream_mode(self, stream_key, download_video=None, download_chat=None):
+        """Update stream download mode and handle process termination if needed"""
+        if stream_key not in self.active_streams:
+            return
+        
+        stream = self.active_streams[stream_key]
+        stream_title = stream["stream_title"]
+        
+        # Handle video state change
+        if download_video is not None and stream["download_video"] != download_video:
+            stream["download_video"] = download_video
+            
+            if not download_video:
+                logger.info(f"Disabling video download for: {stream_title}")
+                
+                # Terminate video process
+                video_process = stream.get("video_process")
+                if video_process and video_process.poll() is None:
+                    video_process.terminate()
+                    try:
+                        video_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        video_process.kill()
+                    stream["video_process"] = None
+                
+                # Clean up video files
+                for ext in [".mp4", ".mp4.part"]:
+                    video_file = os.path.join(self.config["output"], f"{stream_title}{ext}")
+                    if os.path.exists(video_file):
+                        os.remove(video_file)
+                        logger.info(f"Deleted: {stream_title}{ext}")
+        
+        # Handle chat state change (if you ever need it)
+        if download_chat is not None and stream["download_chat"] != download_chat:
+            stream["download_chat"] = download_chat
+            
+            if not download_chat:
+                logger.info(f"Disabling chat download for: {stream_title}")
+                if stream.get("chat_stop_event"):
+                    stream["chat_stop_event"].set()
+
+    def start_stream_recording(self, url, platform, identifier, stream_title, obsidian_title, obsidian_url, download_video=True, download_chat=True):
         """Start recording a complete stream (video + chat) in separate threads"""
         logger.info(f"Starting stream recording for {platform}: {stream_title}")
         
         # Update Obsidian log immediately when stream is detected
         obsidian_entry_info = self.update_obsidian_log(obsidian_title, obsidian_url)
+        obsidian_index = f"{obsidian_entry_info.get('index', 0):03d}" if obsidian_entry_info else 'XXX'
+        stream_title = f"{obsidian_index}_{stream_title}"
 
         # Create unified stream entry
         stream_key = f"{platform}_{identifier}"
@@ -178,7 +242,9 @@ class LivestreamRecorder:
             "chat_thread"           : None,
             "chat_stop_event"       : None,
             "base_filename"         : stream_title,
-            "obsidian_entry_info"   : obsidian_entry_info
+            "obsidian_entry_info"   : obsidian_entry_info,
+            "download_chat"         : download_chat,
+            "download_video"        : download_video
         }
         
         # Start video recording in a separate thread
@@ -200,6 +266,11 @@ class LivestreamRecorder:
     def start_video_recording(self, stream_key):
         """Start video recording for a stream"""
         stream = self.active_streams[stream_key]
+
+        if not stream.get("download_video", True):
+            logger.info(f"Video download disabled for: {stream['stream_title']}")
+            return
+
         url = stream["url"]
         platform = stream["platform"]
         stream_title = stream["stream_title"]
@@ -261,6 +332,11 @@ class LivestreamRecorder:
     def start_chat_recording(self, stream_key):
         """Start incremental chat recording for a stream"""
         stream = self.active_streams[stream_key]
+
+        if not stream.get("download_chat", True):
+            logger.info(f"Chat download disabled for: {stream['stream_title']}")
+            return
+        
         url = stream["url"]
         platform = stream["platform"]
         stream_title = stream["stream_title"]
@@ -318,7 +394,7 @@ class LivestreamRecorder:
                             "--write-subs",
                             "--sub-langs", "live_chat",
                             "--cookies-from-browser", "firefox",
-                            "--js-runtimes", "node"
+                            "--js-runtimes", "node", 
                             "-o", f"{stream_title}.%(ext)s",
                             url
                         ]
@@ -342,13 +418,16 @@ class LivestreamRecorder:
                                     process.wait(timeout=5)
                                 except subprocess.TimeoutExpired:
                                     process.kill()
+                                self._merge_chat_fragments(stream_title)
                                 break
                             time.sleep(0.5)
                         
                         if process.returncode == 0:
                             logger.info(f"Chat download completed for: {stream_title}")
+                            self._merge_chat_fragments(stream_title)
                         elif not stop_event.is_set():
                             logger.warning(f"Chat download ended with code {process.returncode}")
+                            self._merge_chat_fragments(stream_title)
                             
                     except Exception as e:
                         logger.error(f"Error in chat download thread: {str(e)}")
@@ -360,6 +439,49 @@ class LivestreamRecorder:
  
         except Exception as e:
             logger.error(f"Error starting chat recording for {url}: {str(e)}")
+
+    def _merge_chat_fragments(self, stream_title):
+        """Merge yt-dlp chat fragments into single JSON file"""
+        output_dir = self.config["output"]
+        
+        base = f"{stream_title}.live_chat.json"
+        main_part = os.path.join(output_dir, f"{base}.part")
+        frag_pattern = os.path.join(output_dir, f"{base}.part-Frag*.part")
+        final_output = os.path.join(output_dir, f"{stream_title}.json")
+        
+        try:
+            all_lines = []
+            
+            # Read main part file
+            if os.path.exists(main_part):
+                with open(main_part, 'r', encoding='utf-8') as f:
+                    all_lines.extend(f.readlines())
+            
+            # Read fragment files in order
+            frag_files = sorted(glob.glob(frag_pattern))
+            for frag_file in frag_files:
+                with open(frag_file, 'r', encoding='utf-8') as f:
+                    all_lines.extend(f.readlines())
+            
+            if not all_lines:
+                logger.warning(f"No chat data found for {stream_title}")
+                return False
+            
+            # Write merged output
+            with open(final_output, 'w', encoding='utf-8') as f:
+                f.writelines(all_lines)
+            
+            # Clean up part files
+            if os.path.exists(main_part):
+                os.remove(main_part)
+            for frag_file in frag_files:
+                os.remove(frag_file)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error merging chat fragments: {str(e)}")
+            return False
 
     def _upload_file(self, src, dst):
         """Unified file upload handler"""
@@ -526,12 +648,12 @@ class LivestreamRecorder:
             with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
                 f.write(new_content)
             
-            # Return full entry info for future updates
             entry_info = {
-                "entry_line": entry_line,
-                "date_line": date_line,
-                "stream_title": stream_title,
-                "stream_url": stream_url
+                "entry_line"    : entry_line,
+                "date_line"     : date_line,
+                "stream_title"  : stream_title,
+                "stream_url"    : stream_url,
+                "index"         : index
             }
             
             logger.info(f"Created new Obsidian entry #{index_str} for {stream_title}")
