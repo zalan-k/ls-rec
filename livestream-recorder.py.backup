@@ -104,155 +104,6 @@ class LivestreamRecorder:
         
         return False
     
-    def get_stream_index(self, platform, start_time):
-        """Get index for new stream, sharing with dual-stream partner if detected"""
-        window_seconds = self.config["dual_stream_cycle"] * self.config["check_interval"]
-        other_platform = "twitch" if platform == "youtube" else "youtube"
-        
-        # Check for dual-stream partner
-        for stream in self.active_streams.values():
-            if stream["platform"] != other_platform:
-                continue
-            time_diff = abs((start_time - stream["start_time"]).total_seconds())
-            if time_diff <= window_seconds:
-                # Found partner - share its index
-                return stream["obsidian_index"], True
-        
-        # No partner - get new index from Obsidian
-        return self.get_next_obsidian_index(), False
-    
-    def get_next_obsidian_index(self):
-        """Get the next available index from the Obsidian log file"""
-        if not os.path.exists(self.config["obsidian"]):
-            return 1
-        
-        try:
-            with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            if matches := re.findall(r'\[(\d{3})_', content):
-                return max(int(m) for m in matches) + 1
-            return 1
-        except Exception as e:
-            logger.error(f"Error reading obsidian file for index: {str(e)}")
-            return 1
-    
-    def create_obsidian_entry(self, index, title, url):
-        """Create a new Obsidian entry with full structure (first detection)"""
-        if not os.path.exists(os.path.dirname(self.config["obsidian"])):
-            logger.warning(f"NAS path unavailable: {os.path.dirname(self.config['obsidian'])}")
-            return False
-        
-        # Get timestamp
-        now = datetime.datetime.now()
-        utc_offset = now.astimezone().utcoffset()
-        hours_offset = int(utc_offset.total_seconds() / 3600)
-        tz_str = f"GMT{hours_offset:+d}"
-        today = now.strftime(f"%Y.%m.%d %H:%M ({tz_str})")
-        
-        try:
-            # Read existing content
-            try:
-                with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                    content = f.read()
-            except FileNotFoundError:
-                content = ""
-            
-            # Create new entry
-            entry_line = f"- [ ] [{index:03d}_{title}]({url})\n"
-            date_line = f"\t{today} [📁]() [🖿]()\n\n"
-            
-            # Prepend new entry
-            new_content = entry_line + date_line + content
-            
-            with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            
-            logger.info(f"Created new Obsidian entry #{index:03d} for {title}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error creating obsidian entry: {str(e)}")
-            return False
-    
-    def append_dual_stream_line(self, index, title, url):
-        """Append a title line to an existing entry (dual-stream partner detection)"""
-        if not os.path.exists(self.config["obsidian"]):
-            logger.warning("Obsidian file not found for dual-stream append")
-            return False
-        
-        try:
-            with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Find the entry by index pattern: - [ ] [XXX_
-            pattern = rf'(- \[ \] \[{index:03d}_[^\n]+\n)'
-            match = re.search(pattern, content)
-            
-            if not match:
-                logger.warning(f"Could not find entry #{index:03d} for dual-stream append")
-                return False
-            
-            # Insert new title line after the main entry line
-            original_line = match.group(1)
-            new_title_line = f"\t[{title}]({url})\n"
-            replacement = original_line + new_title_line
-            
-            new_content = content.replace(original_line, replacement)
-            
-            with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            
-            logger.info(f"Appended dual-stream line to entry #{index:03d}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error appending dual-stream line: {str(e)}")
-            return False
-    
-    def update_obsidian_path(self, index, platform, file_path):
-        """Update the file path in an Obsidian entry by index"""
-        if not os.path.exists(self.config["obsidian"]):
-            logger.warning("Obsidian file not found for path update")
-            return False
-        
-        try:
-            with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Find the entry block by index
-            # Match from the entry line through the date line with file links
-            pattern = rf'(- \[ \] \[{index:03d}_[^\n]+\n(?:\t\[[^\]]+\]\([^\)]+\)\n)*\t[^\[]+)(\[📁\]\([^\)]*\)) (\[🖿\]\([^\)]*\))'
-            match = re.search(pattern, content)
-            
-            if not match:
-                logger.warning(f"Could not find entry #{index:03d} for path update")
-                return False
-            
-            prefix = match.group(1)
-            yt_link = match.group(2)
-            tw_link = match.group(3)
-            
-            relative_path = f"raws/{os.path.basename(file_path)}"
-            
-            if platform == "youtube":
-                yt_link = f"[📁]({relative_path})"
-            else:
-                tw_link = f"[🖿]({relative_path})"
-            
-            new_block = f"{prefix}{yt_link} {tw_link}"
-            new_content = content[:match.start()] + new_block + content[match.end():]
-            
-            with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            
-            logger.info(f"Updated Obsidian path for entry #{index:03d} ({platform})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating obsidian path: {str(e)}")
-            return False
-
     def check_stream_status(self):
         if not self.is_monitoring_allowed():
             return
@@ -301,12 +152,24 @@ class LivestreamRecorder:
                         if stream_key not in self.active_streams:
                             logger.info(f"Found new active {platform.capitalize()} livestream: {stream_title} ({stream_url})")
 
-                            # Get index (shared with dual-stream partner if detected)
-                            obsidian_index, is_dual = self.get_stream_index(platform, datetime.datetime.now())
-                            if is_dual:
-                                logger.info(f"Dual-stream detected, sharing index {obsidian_index:03d}")
+                            # Dual-stream detection
+                            mode_overrides = {}
+                            other_platform = "twitch" if platform == "youtube" else "youtube"
+                            window_seconds = self.config["dual_stream_cycle"] * self.config["check_interval"]
+                            for existing_key, existing_stream in self.active_streams.items():
+                                if existing_stream["platform"] != other_platform:
+                                    continue
+                                
+                                time_diff = (datetime.datetime.now() - existing_stream["start_time"]).total_seconds()
+                                if time_diff > window_seconds:
+                                    continue
+                                
+                                if platform == self.config['priority']:
+                                    self._update_stream_mode(existing_key, download_video=False) # YouTube starting, demote Twitch
+                                else:
+                                    mode_overrides["download_video"] = False # Twitch starting, skip video for this one
 
-                            self.start_stream_recording(stream_url, platform, video_id, stream_title, obsidian_title, obsidian_url, obsidian_index, is_dual)
+                            self.start_stream_recording(stream_url, platform, video_id, stream_title, obsidian_title, obsidian_url, **mode_overrides)
                         
                 except json.JSONDecodeError:
                     logger.warning(f"Could not parse yt-dlp output for {platform}")
@@ -316,18 +179,55 @@ class LivestreamRecorder:
             except Exception as e:
                 logger.error(f"Error checking {platform}: {str(e)}")
 
-    def start_stream_recording(self, url, platform, identifier, stream_title, obsidian_title, obsidian_url, obsidian_index, is_dual):
+    def _update_stream_mode(self, stream_key, download_video=None, download_chat=None):
+        """Update stream download mode and handle process termination if needed"""
+        if stream_key not in self.active_streams:
+            return
+        
+        stream = self.active_streams[stream_key]
+        stream_title = stream["stream_title"]
+        
+        # Handle video state change
+        if download_video is not None and stream["download_video"] != download_video:
+            stream["download_video"] = download_video
+            
+            if not download_video:
+                logger.info(f"Disabling video download for: {stream_title}")
+                
+                # Terminate video process
+                video_process = stream.get("video_process")
+                if video_process and video_process.poll() is None:
+                    video_process.terminate()
+                    try:
+                        video_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        video_process.kill()
+                    stream["video_process"] = None
+                
+                # Clean up video files
+                for ext in [".mp4", ".mp4.part"]:
+                    video_file = os.path.join(self.config["output"], f"{stream_title}{ext}")
+                    if os.path.exists(video_file):
+                        os.remove(video_file)
+                        logger.info(f"Deleted: {stream_title}{ext}")
+        
+        # Handle chat state change (if you ever need it)
+        if download_chat is not None and stream["download_chat"] != download_chat:
+            stream["download_chat"] = download_chat
+            
+            if not download_chat:
+                logger.info(f"Disabling chat download for: {stream_title}")
+                if stream.get("chat_stop_event"):
+                    stream["chat_stop_event"].set()
+
+    def start_stream_recording(self, url, platform, identifier, stream_title, obsidian_title, obsidian_url, download_video=True, download_chat=True):
         """Start recording a complete stream (video + chat) in separate threads"""
         logger.info(f"Starting stream recording for {platform}: {stream_title}")
         
-        # Update Obsidian log
-        if is_dual:
-            self.append_dual_stream_line(obsidian_index, obsidian_title, obsidian_url)
-        else:
-            self.create_obsidian_entry(obsidian_index, obsidian_title, obsidian_url)
-        
-        # Prepend index to stream title for filename
-        stream_title = f"{obsidian_index:03d}_{stream_title}"
+        # Update Obsidian log immediately when stream is detected
+        obsidian_entry_info = self.update_obsidian_log(obsidian_title, obsidian_url)
+        obsidian_index = f"{obsidian_entry_info.get('index', 0):03d}" if obsidian_entry_info else 'XXX'
+        stream_title = f"{obsidian_index}_{stream_title}"
 
         # Create unified stream entry
         stream_key = f"{platform}_{identifier}"
@@ -341,7 +241,10 @@ class LivestreamRecorder:
             "video_process"         : None,
             "chat_thread"           : None,
             "chat_stop_event"       : None,
-            "obsidian_index"        : obsidian_index
+            "base_filename"         : stream_title,
+            "obsidian_entry_info"   : obsidian_entry_info,
+            "download_chat"         : download_chat,
+            "download_video"        : download_video
         }
         
         # Start video recording in a separate thread
@@ -363,6 +266,11 @@ class LivestreamRecorder:
     def start_video_recording(self, stream_key):
         """Start video recording for a stream"""
         stream = self.active_streams[stream_key]
+
+        if not stream.get("download_video", True):
+            logger.info(f"Video download disabled for: {stream['stream_title']}")
+            return
+
         url = stream["url"]
         platform = stream["platform"]
         stream_title = stream["stream_title"]
@@ -424,6 +332,11 @@ class LivestreamRecorder:
     def start_chat_recording(self, stream_key):
         """Start incremental chat recording for a stream"""
         stream = self.active_streams[stream_key]
+
+        if not stream.get("download_chat", True):
+            logger.info(f"Chat download disabled for: {stream['stream_title']}")
+            return
+        
         url = stream["url"]
         platform = stream["platform"]
         stream_title = stream["stream_title"]
@@ -600,8 +513,7 @@ class LivestreamRecorder:
             
         stream = self.active_streams[stream_key]
         stream_title = stream["stream_title"]
-        platform = stream["platform"]
-        obsidian_index = stream.get("obsidian_index")
+        obsidian_entry_info = stream.get("obsidian_entry_info")
         
         logger.info(f"Handling completion of stream: {stream_title}")
         try:
@@ -646,8 +558,12 @@ class LivestreamRecorder:
                         logger.warning(f"Chat file too small, skipping upload: {chat_file}")
                 
                 # Update Obsidian log with server file path
-                if uploaded_path and obsidian_index:
-                    self.update_obsidian_path(obsidian_index, platform, uploaded_path)
+                if uploaded_path:
+                    self.update_obsidian_log(
+                        local_file_path=uploaded_path,
+                        update_path_only=True,
+                        entry_info=obsidian_entry_info
+                    )
                     logger.info(f"Successfully uploaded and logged: {stream_title}")
             
             # Remove from active streams
@@ -659,6 +575,92 @@ class LivestreamRecorder:
             if stream_key in self.active_streams:
                 del self.active_streams[stream_key]
     
+    def update_obsidian_log(self, stream_title=None, stream_url=None, 
+                            local_file_path=None, update_path_only=False, entry_info=None):
+        # Get time and timezone info
+        now = datetime.datetime.now()
+        utc_offset = now.astimezone().utcoffset()
+        hours_offset = int(utc_offset.total_seconds() / 3600)
+        tz_str = f"GMT{hours_offset:+d}"
+
+        today = now.strftime(f"%Y.%m.%d %H:%M ({tz_str})")
+
+        if not os.path.exists(os.path.dirname(self.config["obsidian"])):
+            logger.warning(f"NAS path unavailable: {os.path.dirname(self.config['obsidian'])}")
+            return None
+
+        try:
+            with open(self.config["obsidian"], 'r+', encoding='utf-8') as f:
+                content = f.read()
+        except FileNotFoundError:
+            content = ""
+
+        # Handle path-only updates using stored entry info
+        if update_path_only and entry_info and local_file_path:
+            # Extract the original entry lines we need to find
+            original_entry = entry_info.get("entry_line", "")
+            original_date_line = entry_info.get("date_line", "")
+            
+            if not original_entry or not original_date_line:
+                logger.warning("Invalid entry info for update")
+                return None
+            
+            # Create the new date line with updated path
+            relative_path = f"raws/{os.path.basename(local_file_path)}"
+            new_date_line = re.sub(r'\[📁\]\(.*?\)', 
+                    f'[📁]({relative_path})', 
+                    original_date_line)
+            
+            # Replace only the file path portion in the original content block
+            content_block = original_entry + original_date_line
+            new_block = original_entry + new_date_line
+            
+            # Perform the replacement
+            if content_block in content:
+                new_content = content.replace(content_block, new_block)
+                
+                # Write back to file
+                with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+                
+                logger.info(f"Updated Obsidian log entry with file path: {local_file_path}")
+                return entry_info
+            else:
+                logger.warning("Original entry not found in log file")
+                return None
+        
+        # Creating a new entry
+        if not update_path_only and stream_title and stream_url:
+            # Find next available index
+            index = 1
+            if matches := re.findall(r'\[(\d{3})_', content):
+                index = max(int(m) for m in matches) + 1
+            
+            index_str = f'{index:03d}'
+            
+            # Create new entry blocks
+            entry_line = f"- [ ] [{index_str}_{stream_title}]({stream_url})\n"
+            date_line = f"\t{today} [📁]()\n\n"
+            
+            # Prepend new entry
+            new_content = entry_line + date_line + content
+            
+            with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            
+            entry_info = {
+                "entry_line"    : entry_line,
+                "date_line"     : date_line,
+                "stream_title"  : stream_title,
+                "stream_url"    : stream_url,
+                "index"         : index
+            }
+            
+            logger.info(f"Created new Obsidian entry #{index_str} for {stream_title}")
+            return entry_info
+        
+        return None
+
     def daily_maintenance(self):
         logger.info("Running daily maintenance routine...")
         
