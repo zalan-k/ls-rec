@@ -381,9 +381,11 @@ class LivestreamRecorder:
                 "--retry-sleep",          "5",
                 "--socket-timeout",       "120",
                 "--cookies-from-browser", "firefox",
+                "--hls-use-mpegts"
+
             ]
             if platform == "youtube":
-                cmd.extend("--live-from-start")
+                cmd.extend(["--live-from-start"])
 
             cmd.append(url)
             
