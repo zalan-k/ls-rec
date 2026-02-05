@@ -24,7 +24,7 @@ class LivestreamRecorder:
             "output"            : "/mnt/nvme/livestream-recorder/tempfiles",
             "obsidian"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/Tenma Maemi Livestreams.md",
             "nas_path"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/raws",
-            "check_interval"    : 120,
+            "check_interval"    :  60,
             "cleanup_hour"      :   3,
             "cooldown_duration" :  30,
             "dual_stream_cycle" :   3
@@ -336,8 +336,8 @@ class LivestreamRecorder:
                 "--hls-use-mpegts"
 
             ]
-            if platform == "youtube":
-                cmd.extend(["--live-from-start"])
+            # if platform == "youtube":
+                # cmd.extend(["--live-from-start"])
 
             cmd.append(url)
             
