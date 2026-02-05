@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 
-import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, signal, threading, ctypes, urllib.parse
+import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, signal, threading, ctypes, urllib.parse, socket
 from pathlib import Path
 from yt_dlp.utils import sanitize_filename
-from chat_downloader import ChatDownloader
 
 # Setup logging with proper UTF-8 encoding
 logging.basicConfig(
@@ -11,16 +10,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("livestream_recorder.log", encoding='utf-8'),
-        logging.StreamHandler()
+        logging.StreamHandler(stream=open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1))
     ]
 )
 logger = logging.getLogger("LivestreamRecorder")
-
-def sanitize_for_logging(text):
-    """Sanitize text for logging to avoid Unicode encoding errors"""
-    if not isinstance(text, str):
-        return str(text)
-    return ''.join(char if ord(char) < 128 else ' ' for char in text)
 
 class LivestreamRecorder:
     def __init__(self):
@@ -120,7 +113,7 @@ class LivestreamRecorder:
         
         # No partner - get new index from Obsidian
         return self.get_next_obsidian_index(), False
-    
+
     def get_next_obsidian_index(self):
         """Get the next available index from the Obsidian log file"""
         if not os.path.exists(self.config["obsidian"]):
@@ -130,127 +123,86 @@ class LivestreamRecorder:
             with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            if matches := re.findall(r'\[(\d{3})_', content):
+            if matches := re.findall(r'\*\*(\d{3})\*\*', content):
                 return max(int(m) for m in matches) + 1
             return 1
         except Exception as e:
             logger.error(f"Error reading obsidian file for index: {str(e)}")
             return 1
     
-    def create_obsidian_entry(self, index, title, url):
-        """Create a new Obsidian entry with full structure (first detection)"""
+    def create_obsidian_entry(self, index, platform, title, url):
+        """Create a new Obsidian entry with both platform lines"""
         if not os.path.exists(os.path.dirname(self.config["obsidian"])):
             logger.warning(f"NAS path unavailable: {os.path.dirname(self.config['obsidian'])}")
             return False
         
-        # Get timestamp
         now = datetime.datetime.now()
         utc_offset = now.astimezone().utcoffset()
         hours_offset = int(utc_offset.total_seconds() / 3600)
         tz_str = f"GMT{hours_offset:+d}"
         today = now.strftime(f"%Y.%m.%d %H:%M ({tz_str})")
         
+        yt_line = f"[{title}]({url})" if platform == "youtube" else ""
+        tw_line = f"[{title}]({url})" if platform == "twitch" else ""
+        
         try:
-            # Read existing content
             try:
                 with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
                     content = f.read()
             except FileNotFoundError:
                 content = ""
             
-            # Create new entry
-            entry_line = f"- [ ] [{index:03d}_{title}]({url})\n"
-            date_line = f"\t{today} [📁]() [🖿]()\n\n"
+            entry = (
+                f"- [ ] **{index:03d}** : {today} [📁]() [🖿]()\n"
+                f"\t`YT` {yt_line}\n"
+                f"\t`TW` {tw_line}\n\n"
+            )
             
-            # Prepend new entry
-            new_content = entry_line + date_line + content
+            new_content = entry + content
             
             with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
                 f.write(new_content)
             
-            logger.info(f"Created new Obsidian entry #{index:03d} for {title}")
+            logger.info(f"Created new Obsidian entry #{index:03d}")
             return True
             
         except Exception as e:
             logger.error(f"Error creating obsidian entry: {str(e)}")
             return False
-    
-    def append_dual_stream_line(self, index, title, url):
-        """Append a title line to an existing entry (dual-stream partner detection)"""
+
+    def update_obsidian_entry(self, index, platform, title=None, url=None, file_path=None):
+        """Update platform line or file path in an existing entry"""
         if not os.path.exists(self.config["obsidian"]):
-            logger.warning("Obsidian file not found for dual-stream append")
+            logger.warning("Obsidian file not found for update")
             return False
         
         try:
             with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
                 content = f.read()
             
-            # Find the entry by index pattern: - [ ] [XXX_
-            pattern = rf'(- \[ \] \[{index:03d}_[^\n]+\n)'
-            match = re.search(pattern, content)
+            # Update platform title/url
+            if title and url:
+                tag = "YT" if platform == "youtube" else "TW"
+                pattern = rf'(\t`{tag}` )[^\n]*\n'
+                replacement = rf'\1[{title}]({url})\n'
+                content = re.sub(pattern, replacement, content, count=1)
             
-            if not match:
-                logger.warning(f"Could not find entry #{index:03d} for dual-stream append")
-                return False
-            
-            # Insert new title line after the main entry line
-            original_line = match.group(1)
-            new_title_line = f"\t[{title}]({url})\n"
-            replacement = original_line + new_title_line
-            
-            new_content = content.replace(original_line, replacement)
+            # Update file path
+            if file_path:
+                encoded_path = "raws/" + urllib.parse.quote(os.path.basename(file_path), safe='')
+                icon = "📁" if platform == "youtube" else "🖿"
+                pattern = rf'(\*\*{index:03d}\*\*[^\n]*)\[{icon}\]\([^\)]*\)'
+                replacement = rf'\1[{icon}]({encoded_path})'
+                content = re.sub(pattern, replacement, content, count=1)
             
             with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(new_content)
+                f.write(content)
             
-            logger.info(f"Appended dual-stream line to entry #{index:03d}")
+            logger.info(f"Updated Obsidian entry #{index:03d} ({platform})")
             return True
             
         except Exception as e:
-            logger.error(f"Error appending dual-stream line: {str(e)}")
-            return False
-    
-    def update_obsidian_path(self, index, platform, file_path):
-        """Update the file path in an Obsidian entry by index"""
-        if not os.path.exists(self.config["obsidian"]):
-            logger.warning("Obsidian file not found for path update")
-            return False
-        
-        try:
-            with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Find the entry block by index
-            # Match from the entry line through the date line with file links
-            pattern = rf'(- \[ \] \[{index:03d}_[^\n]+\n(?:\t\[[^\]]+\]\([^\)]+\)\n)*\t[^\[]+)(\[📁\]\([^\)]*\)) (\[🖿\]\([^\)]*\))'
-            match = re.search(pattern, content)
-            
-            if not match:
-                logger.warning(f"Could not find entry #{index:03d} for path update")
-                return False
-            
-            prefix = match.group(1)
-            yt_link = match.group(2)
-            tw_link = match.group(3)
-            
-            relative_path = f"raws/{os.path.basename(file_path)}"
-            
-            if platform == "youtube":
-                yt_link = f"[📁]({relative_path})"
-            else:
-                tw_link = f"[🖿]({relative_path})"
-            
-            new_block = f"{prefix}{yt_link} {tw_link}"
-            new_content = content[:match.start()] + new_block + content[match.end():]
-            
-            with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            
-            logger.info(f"Updated Obsidian path for entry #{index:03d} ({platform})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating obsidian path: {str(e)}")
+            logger.error(f"Error updating obsidian entry: {str(e)}")
             return False
 
     def check_stream_status(self):
@@ -322,9 +274,9 @@ class LivestreamRecorder:
         
         # Update Obsidian log
         if is_dual:
-            self.append_dual_stream_line(obsidian_index, obsidian_title, obsidian_url)
+            self.update_obsidian_entry(obsidian_index, platform, title=obsidian_title, url=obsidian_url)
         else:
-            self.create_obsidian_entry(obsidian_index, obsidian_title, obsidian_url)
+            self.create_obsidian_entry(obsidian_index, platform, obsidian_title, obsidian_url)
         
         # Prepend index to stream title for filename
         stream_title = f"{obsidian_index:03d}_{stream_title}"
@@ -434,46 +386,153 @@ class LivestreamRecorder:
             self.active_streams[stream_key]["chat_stop_event"] = stop_event
 
             if platform == "twitch":
-                stream_start = int(stream["start_time"].timestamp() * 1_000_000)
+                channel = self.config["twitch"]
+                stream_start = int(stream["start_time"].timestamp() * 1000)
                 output_path = os.path.join(self.config["output"], f"{stream_title}.json")
                 
                 def chat_download_thread():
+                    sock = socket.socket()
+                    sock.settimeout(5.0)
+                    
                     try:
-                        chat_downloader = ChatDownloader()
+                        sock.connect(("irc.chat.twitch.tv", 6667))
+                        sock.send(b"CAP REQ :twitch.tv/tags twitch.tv/commands\r\n")
+                        sock.send(f"NICK justinfan{int(time.time()) % 99999}\r\n".encode())
+                        sock.send(f"JOIN #{channel.lower()}\r\n".encode())
+                        logger.info(f"Connected to Twitch IRC for #{channel}")
+                        
                         with open(output_path, 'w', encoding='utf-8') as f:
-                            f.write('[\n')  # Start JSON array
+                            f.write('[\n')
                             first_message = True
+                            buffer = ""
                             
-                            chat = chat_downloader.get_chat(
-                                url=url,
-                                message_groups=['all'],
-                                sort_keys=True,
-                                indent=4
-                            )
-                            
-                            for message in chat:
-                                if stop_event.is_set():
-                                    logger.info("Chat download terminated by stop event")
+                            while not stop_event.is_set():
+                                try:
+                                    buffer += sock.recv(4096).decode('utf-8', errors='replace')
+                                    
+                                    while '\r\n' in buffer:
+                                        line, buffer = buffer.split('\r\n', 1)
+                                        
+                                        if line.startswith("PING"):
+                                            sock.send(b"PONG :tmi.twitch.tv\r\n")
+                                            continue
+                                        
+                                        if not line.startswith('@'):
+                                            continue
+                                        
+                                        match = re.match(r'@(?P<tags>[^ ]+) :(?P<user>[^!]+)![^ ]+ (?P<cmd>\w+) #[^ ]+(?: :(?P<msg>.*))?', line)
+                                        if not match:
+                                            continue
+                                        
+                                        # Parse tags
+                                        tags = {}
+                                        for tag in match.group('tags').split(';'):
+                                            if '=' in tag:
+                                                k, v = tag.split('=', 1)
+                                                tags[k] = v.replace('\\s', ' ').replace('\\:', ';')
+                                        
+                                        cmd, username, message = match.group('cmd'), match.group('user'), match.group('msg') or ''
+                                        ts = int((int(tags.get('tmi-sent-ts', time.time() * 1000)) - stream_start) * 1000)
+                                        
+                                        # Parse badges
+                                        badges = []
+                                        for b in tags.get('badges', '').split(','):
+                                            if '/' in b:
+                                                name, ver = b.split('/', 1)
+                                                badges.append({'name': name, 'version': ver, 'title': name.replace('-', ' ').title()})
+                                        
+                                        # Parse emotes
+                                        emotes = []
+                                        msg_bytes = message.encode('utf-8')
+                                        for e in tags.get('emotes', '').split('/'):
+                                            if ':' not in e:
+                                                continue
+                                            eid, positions = e.split(':', 1)
+                                            locs, ename = [], None
+                                            for pos in positions.split(','):
+                                                if '-' in pos:
+                                                    s, end = int(pos.split('-')[0]), int(pos.split('-')[1])
+                                                    locs.append(f"{s}-{end}")
+                                                    if not ename:
+                                                        try: ename = msg_bytes[s:end+1].decode('utf-8')
+                                                        except: ename = f"emote_{eid}"
+                                            if ename:
+                                                emotes.append({'id': eid, 'name': ename, 'locations': locs})
+                                        
+                                        # Build base author
+                                        author = {
+                                            'id': tags.get('user-id', ''),
+                                            'name': username,
+                                            'display_name': tags.get('display-name', username),
+                                            'badges': badges
+                                        }
+                                        
+                                        msg = None
+                                        
+                                        if cmd == 'PRIVMSG':
+                                            msg = {'message_type': 'text_message', 'timestamp': ts, 'message_id': tags.get('id', ''),
+                                                'author': author, 'colour': tags.get('color', ''), 'message': message, 'emotes': emotes}
+                                            if tags.get('bits'):
+                                                msg['bits'] = int(tags['bits'])
+                                        
+                                        elif cmd == 'USERNOTICE':
+                                            msg_id = tags.get('msg-id', '')
+                                            msg = {'timestamp': ts, 'message_id': tags.get('id', ''), 'author': author,
+                                                'colour': tags.get('color', ''), 'message': message or None, 'emotes': emotes}
+                                            if msg_id == 'sub':
+                                                msg['message_type'] = 'subscription'
+                                                msg['subscription_type'] = tags.get('msg-param-sub-plan', '1000')
+                                            elif msg_id == 'resub':
+                                                msg['message_type'] = 'resubscription'
+                                                msg['subscription_type'] = tags.get('msg-param-sub-plan', '1000')
+                                                msg['cumulative_months'] = int(tags.get('msg-param-cumulative-months', 1))
+                                            elif msg_id == 'submysterygift':
+                                                msg['message_type'] = 'mystery_subscription_gift'
+                                                msg['subscription_type'] = tags.get('msg-param-sub-plan', '1000')
+                                                msg['mass_gift_count'] = int(tags.get('msg-param-mass-gift-count', 1))
+                                                msg['origin_id'] = tags.get('msg-param-origin-id', '')
+                                            elif msg_id == 'subgift':
+                                                msg['message_type'] = 'subscription_gift'
+                                                msg['subscription_type'] = tags.get('msg-param-sub-plan', '1000')
+                                                msg['gift_recipient_id'] = tags.get('msg-param-recipient-id', '')
+                                                msg['gift_recipient_display_name'] = tags.get('msg-param-recipient-display-name', '')
+                                                msg['origin_id'] = tags.get('msg-param-origin-id', '')
+                                            elif msg_id == 'raid':
+                                                msg['message_type'] = 'raid'
+                                                msg['number_of_raiders'] = int(tags.get('msg-param-viewerCount', 0))
+                                            else:
+                                                msg = None
+                                        
+                                        elif cmd == 'CLEARCHAT' and message:
+                                            msg = {'message_type': 'ban_user', 'timestamp': ts,
+                                                'author': {'target_id': tags.get('target-user-id', ''), 'name': message},
+                                                'ban_duration': int(tags['ban-duration']) if tags.get('ban-duration') else None}
+                                        
+                                        elif cmd == 'CLEARMSG' and tags.get('target-msg-id'):
+                                            msg = {'message_type': 'delete_message', 'timestamp': ts,
+                                                'target_message_id': tags['target-msg-id']}
+                                        
+                                        if msg:
+                                            if not first_message:
+                                                f.write(',\n')
+                                            json.dump(msg, f, ensure_ascii=False)
+                                            first_message = False
+                                            
+                                except socket.timeout:
+                                    continue
+                                except Exception as e:
+                                    logger.error(f"IRC error: {e}")
                                     break
-                                
-                                # Adjust timestamp to be relative to stream start
-                                if 'timestamp' in message:
-                                    original_timestamp = message['timestamp']
-                                    message['timestamp'] = original_timestamp - stream_start
-                                    message['original_timestamp'] = original_timestamp
-                                
-                                # Write message immediately
-                                if not first_message:
-                                    f.write(',\n')
-                                json.dump(message, f, ensure_ascii=False)
-                                f.flush()  # Ensure immediate write
-                                first_message = False
-                                
-                            f.write('\n]')  # Close JSON array
-                            logger.info(f"Chat download completed for: {stream_title}")
                             
+                            f.write('\n]')
+                        logger.info(f"Chat download completed for: {stream_title}")
+                        
                     except Exception as e:
-                        logger.error(f"Error in chat download thread: {str(e)}")
+                        logger.error(f"IRC connection error: {e}")
+                    finally:
+                        try: sock.close()
+                        except: pass
+
             else:
                 def chat_download_thread():
                     try:
@@ -648,7 +707,7 @@ class LivestreamRecorder:
                 
                 # Update Obsidian log with server file path
                 if uploaded_path and obsidian_index:
-                    self.update_obsidian_path(obsidian_index, platform, uploaded_path)
+                    self.update_obsidian_entry(obsidian_index, platform, file_path=uploaded_path)
                     logger.info(f"Successfully uploaded and logged: {stream_title}")
             
             # Remove from active streams
