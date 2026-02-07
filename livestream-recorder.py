@@ -142,8 +142,8 @@ class LivestreamRecorder:
         tz_str = f"GMT{hours_offset:+d}"
         today = now.strftime(f"%Y.%m.%d %H:%M ({tz_str})")
         
-        yt_line = f"[{title}]({url})" if platform == "youtube" else ""
-        tw_line = f"[{title}]({url})" if platform == "twitch" else ""
+        yt_line = f"[{index:03d}_{title}]({url})" if platform == "youtube" else ""
+        tw_line = f"[{index:03d}_{title}]({url})" if platform == "twitch" else ""
         
         try:
             try:
@@ -184,7 +184,7 @@ class LivestreamRecorder:
             if title and url:
                 tag = "YT" if platform == "youtube" else "TW"
                 pattern = rf'(\t`{tag}` )[^\n]*\n'
-                replacement = rf'\1[{title}]({url})\n'
+                replacement = rf'\1[{index:03d}_{title}]({url})\n'
                 content = re.sub(pattern, replacement, content, count=1)
             
             # Update file path
@@ -338,6 +338,9 @@ class LivestreamRecorder:
             ]
             # if platform == "youtube":
                 # cmd.extend(["--live-from-start"])
+
+            if platform == "twitch":
+                cmd.extend(["--remux-video", "mp4"])
 
             cmd.append(url)
             
