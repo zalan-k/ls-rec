@@ -34,7 +34,7 @@ class CommandServer:
         self.server_socket.settimeout(1.0)
         self.running = True
         threading.Thread(target=self._serve, daemon=True).start()
-        logger.info(f"Command server listening on {SOCKET_PATH}")
+        logger.info(f"  > Command server listening on {SOCKET_PATH}")
     
     def stop(self):
         self.running = False
@@ -125,6 +125,11 @@ class LivestreamRecorder:
             "dual_stream_cycle" :  10
         }
         
+        # Startup banner
+        logger.info("=" * 60)
+        logger.info("Livestream Recorder starting...")
+        logger.info("=" * 60)
+
         # Intitial checks
         self.active_streams = {}
         self.create_output_dirs()
@@ -866,10 +871,9 @@ class LivestreamRecorder:
     
     def run(self):
         """Main loop to check for livestreams and manage recordings"""
-        logger.info("Starting Enhanced Livestream Recorder")
-        logger.info(f"Checking every {self.config['check_interval']} seconds")
+        logger.info(f"  > Starting livestream monitoring (ping frequency: {self.config['check_interval']} seconds)")
         # logger.info(f"Weekly cleanup scheduled for {self.config['cleanup_hour']}:00")
-        logger.info(f"Manual termination cooldown: {self.config['cooldown_duration']} seconds")
+        logger.info(f"  > Manual termination cooldown: {self.config['cooldown_duration']} seconds")
         self.command_server.start()
         print('-' * 100)
         
@@ -953,10 +957,9 @@ class LivestreamRecorder:
     
     def create_output_dirs(self):
         Path(self.config["output"]).mkdir(parents=True, exist_ok=True)
-        logger.info("Output directories created")
+        logger.info("  > Output directories validated.")
     
     def check_disk_space(self):
-        logger.info("Checking free disk space...")
         try:
             output_dir = Path(self.config["output"])
             # MacOS / Linux check
@@ -970,7 +973,7 @@ class LivestreamRecorder:
                     ctypes.c_wchar_p(str(output_dir)), None, None, ctypes.pointer(free_bytes))
                 output_free_gb = free_bytes.value / (1024**3)
             
-            logger.info(f"Disk space available: {output_free_gb:.2f} GB.")
+            logger.info(f"  > Disk space available: {output_free_gb:.2f} GB.")
             
             # Warn if disk space is low (less than 10GB)
             if output_free_gb < 10:
