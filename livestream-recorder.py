@@ -23,6 +23,8 @@ class LivestreamRecorder:
             "priority"          : "youtube",
             "output"            : "/mnt/nvme/livestream-recorder/tempfiles",
             "obsidian"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/Tenma Maemi Livestreams.md",
+            "obsidian_vault"    : "archives",
+            "shellcmd_id"       : "4gtship619",
             "nas_path"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/raws",
             "check_interval"    :  60,
             "cleanup_hour"      :   3,
@@ -141,9 +143,9 @@ class LivestreamRecorder:
         hours_offset = int(utc_offset.total_seconds() / 3600)
         tz_str = f"GMT{hours_offset:+d}"
         today = now.strftime(f"%Y.%m.%d %H:%M ({tz_str})")
-        
-        yt_line = f"[{index:03d}_{title}]({url})" if platform == "youtube" else ""
-        tw_line = f"[{index:03d}_{title}]({url})" if platform == "twitch" else ""
+
+        yt_line = f"[📁]() [📄]() [ {title} ]({url})" if platform == "youtube" else ""
+        tw_line = f"[📁]() [📄]() [ {title} ]({url})" if platform == "twitch" else ""
         
         try:
             try:
@@ -153,15 +155,15 @@ class LivestreamRecorder:
                 content = ""
             
             entry = (
-                f"- [ ] **{index:03d}** : {today} [📁]() [🖿]()\n"
+                f"- [ ] **{index:03d}** : {today}  \n"
                 f"\t`YT` {yt_line}\n"
-                f"\t`TW` {tw_line}\n\n"
+                f"\t`TW` {tw_line}\n"
+                f"\t- [ ] \n"
+                f"---\n"
             )
             
-            new_content = entry + content
-            
             with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(new_content)
+                f.write(entry + content)
             
             logger.info(f"Created new Obsidian entry #{index:03d}")
             return True
@@ -170,29 +172,30 @@ class LivestreamRecorder:
             logger.error(f"Error creating obsidian entry: {str(e)}")
             return False
 
-    def update_obsidian_entry(self, index, platform, title=None, url=None, file_path=None):
+    def update_obsidian_entry(self, index, platform, title=None, url=None, stream_title=None):
         """Update platform line or file path in an existing entry"""
         if not os.path.exists(self.config["obsidian"]):
             logger.warning("Obsidian file not found for update")
             return False
         
         try:
+            tag = "YT" if platform == "youtube" else "TW"
             with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
                 content = f.read()
             
             # Update platform title/url
             if title and url:
-                tag = "YT" if platform == "youtube" else "TW"
                 pattern = rf'(\t`{tag}` )[^\n]*\n'
-                replacement = rf'\1[{index:03d}_{title}]({url})\n'
+                replacement = f'\\1[📁]() [📄]() [ {title} ]({url})\n'
                 content = re.sub(pattern, replacement, content, count=1)
             
             # Update file path
-            if file_path:
-                encoded_path = "raws/" + urllib.parse.quote(os.path.basename(file_path), safe='')
-                icon = "📁" if platform == "youtube" else "🖿"
-                pattern = rf'(\*\*{index:03d}\*\*[^\n]*)\[{icon}\]\([^\)]*\)'
-                replacement = rf'\1[{icon}]({encoded_path})'
+            if stream_title:
+                shell_base = (f"obsidian://shell-commands/?vault={self.config['obsidian_vault']}"
+                            f"&execute={self.config['shellcmd_id']}&_arg0=raws/")
+                encoded = urllib.parse.quote(stream_title, safe='')
+                pattern = rf'(\t`{tag}` )\[📁\]\(\) \[📄\]\(\)'
+                replacement = f'\\1[📁]({shell_base}{encoded}.mp4) [📄]({shell_base}{encoded}.json)'
                 content = re.sub(pattern, replacement, content, count=1)
             
             with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
@@ -330,14 +333,15 @@ class LivestreamRecorder:
                 "--no-mtime",
                 "--retries",              "10",
                 "--fragment-retries",     "10",
-                "--retry-sleep",          "5",
+                "--retry-sleep",          "fragment:300",
                 "--socket-timeout",       "120",
                 "--cookies-from-browser", "firefox",
-                "--hls-use-mpegts"
+                "--hls-use-mpegts",
+                "--concurrent-fragments",  "4"
 
             ]
-            # if platform == "youtube":
-                # cmd.extend(["--live-from-start"])
+            if platform == "youtube":
+                cmd.extend(["--live-from-start"])
 
             if platform == "twitch":
                 cmd.extend(["--remux-video", "mp4"])
@@ -710,7 +714,7 @@ class LivestreamRecorder:
                 
                 # Update Obsidian log with server file path
                 if uploaded_path and obsidian_index:
-                    self.update_obsidian_entry(obsidian_index, platform, file_path=uploaded_path)
+                    self.update_obsidian_entry(obsidian_index, platform, stream_title=stream_title)
                     logger.info(f"Successfully uploaded and logged: {stream_title}")
             
             # Remove from active streams
