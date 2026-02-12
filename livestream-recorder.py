@@ -14,6 +14,99 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("LivestreamRecorder")
+SOCKET_PATH = "/tmp/livestream-recorder.sock"
+
+class CommandServer:
+    """Unix socket server - thin dispatcher to existing recorder methods"""
+    
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.running = False
+        self.server_socket = None
+    
+    def start(self):
+        if os.path.exists(SOCKET_PATH):
+            os.unlink(SOCKET_PATH)
+        self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server_socket.bind(SOCKET_PATH)
+        os.chmod(SOCKET_PATH, 0o666)
+        self.server_socket.listen(1)
+        self.server_socket.settimeout(1.0)
+        self.running = True
+        threading.Thread(target=self._serve, daemon=True).start()
+        logger.info(f"Command server listening on {SOCKET_PATH}")
+    
+    def stop(self):
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+        if os.path.exists(SOCKET_PATH):
+            os.unlink(SOCKET_PATH)
+    
+    def _serve(self):
+        while self.running:
+            try:
+                conn, _ = self.server_socket.accept()
+                try:
+                    data = conn.recv(1024).decode('utf-8').strip()
+                    if data:
+                        response = self._handle(data)
+                        conn.sendall(response.encode('utf-8'))
+                finally:
+                    conn.close()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+    
+    def _handle(self, command):
+        parts = command.split()
+        cmd = parts[0].lower()
+        rec = self.recorder
+        
+        if cmd == "status":
+            if not rec.active_streams:
+                return "No active streams."
+            lines = [f"Active streams ({len(rec.active_streams)}):"]
+            for key, s in rec.active_streams.items():
+                elapsed = str(datetime.datetime.now() - s["start_time"]).split('.')[0]
+                vid = "recording" if s.get("video_process") and s["video_process"].poll() is None else "stopped"
+                lines.append(f"  [{s['platform'].upper()}] {s['obsidian_title']}")
+                lines.append(f"    Video: {vid} | Elapsed: {elapsed} | URL: {s['url']}")
+            return "\n".join(lines)
+        
+        elif cmd == "check":
+            platforms = [parts[1]] if len(parts) > 1 and parts[1] in ("youtube", "twitch") else ["youtube", "twitch"]
+            lines = []
+            for plat in platforms:
+                result = rec.probe_platform(plat)
+                if result:
+                    already = "(already recording)" if result["stream_key"] in rec.active_streams else "(not recording)"
+                    lines.append(f"  ✔ {plat.upper()}: LIVE - {result['obsidian_title']} {already}")
+                else:
+                    lines.append(f"  ✗ {plat.upper()}: offline")
+            return "\n".join(lines)
+        
+        elif cmd == "record":
+            if len(parts) < 2 or parts[1] not in ("youtube", "twitch"):
+                return "Usage: record <youtube|twitch>"
+            plat = parts[1]
+            result = rec.probe_platform(plat)
+            if not result:
+                return f"No live stream found on {plat}."
+            if result["stream_key"] in rec.active_streams:
+                return f"Already recording: {result['obsidian_title']}"
+            
+            obsidian_index, is_dual = rec.get_stream_index(plat, datetime.datetime.now())
+            rec.start_stream_recording(
+                result["stream_url"], plat, result["video_id"],
+                result["stream_title"], result["obsidian_title"],
+                result["obsidian_url"], obsidian_index, is_dual
+            )
+            return f"✔ Started recording {plat.upper()}: {result['obsidian_title']} (#{obsidian_index:03d})"
+        
+        else:
+            return "Commands: status | check [youtube|twitch] | record <youtube|twitch>"
 
 class LivestreamRecorder:
     def __init__(self):
@@ -50,6 +143,9 @@ class LivestreamRecorder:
         # Store the original SIGINT handler
         self.original_sigint_handler = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, self.handle_sigint)
+
+        # External probing
+        self.command_server = CommandServer(self)
 
     def handle_sigint(self, sig, frame):
         """Simple SIGINT handler - let yt-dlp handle Ctrl+C naturally, just set flag"""
@@ -207,10 +303,9 @@ class LivestreamRecorder:
         except Exception as e:
             logger.error(f"Error updating obsidian entry: {str(e)}")
             return False
-
-    def check_stream_status(self):
-        if not self.is_monitoring_allowed():
-            return
+    
+    def probe_platform(self, platform):
+        """Probe a single platform for live stream. Returns dict with stream info or None."""
         services = {
             'youtube': {
                 'url': f"https://www.youtube.com/{self.config['youtube']}/live",
@@ -221,55 +316,63 @@ class LivestreamRecorder:
                 'extra_args': []
             }
         }
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+        svc = services[platform]
+        try:
+            cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json"] + svc['extra_args'] + [svc['url']]
+            process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if process.returncode != 0:
+                return None
+            
+            data = json.loads(process.stdout.strip())
+            if not data.get('is_live', False):
+                return None
+            
+            video_id = data.get('id')
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+            
+            if platform == 'youtube':
+                stream_url = f"https://www.youtube.com/watch?v={video_id}"
+                obsidian_title = data.get('fulltitle')
+                obsidian_url = stream_url
+            else:
+                stream_url = svc['url']
+                obsidian_title = data.get('description')
+                obsidian_url = f"{svc['url']}/video/{video_id.lstrip('v')}"
+            
+            raw_title = f"{obsidian_title} [{video_id}] @ {timestamp}"
+            stream_title = sanitize_filename(raw_title)
+            
+            return {
+                "platform": platform,
+                "video_id": video_id,
+                "stream_url": stream_url,
+                "stream_title": stream_title,
+                "obsidian_title": obsidian_title,
+                "obsidian_url": obsidian_url,
+                "stream_key": f"{platform}_{video_id}"
+            }
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+            logger.warning(f"Probe failed for {platform}: {e}")
+            return None
+    
+    def check_stream_status(self):
+        if not self.is_monitoring_allowed():
+            return
         
-        for platform, service_config in services.items():
-            try:
-                cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json"] + service_config['extra_args'] + [service_config['url']]
-                process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        for platform in ("youtube", "twitch"):
+            result = self.probe_platform(platform)
+            if result and result["stream_key"] not in self.active_streams:
+                logger.info(f"Found new active {platform.capitalize()} livestream: {result['stream_title']} ({result['stream_url']})")
                 
-                if process.returncode != 0:
-                    continue
+                obsidian_index, is_dual = self.get_stream_index(platform, datetime.datetime.now())
+                if is_dual:
+                    logger.info(f"Dual-stream detected, sharing index {obsidian_index:03d}")
                 
-                try:
-                    stream_data = json.loads(process.stdout.strip())
-                    is_live = stream_data.get('is_live', False)
-                    
-                    if is_live:
-                        video_id = stream_data.get('id')
-                                
-                        if platform == 'youtube':
-                            stream_url = f"https://www.youtube.com/watch?v={video_id}"
-                            obsidian_title = stream_data.get('fulltitle')
-                            obsidian_url = stream_url
-                            raw_title = f"{obsidian_title} [{video_id}] @ {timestamp}"
-                            stream_title = sanitize_filename(raw_title)
-                        else:  # twitch
-                            stream_url = service_config['url']
-                            obsidian_title = stream_data.get('description')
-                            obsidian_url = f"{service_config['url']}/video/{video_id.lstrip('v')}"
-                            raw_title = f"{obsidian_title} [{video_id}] @ {timestamp}"
-                            stream_title = sanitize_filename(raw_title)
-
-
-                        stream_key = f"{platform}_{video_id}"
-                        if stream_key not in self.active_streams:
-                            logger.info(f"Found new active {platform.capitalize()} livestream: {stream_title} ({stream_url})")
-
-                            # Get index (shared with dual-stream partner if detected)
-                            obsidian_index, is_dual = self.get_stream_index(platform, datetime.datetime.now())
-                            if is_dual:
-                                logger.info(f"Dual-stream detected, sharing index {obsidian_index:03d}")
-
-                            self.start_stream_recording(stream_url, platform, video_id, stream_title, obsidian_title, obsidian_url, obsidian_index, is_dual)
-                        
-                except json.JSONDecodeError:
-                    logger.warning(f"Could not parse yt-dlp output for {platform}")
-                    
-            except subprocess.TimeoutExpired:
-                logger.warning(f"{platform.capitalize()} check timed out")
-            except Exception as e:
-                logger.error(f"Error checking {platform}: {str(e)}")
+                self.start_stream_recording(
+                    result["stream_url"], platform, result["video_id"],
+                    result["stream_title"], result["obsidian_title"],
+                    result["obsidian_url"], obsidian_index, is_dual
+                )
 
     def start_stream_recording(self, url, platform, identifier, stream_title, obsidian_title, obsidian_url, obsidian_index, is_dual):
         """Start recording a complete stream (video + chat) in separate threads"""
@@ -767,6 +870,7 @@ class LivestreamRecorder:
         logger.info(f"Checking every {self.config['check_interval']} seconds")
         # logger.info(f"Weekly cleanup scheduled for {self.config['cleanup_hour']}:00")
         logger.info(f"Manual termination cooldown: {self.config['cooldown_duration']} seconds")
+        self.command_server.start()
         print('-' * 100)
         
         try:
@@ -878,6 +982,7 @@ class LivestreamRecorder:
         
     def shutdown(self):
         logger.info("Shutting down Livestream Recorder...")
+        self.command_server.stop()
         for stream_key, stream in list(self.active_streams.items()):
             logger.info("Terminating stream...")
             self.handle_stream_completion(stream_key, upload_files=False)
