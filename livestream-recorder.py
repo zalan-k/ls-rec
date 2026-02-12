@@ -122,7 +122,7 @@ class LivestreamRecorder:
             "check_interval"    :  60,
             "cleanup_hour"      :   3,
             "cooldown_duration" :  30,
-            "dual_stream_cycle" :   3
+            "dual_stream_cycle" :  10
         }
         
         # Intitial checks
