@@ -256,7 +256,7 @@ class LivestreamRecorder:
                 content = ""
             
             entry = (
-                f"- [ ] **{index:03d}** : {today}  \n"
+                f"- [ ] **{index:03d}** : {today}\n"
                 f"\t`YT` {yt_line}\n"
                 f"\t`TW` {tw_line}\n"
                 f"\t- [ ] \n"
