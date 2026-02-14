@@ -97,18 +97,18 @@ def _tw_newest_date(cache):
 # ── YouTube: yt-dlp ──────────────────────────────────────────────────────────
 
 def refresh_youtube(cache, full=False):
-    count = 100 if full else 30
+    count = 15 if full else 10
     print(f"  ⌛ Refreshing YouTube cache ({'full' if full else 'incremental'}, last {count})...")
 
     cmd = [
-        "yt-dlp", "--flat-playlist", "--dump-json",
+        "yt-dlp", "--dump-json",
         "--playlist-items", f"1:{count}",
         "--cookies-from-browser", "firefox",
         f"https://www.youtube.com/{CONFIG['youtube_handle']}/streams"
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0 and not result.stdout.strip():
             stderr_tail = result.stderr.strip().split('\n')[-3:] if result.stderr else []
             print(f"  ⚠ yt-dlp failed (exit {result.returncode})")
@@ -136,6 +136,7 @@ def refresh_youtube(cache, full=False):
                     "id": vid_id,
                     "title": title,
                     "upload_date": upload_date,
+                    "duration": data.get("duration")
                 })
         except json.JSONDecodeError:
             continue
