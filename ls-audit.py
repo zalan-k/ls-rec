@@ -358,6 +358,11 @@ def read_entry(index):
         stripped = lines[i].strip()
         if stripped == '---' or re.match(r'^-\s*\[.\]\s*\*\*\d+\*\*', lines[i]):
             break
+        m_plat = re.match(r'^\t`(YT|TW)`\s*(✗|✘)', lines[i])
+        if m_plat:
+            result.setdefault("no_platform", set()).add(m_plat.group(1))
+            i += 1
+            continue
         if re.match(r'^\t`(YT|TW)`', lines[i]):
             i += 1
             continue
@@ -415,7 +420,8 @@ def build_platform_line(tag, url, title, video_file, chat_file):
 def build_entry(index, entry, nas, yt_info, tw_info):
     # ── Resolve YouTube ──
     yt_url, yt_title = None, None
-
+    no_plat = entry.get("no_platform", set())
+    
     # Priority 1: NAS file
     if nas["yt_video"]:
         vid = extract_video_id_from_filename(nas["yt_video"])
@@ -451,8 +457,15 @@ def build_entry(index, entry, nas, yt_info, tw_info):
 
     lines = []
     lines.append(f"- {entry['checkbox']} **{index}** : {date_str} {tz_str}  ")
-    lines.append(build_platform_line("YT", yt_url, yt_title, nas["yt_video"], nas["yt_chat"]))
-    lines.append(build_platform_line("TW", tw_url, tw_title, nas["tw_video"], nas["tw_chat"]))
+    if "YT" in no_plat:
+        lines.append("\t`YT` ✗")
+    else:
+        lines.append(build_platform_line("YT", yt_url, yt_title, nas["yt_video"], nas["yt_chat"]))
+
+    if "TW" in no_plat:
+        lines.append("\t`TW` ✗")
+    else:
+        lines.append(build_platform_line("TW", tw_url, tw_title, nas["tw_video"], nas["tw_chat"]))
 
     # Append preserved sub-notes
     for note in entry.get("notes", []):
@@ -573,24 +586,34 @@ def audit(index):
     print(f"  Checkbox : {entry['checkbox']}")
     print()
 
+    no_plat = entry.get("no_platform", set())
+
     # ── 2. Search cache for streams ──
     cache = load_cache()
 
-    print("  Searching YouTube...")
-    yt_info = find_youtube_by_date(cache, entry["date_obj"])
-    if yt_info:
-        note = yt_info.get("note", "")
-        print(f"    ✔ {yt_info['title'][:60]}  {note}")
+    if "YT" not in no_plat:
+        print("  Searching YouTube...")
+        yt_info = find_youtube_by_date(cache, entry["date_obj"])
+        if yt_info:
+            note = yt_info.get("note", "")
+            print(f"    ✔ {yt_info['title'][:60]}  {note}")
+        else:
+            print(f"    ✗ No YouTube stream found for {entry['date_str']}")
     else:
-        print(f"    ✗ No YouTube stream found for {entry['date_str']}")
+        print("  Skipping YouTube...")
+        yt_info = None
 
-    print("  Searching Twitch...")
-    tw_info = find_twitch_by_date(cache, entry["date_obj"])
-    if tw_info:
-        note = tw_info.get("note", "")
-        print(f"    ✔ {tw_info['title'][:60]}  {note}")
+    if "TW" not in no_plat:
+        print("  Searching Twitch...")
+        tw_info = find_twitch_by_date(cache, entry["date_obj"])
+        if tw_info:
+            note = tw_info.get("note", "")
+            print(f"    ✔ {tw_info['title'][:60]}  {note}")
+        else:
+            print(f"    ✗ No Twitch VOD found for {entry['date_str']}")
     else:
-        print(f"    ✗ No Twitch VOD found for {entry['date_str']}")
+        print("  Skipping Twitch...")
+        tw_info = None
     print()
 
     # ── 3. Scan NAS ──

@@ -452,7 +452,7 @@ class LivestreamRecorder:
                 cmd.extend(["--live-from-start"])
 
             if platform == "twitch":
-                cmd.extend(["--remux-video", "mp4"])
+                cmd.extend(["--remux-video", "mp4", "--ppa", "Remux:-movflags +faststart"])
 
             cmd.append(url)
             
