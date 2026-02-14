@@ -97,7 +97,7 @@ def _tw_newest_date(cache):
 # ── YouTube: yt-dlp ──────────────────────────────────────────────────────────
 
 def refresh_youtube(cache, full=False):
-    count = 15 if full else 10
+    count = 100 if full else 10
     print(f"  ⌛ Refreshing YouTube cache ({'full' if full else 'incremental'}, last {count})...")
 
     cmd = [
