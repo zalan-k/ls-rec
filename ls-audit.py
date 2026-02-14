@@ -130,7 +130,7 @@ def refresh_youtube(cache, full=False):
             data = json.loads(line)
             vid_id = data.get("id", "")
             title = data.get("title", "Unknown")
-            upload_date = data.get("upload_date", "")
+            upload_date = data.get("upload_date") or data.get("release_date") or ""
             if vid_id and upload_date:
                 new_streams.append({
                     "id": vid_id,
