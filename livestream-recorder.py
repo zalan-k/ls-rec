@@ -256,7 +256,7 @@ class LivestreamRecorder:
                 content = ""
             
             entry = (
-                f"- [ ] **{index:03d}** : {today}\n"
+                f"- [ ] **{index:03d}** : {today}  \n"
                 f"\t`YT` {yt_line}\n"
                 f"\t`TW` {tw_line}\n"
                 f"\t- [ ] \n"
@@ -441,7 +441,8 @@ class LivestreamRecorder:
                 "--no-mtime",
                 "--retries",              "10",
                 "--fragment-retries",     "10",
-                "--retry-sleep",          "fragment:300",
+                "--retry-sleep",          "exp=1::10",
+                "--retry-sleep",          "fragment:exp=2::60",
                 "--socket-timeout",       "120",
                 "--cookies-from-browser", "firefox",
                 "--hls-use-mpegts",
