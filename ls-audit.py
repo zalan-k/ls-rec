@@ -109,7 +109,7 @@ def refresh_youtube(cache, full=False):
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
+        if result.returncode != 0 and not result.stdout.strip():
             stderr_tail = result.stderr.strip().split('\n')[-3:] if result.stderr else []
             print(f"  ⚠ yt-dlp failed (exit {result.returncode})")
             for line in stderr_tail:
@@ -372,6 +372,43 @@ def read_entry(index):
 
     return result
 
+def write_entry(index, new_lines):
+    """Replace entry #index in the Obsidian file with new_lines."""
+    if not os.path.exists(CONFIG["obsidian"]):
+        print(f"  ✗ Obsidian file not found: {CONFIG['obsidian']}")
+        return False
+
+    with open(CONFIG["obsidian"], 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    # Find start of this entry
+    start = None
+    for i, line in enumerate(lines):
+        if re.search(rf'\*\*{index}\*\*\s*:', line):
+            start = i
+            break
+
+    if start is None:
+        print(f"  ✗ Entry #{index} not found for writing.")
+        return False
+
+    # Find end of entry (next entry or --- separator)
+    end = start + 1
+    while end < len(lines):
+        stripped = lines[end].strip()
+        if stripped == '---' or re.match(r'^-\s*\[.\]\s*\*\*\d+\*\*', lines[end]):
+            break
+        end += 1
+
+    # Replace
+    replacement = [line + "\n" for line in new_lines]
+    lines[start:end] = replacement
+
+    with open(CONFIG["obsidian"], 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+
+    return True
+
 # ── NAS Scanner ──────────────────────────────────────────────────────────────
 
 def scan_nas(index):
@@ -631,19 +668,21 @@ def audit(index):
     block = build_entry(index, entry, nas, yt_info, tw_info)
     output_text = "\n".join(block)
 
-    # ── 5. Print + clipboard ──
+    # ── 5. Write to Obsidian ──
     print("  ┌─ Entry ────────────────────────────────────────────")
     for line in block:
         print(f"  │ {line}")
     print("  └──────────────────────────────────────────────────────")
     print()
 
-    copied = copy_to_clipboard(output_text)
-    if copied:
-        print("  📋 Copied to clipboard.")
+    confirm = input("  Write to Obsidian? (y/n): ").strip().lower()
+    if confirm == 'y':
+        if write_entry(index, block):
+            print("  ✔ Written to Obsidian file.")
+        else:
+            print("  ✗ Failed to write to Obsidian file.")
     else:
-        print("  ⚠ Could not copy to clipboard (no xclip/xsel/wl-copy).")
-        print("    Select and copy the block above manually.")
+        print("  Skipped.")
     print()
 
     # ── 6. Check for missing files → offer download ──
@@ -686,11 +725,14 @@ def audit(index):
         print("  └──────────────────────────────────────────────────────")
         print()
 
-        copied = copy_to_clipboard(output_text)
-        if copied:
-            print("  📋 Copied to clipboard.")
+        confirm = input("  Write to Obsidian? (y/n): ").strip().lower()
+        if confirm == 'y':
+            if write_entry(index, block):
+                print("  ✔ Written to Obsidian file.")
+            else:
+                print("  ✗ Failed to write to Obsidian file.")
         else:
-            print("  ⚠ Could not copy to clipboard.")
+            print("  Skipped.")
         print()
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
