@@ -36,8 +36,7 @@ CACHE_FILE = os.path.join(SCRIPT_DIR, ".stream_cache.json")
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def classify_video_id(vid):
-    """YouTube IDs are 11 alphanumeric chars; Twitch VOD IDs are long numeric."""
-    if vid.isdigit() and len(vid) > 11:
+    if vid.lstrip('v').isdigit():
         return "twitch"
     return "youtube"
 

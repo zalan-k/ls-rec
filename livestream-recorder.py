@@ -256,7 +256,7 @@ class LivestreamRecorder:
                 content = ""
             
             entry = (
-                f"- [ ] **{index:03d}** : {today}  \n"
+                f"- [ ] **{index:03d}** : {today}  #stream\n"
                 f"\t`YT` {yt_line}\n"
                 f"\t`TW` {tw_line}\n"
                 f"\t- [ ] \n"
@@ -443,17 +443,22 @@ class LivestreamRecorder:
                 "--fragment-retries",     "10",
                 "--retry-sleep",          "exp=1::10",
                 "--retry-sleep",          "fragment:exp=2::60",
-                "--socket-timeout",       "120",
+                "--socket-timeout",       "15",
                 "--cookies-from-browser", "firefox",
                 "--hls-use-mpegts",
                 "--concurrent-fragments",  "4"
 
             ]
             if platform == "youtube":
-                cmd.extend(["--live-from-start"])
+                cmd.extend([
+                    "--live-from-start"
+                    ])
 
             if platform == "twitch":
-                cmd.extend(["--remux-video", "mp4", "--ppa", "Remux:-movflags +faststart"])
+                cmd.extend([
+                    "--recode-video", "mp4",
+                    "--ppa", "VideoConvertor:-c copy -movflags +faststart",
+                    ])
 
             cmd.append(url)
             

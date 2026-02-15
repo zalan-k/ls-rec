@@ -98,8 +98,7 @@ class ManualRecorder:
                 TWITCH_DOWNLOADER_CLI,
                 "chatdownload",
                 "--id", vod_id,
-                "-o", output_path,
-                "-E",
+                "-o", output_path
             ]
             return self._run_download(cmd, title, output_path, "Chat (TwitchDownloaderCLI)")
         else:
