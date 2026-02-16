@@ -438,26 +438,23 @@ class LivestreamRecorder:
                 "--format",               fmt,
                 "-o",                     f"{stream_title}.%(ext)s",
                 "--no-part",
-                "--no-mtime",
                 "--retries",              "10",
-                "--fragment-retries",     "10",
+                "--fragment-retries",     "3",
                 "--retry-sleep",          "exp=1::10",
-                "--retry-sleep",          "fragment:exp=2::60",
+                "--retry-sleep",          "fragment:exp=2::15",
                 "--socket-timeout",       "15",
                 "--cookies-from-browser", "firefox",
-                "--hls-use-mpegts",
-                "--concurrent-fragments",  "4"
+                "--hls-use-mpegts"
 
             ]
             if platform == "youtube":
-                cmd.extend([
-                    "--live-from-start"
-                    ])
+                cmd.extend([])
 
             if platform == "twitch":
                 cmd.extend([
-                    "--recode-video", "mp4",
-                    "--ppa", "VideoConvertor:-c copy -movflags +faststart",
+                    "--concurrent-fragments",   "4",
+                    "--recode-video",           "mp4",
+                    "--ppa",                    "VideoConvertor:-c copy -movflags +faststart",
                     ])
 
             cmd.append(url)

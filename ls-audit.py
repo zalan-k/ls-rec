@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 """
 ls-audit - Reconstruct Obsidian livestream entries from authoritative sources.
-
-Philosophy:
-    The existing entry is only used for: date, checkbox state, and sub-notes.
-    Everything else (titles, URLs, file links) is rebuilt fresh from
-    yt-dlp / Twitch API / NAS filesystem every time.
-
 Usage:
     ls-audit <index>            Reconstruct entry #index
     ls-audit --refresh          Force-refresh the stream cache
@@ -15,9 +9,6 @@ Usage:
 """
 
 import os, re, sys, json, glob, subprocess, shutil, datetime, urllib.parse, urllib.request
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
 CONFIG = {
     "obsidian"       : "/mnt/nas/edit-video_library/Tenma Maemi/archives/Tenma Maemi Livestreams.md",
     "obsidian_vault" : "archives",
@@ -292,21 +283,14 @@ def find_twitch_by_date(cache, target_date):
 # Everything else is reconstructed from API + NAS.
 
 def read_entry(index):
-    """
-    Find entry #index in the Obsidian file.
-    Returns: {
-        "found": bool,
-        "date_str": "2026.02.08 04:15" or None,
-        "date_obj": datetime or None,
-        "tz_str": "(GMT-6)" or None,
-        "checkbox": "[ ]" or "[x]",
-        "notes": [lines...],        # sub-notes/sub-checkboxes below the entry
-    }
-    """
     result = {
         "found": False,
-        "date_str": None, "date_obj": None, "tz_str": "(GMT-6)",
-        "checkbox": "[ ]", "notes": [],
+        "checkbox": None, "timestamp": None,
+        "yt_title": None, "tw_title": None,
+        "yt_url": None, "tw_url": None,
+        "yt_path_vod": None, "yt_path_chat": None,
+        "tw_path_vod": None, "tw_path_chat": None,
+        "notes": [],
     }
 
     if not os.path.exists(CONFIG["obsidian"]):
@@ -321,55 +305,84 @@ def read_entry(index):
     for i, line in enumerate(lines):
         if re.search(rf'\*\*{index}\*\*\s*:', line):
             start = i
+            result["found"] = True
             break
-
     if start is None:
         return result
 
-    result["found"] = True
     header = lines[start]
 
     # Checkbox
     cb = re.search(r'\[([ x])\]', header)
-    if cb:
-        result["checkbox"] = f"[{cb.group(1)}]"
+    result["checkbox"] = f"[{cb.group(1)}]" if cb else None
 
-    # Date + timezone
+    # Timestamp
     dm = re.search(r'(\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2})', header)
+    tz = re.search(r'\(GMT([+-]?\d+)\)', header)
     if dm:
-        result["date_str"] = dm.group(1)
+        offset = int(tz.group(1)) if tz else 0
+        tz_info = datetime.timezone(datetime.timedelta(hours=offset))
         try:
-            result["date_obj"] = datetime.datetime.strptime(dm.group(1), "%Y.%m.%d %H:%M")
-        except ValueError:
+            local_dt = datetime.datetime.strptime(dm.group(1), "%Y.%m.%d %H:%M").replace(tzinfo=tz_info)
+            result["timestamp"] = int(local_dt.timestamp())
+        except:
             pass
 
-    tz = re.search(r'(\(GMT[^\)]*\))', header)
-    if tz:
-        result["tz_str"] = tz.group(1)
-
-    # Find end of entry, collect sub-notes
-    # Sub-notes are lines after the first 3 lines (header + YT + TW) that aren't
-    # the separator or next entry. But since we don't know if YT/TW lines exist
-    # in the current entry (it might be malformed), we skip all tab-indented
-    # platform lines and collect everything else until the next entry or ---.
+    # ── Collect all entry lines (header + platform lines + notes) ──
+    entry_lines = [header]
     i = start + 1
-    # Skip known platform sublines (tab-indented lines starting with `YT` or `TW`)
     while i < len(lines):
         stripped = lines[i].strip()
         if stripped == '---' or re.match(r'^-\s*\[.\]\s*\*\*\d+\*\*', lines[i]):
             break
-        m_plat = re.match(r'^\t`(YT|TW)`\s*(✗|✘)', lines[i])
-        if m_plat:
-            result.setdefault("no_platform", set()).add(m_plat.group(1))
-            i += 1
-            continue
-        if re.match(r'^\t`(YT|TW)`', lines[i]):
-            i += 1
-            continue
-        # This is a sub-note line
-        result["notes"].append(lines[i])
+        entry_lines.append(lines[i])
         i += 1
 
+    # ── Parse platform lines ──
+    for line in entry_lines:
+        tag_match = re.match(r'^\t`(YT|TW)`\s*(.*)', line)
+        if not tag_match:
+            continue
+
+        tag, rest = tag_match.group(1), tag_match.group(2)
+        prefix = "yt" if tag == "YT" else "tw"
+
+        # Check for ✗ — explicitly no stream on this platform
+        if rest.strip() in ('✗', '✘'):
+            result[f"{prefix}_title"]       = "SKIP"
+            result[f"{prefix}_url"]         = "SKIP"
+            result[f"{prefix}_path_vod"]    = "SKIP"
+            result[f"{prefix}_path_chat"]   = "SKIP"
+            continue
+
+        # Title: [ title ](url) — grab the text between [ and ](
+        title_match = re.search(r'\[\s*(.+?)\s*\]\(https?://', rest)
+        if title_match:
+            result[f"{prefix}_title"] = title_match.group(1)
+
+        # File paths from shell-command URIs
+        vod_match = re.search(r'\[📁\]\(obsidian://[^)]*_arg0=raws/([^)]+\.mp4)\)', rest)
+        chat_match = re.search(r'\[📄\]\(obsidian://[^)]*_arg0=raws/([^)]+\.json)\)', rest)
+        if vod_match:
+            result[f"{prefix}_path_vod"] = urllib.parse.unquote(vod_match.group(1))
+        if chat_match:
+            result[f"{prefix}_path_chat"] = urllib.parse.unquote(chat_match.group(1))
+        
+        # URLs
+        if not result["yt_url"]:
+            yt_match = re.search(r'(https?://(?:www\.)?youtube\.com/watch\?v=[^\s\)]+)', line)
+            if yt_match:
+                result["yt_url"] = yt_match.group(1)
+        if not result["tw_url"]:
+            tw_match = re.search(r'(https?://(?:www\.)?twitch\.tv/[^\s\)]+/video/\d+)', line)
+            if tw_match:
+                result["tw_url"] = tw_match.group(1)
+
+    # ── Collect sub-notes (non-platform, non-header lines) ──
+    result["notes"] = [
+        line for line in entry_lines[1:]
+        if not re.match(r'^\t`(YT|TW)`', line)
+    ]
     return result
 
 def write_entry(index, new_lines):
@@ -593,8 +606,6 @@ def offer_downloads(missing, index):
 
 def audit(index):
     """
-    Reconstruct entry #index from scratch.
-
     Flow:
         1. Read Obsidian → date + checkbox + notes (nothing else)
         2. Load cache → find YouTube + Twitch streams by date
@@ -605,7 +616,7 @@ def audit(index):
     """
 
     print(f"\n{'='*60}")
-    print(f"  Reconstructing entry #{index}")
+    print(f"  Auditing entry #{index}")
     print(f"{'='*60}\n")
 
     # ── 1. Read Obsidian (date + checkbox only) ──
@@ -738,11 +749,12 @@ def audit(index):
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # Argument handler
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         return
 
-    # Handle --refresh
+    # Re-freshing cache
     if sys.argv[1] == "--refresh":
         cache = load_cache()
         target = sys.argv[2] if len(sys.argv) > 2 else "all"
@@ -753,13 +765,13 @@ def main():
         print("\n  Cache refreshed.")
         return
 
-    # Normal: reconstruct entry
+    # Audit entry
     try:
         index = int(sys.argv[1])
     except ValueError:
         print(f"  Error: '{sys.argv[1]}' is not a valid index number.")
         return
-
+    
     audit(index)
 
 if __name__ == "__main__":
