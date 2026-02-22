@@ -439,6 +439,7 @@ def parse_entry(index):
     }
 
     if not os.path.exists(CONFIG["obsidian"]):
+        print(f"  ✗ Obsidian file not found: {CONFIG['obsidian']}")
         return result
 
     with open(CONFIG["obsidian"], 'r', encoding='utf-8') as f:
