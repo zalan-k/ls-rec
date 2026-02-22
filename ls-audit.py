@@ -1,90 +1,83 @@
 #!/usr/bin/env python3
 """
-ls-audit - Reconstruct Obsidian livestream entries from authoritative sources.
+ls-audit - Audit and reconstruct Obsidian livestream entries.
+
+Philosophy:
+    The Obsidian entry is the source of truth, but only for: date, checkbox,
+    and user notes. Everything else (titles, URLs, file links) is rebuilt
+    from video IDs — resolved via URL > NAS filename > date-based cache.
+
 Usage:
-    ls-audit <index>            Reconstruct entry #index
-    ls-audit --refresh          Force-refresh the stream cache
-    ls-audit --refresh youtube  Force-refresh YouTube cache only
-    ls-audit --refresh twitch   Force-refresh Twitch cache only
+    ls-audit <index>                        Reconstruct entry
+    ls-audit <index> --yt-id ID             Override YouTube video ID
+    ls-audit <index> --tw-id ID             Override Twitch video ID
+    ls-audit --refresh [youtube|twitch]     Refresh stream cache
+    ls-audit --inject URL                   Add external video to cache
+    ls-audit --inject --manual              Manually add to cache
+    ls-audit --cache-info ID                Look up a cached video by ID
 """
 
-import os, re, sys, json, glob, subprocess, shutil, datetime, urllib.parse, urllib.request
-CONFIG = {
-    "obsidian"       : "/mnt/nas/edit-video_library/Tenma Maemi/archives/Tenma Maemi Livestreams.md",
-    "obsidian_vault" : "archives",
-    "shellcmd_id"    : "4gtship619",
-    "nas_path"       : "/mnt/nas/edit-video_library/Tenma Maemi/archives/raws",
-    "youtube_handle" : "@TenmaMaemi",
-    "twitch_user"    : "tenma",
-    "twitch_user_id" : "664177022",
-    "twitch_client_id"     : "xk0o9l63z2mtf854e509jxhzd75u0k",
-    "twitch_client_secret" : "li5r50yetf66oct982iw1m6x42ww0u",
-}
+import os, re, sys, json, glob, subprocess, shutil, datetime, argparse
+import urllib.parse, urllib.request
+
+# ── Config ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".stream_cache.json")
+with open(os.path.join(SCRIPT_DIR, "config.json")) as f:
+    CONFIG = json.load(f)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def classify_video_id(vid):
-    if vid.lstrip('v').isdigit():
-        return "twitch"
-    return "youtube"
-
-def extract_video_id_from_filename(filename):
-    """Extract [video_id] from filename like '516_title [ID] @ 2026-02-08_04-15.ext'"""
-    m = re.search(r'\[([^\]]+)\]\s*@\s*\d{4}-\d{2}-\d{2}', filename)
-    return m.group(1) if m else None
-
-def build_shell_cmd(filename):
-    """Build obsidian://shell-commands URI for a file."""
-    encoded = urllib.parse.quote(filename, safe='')
-    return (f"obsidian://shell-commands/?vault={CONFIG['obsidian_vault']}"
-            f"&execute={CONFIG['shellcmd_id']}&_arg0=raws/{encoded}")
-
-def build_stream_url(platform, video_id):
-    if platform == "youtube":
-        return f"https://www.youtube.com/watch?v={video_id}"
-    return f"https://www.twitch.tv/{CONFIG['twitch_user']}/video/{video_id}"
-
-def copy_to_clipboard(text):
-    """Try to copy text to system clipboard. Returns True on success."""
-    # Try xclip first, then xsel, then wl-copy (Wayland)
-    for cmd in [["xclip", "-selection", "clipboard"],
-                ["xsel", "--clipboard", "--input"],
-                ["wl-copy"]]:
-        if shutil.which(cmd[0]):
-            try:
-                subprocess.run(cmd, input=text.encode(), check=True, timeout=5)
-                return True
-            except (subprocess.SubprocessError, OSError):
-                continue
-    return False
-
-# ── Stream Cache ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  CACHE
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  Flat lists keyed by platform. Each entry:
+#    id, platform, title, start_time (ISO), duration (seconds), channel, injected
+#
+#  YouTube entries also carry upload_date (YYYYMMDD) for compat.
+#  Injected entries are preserved across refreshes.
 
 def load_cache():
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'r') as f:
-                return json.load(f)
+                raw = json.load(f)
+
+            # Migrate old nested format: {"youtube": {"streams": [...]}}
+            cache = {}
+            for platform in ("youtube", "twitch"):
+                data = raw.get(platform, [])
+                if isinstance(data, dict):
+                    cache[platform] = data.get("streams", data.get("vods", []))
+                elif isinstance(data, list):
+                    cache[platform] = data
+                else:
+                    cache[platform] = []
+            return cache
         except (json.JSONDecodeError, IOError):
             pass
-    return {"youtube": {"streams": []}, "twitch": {"vods": []}}
+    return {"youtube": [], "twitch": []}
+
 
 def save_cache(cache):
     with open(CACHE_FILE, 'w') as f:
         json.dump(cache, f, indent=2)
 
-def _yt_newest_date(cache):
-    streams = cache.get("youtube", {}).get("streams", [])
-    return max((s["upload_date"] for s in streams), default=None)
 
-def _tw_newest_date(cache):
-    vods = cache.get("twitch", {}).get("vods", [])
-    return max((v["created_at"][:10] for v in vods), default=None)
+def _newest_date(streams):
+    """Get newest start_time or upload_date from a list of cache entries."""
+    dates = []
+    for s in streams:
+        st = s.get("start_time", "")[:10]
+        if st:
+            dates.append(st)
+        ud = s.get("upload_date", "")
+        if ud:
+            dates.append(f"{ud[:4]}-{ud[4:6]}-{ud[6:8]}")
+    return max(dates) if dates else None
 
-# ── YouTube: yt-dlp ──────────────────────────────────────────────────────────
+
+# ── YouTube refresh ───────────────────────────────────────────────────────────
 
 def refresh_youtube(cache, full=False):
     count = 100 if full else 10
@@ -119,40 +112,59 @@ def refresh_youtube(cache, full=False):
         try:
             data = json.loads(line)
             vid_id = data.get("id", "")
-            title = data.get("title", "Unknown")
-            upload_date = data.get("upload_date") or data.get("release_date") or ""
-            if vid_id and upload_date:
-                new_streams.append({
-                    "id": vid_id,
-                    "title": title,
-                    "upload_date": upload_date,
-                    "duration": data.get("duration")
-                })
+            if not vid_id:
+                continue
+
+            release_ts = data.get("release_timestamp")
+            upload_date = data.get("upload_date", "")
+
+            if release_ts:
+                start_time = datetime.datetime.fromtimestamp(release_ts).isoformat()
+            elif upload_date:
+                start_time = datetime.datetime.strptime(upload_date, "%Y%m%d").isoformat()
+            else:
+                continue
+
+            new_streams.append({
+                "id":          vid_id,
+                "platform":    "youtube",
+                "title":       data.get("title", "Unknown"),
+                "start_time":  start_time,
+                "upload_date": upload_date,
+                "duration":    data.get("duration"),
+                "channel":     data.get("channel") or CONFIG["youtube_handle"],
+                "injected":    False,
+            })
         except json.JSONDecodeError:
             continue
 
     if not new_streams:
-        print(f"  ⚠ No streams parsed from yt-dlp output")
+        print("  ⚠ No streams parsed")
         return False
 
-    existing = {s["id"]: s for s in cache.get("youtube", {}).get("streams", [])}
+    # Merge: preserve injected, overwrite non-injected by ID
+    existing = {}
+    for s in cache.get("youtube", []):
+        if s.get("injected"):
+            existing[s["id"]] = s          # injected entries kept as-is
+        else:
+            existing.setdefault(s["id"], s)
     for s in new_streams:
-        existing[s["id"]] = s
+        existing[s["id"]] = s              # fresh data wins
 
-    merged = sorted(existing.values(), key=lambda s: s["upload_date"], reverse=True)
-    cache["youtube"] = {"streams": merged}
+    cache["youtube"] = sorted(existing.values(), key=lambda s: s.get("start_time", ""), reverse=True)
     save_cache(cache)
-
-    print(f"  ✔ YouTube cache: {len(merged)} streams (newest: {merged[0]['upload_date']})")
+    print(f"  ✔ YouTube cache: {len(cache['youtube'])} streams")
     return True
 
-# ── Twitch: Helix API ────────────────────────────────────────────────────────
+
+# ── Twitch refresh ────────────────────────────────────────────────────────────
 
 def _twitch_get_token():
     data = urllib.parse.urlencode({
-        "client_id": CONFIG["twitch_client_id"],
+        "client_id":     CONFIG["twitch_client_id"],
         "client_secret": CONFIG["twitch_client_secret"],
-        "grant_type": "client_credentials",
+        "grant_type":    "client_credentials",
     }).encode()
     req = urllib.request.Request("https://id.twitch.tv/oauth2/token", data=data, method="POST")
     try:
@@ -161,6 +173,18 @@ def _twitch_get_token():
     except Exception as e:
         print(f"  ⚠ Twitch auth failed: {e}")
         return None
+
+
+def _parse_twitch_duration(dur_str):
+    """Parse '3h24m18s' → seconds."""
+    if not dur_str:
+        return None
+    total = 0
+    for m in re.finditer(r'(\d+)([hms])', dur_str):
+        val, unit = int(m.group(1)), m.group(2)
+        total += val * {'h': 3600, 'm': 60, 's': 1}[unit]
+    return total or None
+
 
 def refresh_twitch(cache, full=False):
     token = _twitch_get_token()
@@ -171,7 +195,7 @@ def refresh_twitch(cache, full=False):
     print(f"  ⌛ Refreshing Twitch cache ({'full' if full else 'incremental'}, last {limit})...")
 
     headers = {
-        "Client-ID": CONFIG["twitch_client_id"],
+        "Client-ID":     CONFIG["twitch_client_id"],
         "Authorization": f"Bearer {token}",
     }
 
@@ -200,9 +224,13 @@ def refresh_twitch(cache, full=False):
 
         for v in videos:
             all_vods.append({
-                "id": v["id"],
-                "title": v["title"],
-                "created_at": v["created_at"],
+                "id":        v["id"],
+                "platform":  "twitch",
+                "title":     v["title"],
+                "start_time": v["created_at"],
+                "duration":  _parse_twitch_duration(v.get("duration")),
+                "channel":   CONFIG["twitch_user"],
+                "injected":  False,
             })
 
         fetched += len(videos)
@@ -211,201 +239,301 @@ def refresh_twitch(cache, full=False):
             break
 
     if not all_vods:
-        print(f"  ⚠ No VODs returned from Twitch API")
+        print("  ⚠ No VODs returned")
         return False
 
-    existing = {v["id"]: v for v in cache.get("twitch", {}).get("vods", [])}
+    existing = {}
+    for v in cache.get("twitch", []):
+        if v.get("injected"):
+            existing[v["id"]] = v
+        else:
+            existing.setdefault(v["id"], v)
     for v in all_vods:
         existing[v["id"]] = v
 
-    merged = sorted(existing.values(), key=lambda v: v["created_at"], reverse=True)
-    cache["twitch"] = {"vods": merged}
+    cache["twitch"] = sorted(existing.values(), key=lambda v: v.get("start_time", ""), reverse=True)
     save_cache(cache)
-
-    print(f"  ✔ Twitch cache: {len(merged)} VODs (newest: {merged[0]['created_at'][:10]})")
+    print(f"  ✔ Twitch cache: {len(cache['twitch'])} VODs")
     return True
 
-# ── Date-based stream lookup ─────────────────────────────────────────────────
 
-def find_youtube_by_date(cache, target_date):
-    """Search cache for YouTube stream on target_date. Auto-refreshes if needed."""
-    target_str = target_date.strftime("%Y%m%d")
-    newest = _yt_newest_date(cache)
+# ── Cache injection ───────────────────────────────────────────────────────────
 
-    if newest is None:
-        refresh_youtube(cache, full=True)
-    elif target_str > newest:
-        refresh_youtube(cache, full=False)
+def inject_video(url=None):
+    """Add a video to the cache. Fetches metadata via yt-dlp, or prompts manually."""
+    cache = load_cache()
 
-    streams = cache.get("youtube", {}).get("streams", [])
+    if url:
+        print(f"  ⌛ Fetching metadata for: {url}")
+        try:
+            cmd = ["yt-dlp", "--dump-json", "--cookies-from-browser", "firefox", url]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-    # Exact match
-    for s in streams:
-        if s["upload_date"] == target_str:
-            return {"id": s["id"], "title": s["title"]}
+            if result.returncode != 0:
+                print(f"  ⚠ yt-dlp failed. Falling back to manual entry.")
+                return _inject_manual(cache)
 
-    # ±1 day (timezone edge cases)
-    for delta in [-1, 1]:
-        alt_str = (target_date + datetime.timedelta(days=delta)).strftime("%Y%m%d")
-        for s in streams:
-            if s["upload_date"] == alt_str:
-                return {"id": s["id"], "title": s["title"], "note": f"±1d: {alt_str}"}
+            data = json.loads(result.stdout.strip())
+            platform = "twitch" if "twitch.tv" in url else "youtube"
 
-    return None
+            release_ts = data.get("release_timestamp")
+            upload_date = data.get("upload_date", "")
+            if release_ts:
+                start_time = datetime.datetime.fromtimestamp(release_ts).isoformat()
+            elif upload_date:
+                start_time = datetime.datetime.strptime(upload_date, "%Y%m%d").isoformat()
+            else:
+                start_time = datetime.datetime.now().isoformat()
 
-def find_twitch_by_date(cache, target_date):
-    """Search cache for Twitch VOD on target_date. Auto-refreshes if needed."""
-    target_str = target_date.strftime("%Y-%m-%d")
-    newest = _tw_newest_date(cache)
+            entry = {
+                "id":         data.get("id", "unknown"),
+                "platform":   platform,
+                "title":      data.get("title", "Unknown"),
+                "start_time": start_time,
+                "duration":   data.get("duration"),
+                "channel":    data.get("channel") or data.get("uploader") or "unknown",
+                "injected":   True,
+            }
+            if platform == "youtube":
+                entry["upload_date"] = upload_date
 
-    if newest is None:
-        refresh_twitch(cache, full=True)
-    elif target_str > newest:
-        refresh_twitch(cache, full=False)
+        except Exception as e:
+            print(f"  ⚠ Error: {e}")
+            return _inject_manual(cache)
+    else:
+        return _inject_manual(cache)
 
-    vods = cache.get("twitch", {}).get("vods", [])
+    # Show and confirm
+    _print_cache_entry(entry)
+    if input("\n  Add to cache? (y/n): ").strip().lower() != 'y':
+        print("  Skipped.")
+        return
 
-    for v in vods:
-        if v["created_at"][:10] == target_str:
-            return {"id": v["id"], "title": v["title"]}
+    _upsert_cache(cache, entry)
+    print(f"  ✔ Added to {entry['platform']} cache.")
 
-    for delta in [-1, 1]:
-        alt_str = (target_date + datetime.timedelta(days=delta)).strftime("%Y-%m-%d")
-        for v in vods:
-            if v["created_at"][:10] == alt_str:
-                return {"id": v["id"], "title": v["title"], "note": f"±1d: {alt_str}"}
 
-    return None
+def _inject_manual(cache):
+    """Interactive manual cache entry."""
+    print("\n  Manual cache entry:")
 
-# ── Obsidian: minimal entry reader ───────────────────────────────────────────
+    platform = input("  Platform (youtube/twitch): ").strip().lower()
+    if platform not in ("youtube", "twitch"):
+        print("  ✗ Invalid platform.")
+        return
+
+    vid_id = input("  Video ID: ").strip()
+    if not vid_id:
+        print("  ✗ ID required.")
+        return
+
+    title = input("  Title: ").strip() or "Unknown"
+
+    date_str = input("  Start date/time (YYYY-MM-DD or ISO): ").strip()
+    try:
+        if 'T' in date_str:
+            start_time = date_str
+        else:
+            start_time = datetime.datetime.strptime(date_str, "%Y-%m-%d").isoformat()
+    except ValueError:
+        print("  ✗ Invalid date.")
+        return
+
+    dur = input("  Duration in seconds (Enter to skip): ").strip()
+    duration = int(dur) if dur.isdigit() else None
+
+    channel = input("  Channel/uploader: ").strip() or "unknown"
+
+    entry = {
+        "id":         vid_id,
+        "platform":   platform,
+        "title":      title,
+        "start_time": start_time,
+        "duration":   duration,
+        "channel":    channel,
+        "injected":   True,
+    }
+    if platform == "youtube":
+        entry["upload_date"] = start_time[:10].replace("-", "")
+
+    _print_cache_entry(entry)
+    if input("\n  Add to cache? (y/n): ").strip().lower() != 'y':
+        print("  Skipped.")
+        return
+
+    _upsert_cache(cache, entry)
+    print(f"  ✔ Added to {platform} cache.")
+
+
+def _upsert_cache(cache, entry):
+    """Insert or update a cache entry, dedup by ID, save."""
+    platform = entry["platform"]
+    streams = cache.get(platform, [])
+    by_id = {s["id"]: s for s in streams}
+    by_id[entry["id"]] = entry
+    cache[platform] = sorted(by_id.values(), key=lambda s: s.get("start_time", ""), reverse=True)
+    save_cache(cache)
+
+
+def _print_cache_entry(entry):
+    """Pretty-print a cache entry."""
+    dur = f"{entry['duration']}s ({entry['duration']//3600}h{(entry['duration']%3600)//60:02d}m)" if entry.get('duration') else "unknown"
+    print(f"\n  Platform : {entry['platform']}")
+    print(f"  ID       : {entry['id']}")
+    print(f"  Title    : {entry['title']}")
+    print(f"  Start    : {entry['start_time']}")
+    print(f"  Duration : {dur}")
+    print(f"  Channel  : {entry.get('channel', 'unknown')}")
+    print(f"  Injected : {'yes' if entry.get('injected') else 'no'}")
+
+
+def cache_info(vid_id):
+    """Look up a video by ID in cache."""
+    cache = load_cache()
+    for platform in ("youtube", "twitch"):
+        for s in cache.get(platform, []):
+            if s["id"] == vid_id:
+                _print_cache_entry(s)
+                return
+    print(f"  ✗ ID '{vid_id}' not found in cache.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OBSIDIAN PARSER  (tag-based, defensive)
+# ══════════════════════════════════════════════════════════════════════════════
 #
-# We only extract: date, checkbox, and sub-notes.
-# Everything else is reconstructed from API + NAS.
+#  Extracts ONLY: checkbox, date, timezone, video IDs from URLs,
+#  no-stream markers (✗), and user notes.
+#  Everything else is discarded and rebuilt.
 
-def read_entry(index):
+def _extract_video_id_from_url(url):
+    """Extract video ID + platform from a YouTube or Twitch URL."""
+    if not url:
+        return None, None
+
+    m = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+    if m:
+        return m.group(1), "youtube"
+
+    m = re.search(r'twitch\.tv/[^/]+/videos?/(\d+)', url)
+    if m:
+        return m.group(1), "twitch"
+
+    return None, None
+
+
+def parse_entry(index):
+    """
+    Minimal parse of Obsidian entry #index.
+
+    Returns dict with: found, checkbox, date_str, date_obj, tz_str,
+    yt_id, tw_id, no_yt, no_tw, notes.
+    """
     result = {
         "found": False,
-        "checkbox": None, "timestamp": None,
-        "yt_title": None, "tw_title": None,
-        "yt_url": None, "tw_url": None,
-        "yt_path_vod": None, "yt_path_chat": None,
-        "tw_path_vod": None, "tw_path_chat": None,
+        "checkbox": "[ ]",
+        "date_str": None, "date_obj": None, "tz_str": None,
+        "yt_id": None, "tw_id": None,
+        "no_yt": False, "no_tw": False,
         "notes": [],
     }
 
     if not os.path.exists(CONFIG["obsidian"]):
-        print(f"  ✗ Obsidian file not found: {CONFIG['obsidian']}")
         return result
 
     with open(CONFIG["obsidian"], 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
-    # Find the header line for this index
+    # Find header
     start = None
     for i, line in enumerate(lines):
         if re.search(rf'\*\*{index}\*\*\s*:', line):
             start = i
-            result["found"] = True
             break
     if start is None:
         return result
 
+    result["found"] = True
     header = lines[start]
 
     # Checkbox
     cb = re.search(r'\[([ x])\]', header)
-    result["checkbox"] = f"[{cb.group(1)}]" if cb else None
+    if cb:
+        result["checkbox"] = f"[{cb.group(1)}]"
 
-    # Timestamp
+    # Date
     dm = re.search(r'(\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2})', header)
-    tz = re.search(r'\(GMT([+-]?\d+)\)', header)
     if dm:
-        offset = int(tz.group(1)) if tz else 0
-        tz_info = datetime.timezone(datetime.timedelta(hours=offset))
+        result["date_str"] = dm.group(1)
         try:
-            local_dt = datetime.datetime.strptime(dm.group(1), "%Y.%m.%d %H:%M").replace(tzinfo=tz_info)
-            result["timestamp"] = int(local_dt.timestamp())
-        except:
+            result["date_obj"] = datetime.datetime.strptime(dm.group(1), "%Y.%m.%d %H:%M")
+        except ValueError:
             pass
 
-    # ── Collect all entry lines (header + platform lines + notes) ──
-    entry_lines = [header]
+    # Timezone
+    tz = re.search(r'(\(GMT[^)]*\))', header)
+    if tz:
+        result["tz_str"] = tz.group(1)
+
+    # Scan indented lines — tag-based, order-independent
     i = start + 1
     while i < len(lines):
-        stripped = lines[i].strip()
-        if stripped == '---' or re.match(r'^-\s*\[.\]\s*\*\*\d+\*\*', lines[i]):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Entry boundary
+        if stripped == '---' or re.match(r'^-\s*\[.\]\s*\*\*\d+\*\*', line):
             break
-        entry_lines.append(lines[i])
+
+        # YouTube platform line
+        if re.match(r'^\t`YT`', line):
+            if re.search(r'[✗✘]', line):
+                result["no_yt"] = True
+            else:
+                for url in re.findall(r'\]\(([^)]+)\)', line):
+                    vid, plat = _extract_video_id_from_url(url)
+                    if vid and plat == "youtube":
+                        result["yt_id"] = vid
+                        break
+
+        # Twitch platform line
+        elif re.match(r'^\t`TW`', line):
+            if re.search(r'[✗✘]', line):
+                result["no_tw"] = True
+            else:
+                for url in re.findall(r'\]\(([^)]+)\)', line):
+                    vid, plat = _extract_video_id_from_url(url)
+                    if vid and plat == "twitch":
+                        result["tw_id"] = vid
+                        break
+
+        # Anything else under this entry = user note (preserved verbatim)
+        else:
+            result["notes"].append(line)
+
         i += 1
 
-    # ── Parse platform lines ──
-    for line in entry_lines:
-        tag_match = re.match(r'^\t`(YT|TW)`\s*(.*)', line)
-        if not tag_match:
-            continue
-
-        tag, rest = tag_match.group(1), tag_match.group(2)
-        prefix = "yt" if tag == "YT" else "tw"
-
-        # Check for ✗ — explicitly no stream on this platform
-        if rest.strip() in ('✗', '✘'):
-            result[f"{prefix}_title"]       = "SKIP"
-            result[f"{prefix}_url"]         = "SKIP"
-            result[f"{prefix}_path_vod"]    = "SKIP"
-            result[f"{prefix}_path_chat"]   = "SKIP"
-            continue
-
-        # Title: [ title ](url) — grab the text between [ and ](
-        title_match = re.search(r'\[\s*(.+?)\s*\]\(https?://', rest)
-        if title_match:
-            result[f"{prefix}_title"] = title_match.group(1)
-
-        # File paths from shell-command URIs
-        vod_match = re.search(r'\[📁\]\(obsidian://[^)]*_arg0=raws/([^)]+\.mp4)\)', rest)
-        chat_match = re.search(r'\[📄\]\(obsidian://[^)]*_arg0=raws/([^)]+\.json)\)', rest)
-        if vod_match:
-            result[f"{prefix}_path_vod"] = urllib.parse.unquote(vod_match.group(1))
-        if chat_match:
-            result[f"{prefix}_path_chat"] = urllib.parse.unquote(chat_match.group(1))
-        
-        # URLs
-        if not result["yt_url"]:
-            yt_match = re.search(r'(https?://(?:www\.)?youtube\.com/watch\?v=[^\s\)]+)', line)
-            if yt_match:
-                result["yt_url"] = yt_match.group(1)
-        if not result["tw_url"]:
-            tw_match = re.search(r'(https?://(?:www\.)?twitch\.tv/[^\s\)]+/video/\d+)', line)
-            if tw_match:
-                result["tw_url"] = tw_match.group(1)
-
-    # ── Collect sub-notes (non-platform, non-header lines) ──
-    result["notes"] = [
-        line for line in entry_lines[1:]
-        if not re.match(r'^\t`(YT|TW)`', line)
-    ]
     return result
+
 
 def write_entry(index, new_lines):
     """Replace entry #index in the Obsidian file with new_lines."""
     if not os.path.exists(CONFIG["obsidian"]):
-        print(f"  ✗ Obsidian file not found: {CONFIG['obsidian']}")
+        print(f"  ✗ Obsidian file not found")
         return False
 
     with open(CONFIG["obsidian"], 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
-    # Find start of this entry
     start = None
     for i, line in enumerate(lines):
         if re.search(rf'\*\*{index}\*\*\s*:', line):
             start = i
             break
-
     if start is None:
-        print(f"  ✗ Entry #{index} not found for writing.")
+        print(f"  ✗ Entry #{index} not found")
         return False
 
-    # Find end of entry (next entry or --- separator)
     end = start + 1
     while end < len(lines):
         stripped = lines[end].strip()
@@ -413,115 +541,171 @@ def write_entry(index, new_lines):
             break
         end += 1
 
-    # Replace
-    replacement = [line + "\n" for line in new_lines]
+    replacement = [(l if l.endswith('\n') else l + '\n') for l in new_lines]
     lines[start:end] = replacement
 
     with open(CONFIG["obsidian"], 'w', encoding='utf-8') as f:
         f.writelines(lines)
-
     return True
 
-# ── NAS Scanner ──────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ID RESOLUTION
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  Priority:  CLI override → URL in entry → NAS filename → date-based cache
+
+def _extract_video_id_from_filename(filename):
+    """Extract [video_id] from NAS filename like '516_title [ID] @ 2026-02-08_04-15.ext'"""
+    m = re.search(r'\[([^\]]+)\]\s*@\s*\d{4}-\d{2}-\d{2}', filename)
+    return m.group(1) if m else None
+
+
+def _classify_video_id(vid):
+    """Guess platform from a video ID."""
+    return "twitch" if vid.lstrip('v').isdigit() else "youtube"
+
+def _entry_date_to_utc(entry):
+    """Convert entry's local date to UTC using its timezone tag."""
+    dt = entry["date_obj"]
+    if not dt:
+        return None
+    
+    tz_str = entry.get("tz_str", "")
+    m = re.search(r'GMT([+-]?\d+)', tz_str)
+    if m:
+        offset_hours = int(m.group(1))
+        dt = dt - datetime.timedelta(hours=offset_hours)
+    
+    return dt
+
+def _find_in_cache(cache, platform, target_date):
+    """Search cache for a stream within ±1 hour of target_date."""
+    streams = cache.get(platform, [])
+    
+    best_match = None
+    best_delta = None
+    max_delta = datetime.timedelta(hours=1)
+
+    for s in streams:
+        st = s.get("start_time", "")
+        if not st:
+            continue
+        try:
+            stream_dt = datetime.datetime.fromisoformat(st.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            continue
+
+        delta = abs(stream_dt - target_date)
+        if delta <= max_delta and (best_delta is None or delta < best_delta):
+            best_match = s
+            best_delta = delta
+
+    if best_match:
+        if best_delta > datetime.timedelta(minutes=5):
+            best_match = dict(best_match)
+            best_match["_fuzzy"] = f"~{int(best_delta.total_seconds()//60)}min off"
+        return best_match
+
+    return None
+
+
+def resolve_id(platform, entry, nas, cache, cli_override=None):
+    """
+    Resolve video ID for a platform.
+    Returns (video_id, source_description) or (None, None).
+    """
+    tag = "yt" if platform == "youtube" else "tw"
+
+    # 1. CLI override
+    if cli_override:
+        return cli_override, "cli override"
+
+    # 2. Existing URL in Obsidian entry
+    entry_id = entry.get(f"{tag}_id")
+    if entry_id:
+        return entry_id, "entry url"
+
+    # 3. NAS filename
+    nas_file = nas.get(f"{tag}_video")
+    if nas_file:
+        vid = _extract_video_id_from_filename(nas_file)
+        if vid:
+            return vid, "nas filename"
+
+    # 4. Date → cache (auto-refresh if needed)
+    if entry["date_obj"]:
+        newest = _newest_date(cache.get(platform, []))
+        target = entry["date_obj"].strftime("%Y-%m-%d")
+
+        if newest is None:
+            if platform == "youtube":
+                refresh_youtube(cache, full=True)
+            else:
+                refresh_twitch(cache, full=True)
+        elif target > newest:
+            if platform == "youtube":
+                refresh_youtube(cache, full=False)
+            else:
+                refresh_twitch(cache, full=False)
+
+        utc_date = _entry_date_to_utc(entry)
+        if utc_date:
+            match = _find_in_cache(cache, platform, utc_date)
+        if match:
+            label = "cache"
+            if match.get("_fuzzy"):
+                label += f" {match['_fuzzy']}"
+            return match["id"], label
+
+    return None, None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NAS SCANNER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def scan_nas(index):
+    """Scan NAS for files matching this index prefix."""
     found = {"yt_video": None, "yt_chat": None, "tw_video": None, "tw_chat": None}
-    nas = CONFIG["nas_path"]
-    if not os.path.exists(nas):
-        print("  ⚠ NAS not mounted, skipping file scan")
+
+    if not os.path.exists(CONFIG["nas_path"]):
+        print("  ⚠ NAS not mounted")
         return found
 
-    pattern = os.path.join(nas, f"{index}_*")
-    files = glob.glob(pattern)
-
-    for filepath in files:
+    for filepath in glob.glob(os.path.join(CONFIG["nas_path"], f"{index}_*")):
         filename = os.path.basename(filepath)
-        vid = extract_video_id_from_filename(filename)
+        vid = _extract_video_id_from_filename(filename)
         if not vid:
             continue
 
-        platform = classify_video_id(vid)
+        platform = _classify_video_id(vid)
         ext = os.path.splitext(filename)[1].lower()
+        prefix = "yt" if platform == "youtube" else "tw"
 
-        if ext == '.mp4':
-            key = f"{'yt' if platform == 'youtube' else 'tw'}_video"
-        elif ext == '.json':
-            key = f"{'yt' if platform == 'youtube' else 'tw'}_chat"
-        else:
-            continue
-        found[key] = filename
+        if ext == ".mp4":
+            found[f"{prefix}_video"] = filename
+        elif ext == ".json":
+            found[f"{prefix}_chat"] = filename
 
     return found
 
-# ── Entry Builder ────────────────────────────────────────────────────────────
 
-def build_platform_line(tag, url, title, video_file, chat_file):
-    vid_link = f"[📁]({build_shell_cmd(video_file)})" if video_file else "[📁]()"
-    chat_link = f"[📄]({build_shell_cmd(chat_file)})" if chat_file else "[📄]()"
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENTRY BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
 
-    display = title or "untitled"
-    if url:
-        title_link = f"[ {display} ]({url})"
-    else:
-        title_link = f"[ {display} ]()"
+def _build_stream_url(platform, video_id):
+    if platform == "youtube":
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return f"https://www.twitch.tv/{CONFIG['twitch_user']}/video/{video_id}"
 
-    return f"\t`{tag}` {vid_link} {chat_link} {title_link}"
 
-def build_entry(index, entry, nas, yt_info, tw_info):
-    # ── Resolve YouTube ──
-    yt_url, yt_title = None, None
-    no_plat = entry.get("no_platform", set())
-    
-    # Priority 1: NAS file
-    if nas["yt_video"]:
-        vid = extract_video_id_from_filename(nas["yt_video"])
-        if vid:
-            yt_url = build_stream_url("youtube", vid)
-        yt_title = _title_from_filename(nas["yt_video"])
+def _build_shell_cmd(filename):
+    encoded = urllib.parse.quote(filename, safe='')
+    return (f"obsidian://shell-commands/?vault={CONFIG['obsidian_vault']}"
+            f"&execute={CONFIG['shellcmd_id']}&_arg0=raws/{encoded}")
 
-    # Priority 2: API/cache
-    if yt_info:
-        if not yt_url:
-            yt_url = build_stream_url("youtube", yt_info["id"])
-        if not yt_title:
-            yt_title = yt_info.get("title")
-
-    # ── Resolve Twitch ──
-    tw_url, tw_title = None, None
-
-    if nas["tw_video"]:
-        vid = extract_video_id_from_filename(nas["tw_video"])
-        if vid:
-            tw_url = build_stream_url("twitch", vid)
-        tw_title = _title_from_filename(nas["tw_video"])
-
-    if tw_info:
-        if not tw_url:
-            tw_url = build_stream_url("twitch", tw_info["id"])
-        if not tw_title:
-            tw_title = tw_info.get("title")
-
-    # ── Assemble ──
-    date_str = entry["date_str"] or "UNKNOWN"
-    tz_str = entry["tz_str"] or "(GMT-6)"
-
-    lines = []
-    lines.append(f"- {entry['checkbox']} **{index}** : {date_str} {tz_str}  ")
-    if "YT" in no_plat:
-        lines.append("\t`YT` ✗")
-    else:
-        lines.append(build_platform_line("YT", yt_url, yt_title, nas["yt_video"], nas["yt_chat"]))
-
-    if "TW" in no_plat:
-        lines.append("\t`TW` ✗")
-    else:
-        lines.append(build_platform_line("TW", tw_url, tw_title, nas["tw_video"], nas["tw_chat"]))
-
-    # Append preserved sub-notes
-    for note in entry.get("notes", []):
-        lines.append(note.rstrip())
-
-    return lines
 
 def _title_from_filename(filename):
     """Extract clean title from NAS filename."""
@@ -530,58 +714,116 @@ def _title_from_filename(filename):
     name = re.sub(r'\s*\[[^\]]+\]\s*@\s*\d{4}-\d{2}-\d{2}_\d{2}-\d{2}$', '', name)
     return name
 
-# ── Download Integration ─────────────────────────────────────────────────────
 
-def find_ls_download():
+def _get_title(video_id, platform, cache, nas_file):
+    """Resolve display title: cache → NAS filename → fallback."""
+    # Cache lookup
+    for s in cache.get(platform, []):
+        if s["id"] == video_id:
+            return s.get("title")
+    # NAS filename
+    if nas_file:
+        return _title_from_filename(nas_file)
+    return None
+
+
+def _build_platform_line(tag, video_id, platform, title, video_file, chat_file):
+    """Build one platform subline for the Obsidian entry."""
+    vid_link  = f"[📁]({_build_shell_cmd(video_file)})" if video_file else "[📁]()"
+    chat_link = f"[📄]({_build_shell_cmd(chat_file)})" if chat_file else "[📄]()"
+
+    display = title or "untitled"
+    url = _build_stream_url(platform, video_id) if video_id else ""
+    title_link = f"[ {display} ]({url})"
+
+    return f"\t`{tag}` {vid_link} {chat_link} {title_link}"
+
+
+def build_entry(index, entry, nas, cache, yt_id, tw_id):
+    """Assemble the full Obsidian entry block."""
+    lines = []
+
+    # Header (preserved: checkbox, date, timezone)
+    date_str = entry["date_str"] or "UNKNOWN"
+    tz_str = entry["tz_str"] or "(GMT-6)"
+    lines.append(f"- {entry['checkbox']} **{index}** : {date_str} {tz_str}  #stream")
+
+    # YouTube
+    if entry["no_yt"]:
+        lines.append("\t`YT` ✗")
+    else:
+        yt_title = _get_title(yt_id, "youtube", cache, nas["yt_video"]) if yt_id else None
+        lines.append(_build_platform_line("YT", yt_id, "youtube", yt_title, nas["yt_video"], nas["yt_chat"]))
+
+    # Twitch
+    if entry["no_tw"]:
+        lines.append("\t`TW` ✗")
+    else:
+        tw_title = _get_title(tw_id, "twitch", cache, nas["tw_video"]) if tw_id else None
+        lines.append(_build_platform_line("TW", tw_id, "twitch", tw_title, nas["tw_video"], nas["tw_chat"]))
+
+    # User notes (preserved verbatim)
+    for note in entry.get("notes", []):
+        lines.append(note.rstrip('\n'))
+
+    return lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DOWNLOAD INTEGRATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_ls_download():
     path = os.path.join(SCRIPT_DIR, "ls-download.py")
     return path if os.path.exists(path) else None
 
-def identify_missing(nas, yt_url, tw_url):
-    """Figure out what needs downloading."""
+
+def _identify_missing(nas, yt_id, tw_id):
+    """Determine which files are missing from NAS."""
     missing = []
-    if yt_url:
+    if yt_id:
+        url = _build_stream_url("youtube", yt_id)
         if not nas["yt_video"]:
-            missing.append({"platform": "youtube", "type": "video", "url": yt_url, "label": "YT video"})
+            missing.append({"platform": "youtube", "type": "video", "url": url, "label": "YT video"})
         if not nas["yt_chat"]:
-            missing.append({"platform": "youtube", "type": "chat", "url": yt_url, "label": "YT chat"})
-    if tw_url:
+            missing.append({"platform": "youtube", "type": "chat", "url": url, "label": "YT chat"})
+    if tw_id:
+        url = _build_stream_url("twitch", tw_id)
         if not nas["tw_video"]:
-            missing.append({"platform": "twitch", "type": "video", "url": tw_url, "label": "TW video"})
+            missing.append({"platform": "twitch", "type": "video", "url": url, "label": "TW video"})
         if not nas["tw_chat"]:
-            missing.append({"platform": "twitch", "type": "chat", "url": tw_url, "label": "TW chat"})
+            missing.append({"platform": "twitch", "type": "chat", "url": url, "label": "TW chat"})
     return missing
 
-def offer_downloads(missing, index):
-    """Offer to download missing files via ls-download.py. Returns True if anything downloaded."""
-    ls_download = find_ls_download()
+
+def _offer_downloads(missing, index):
+    """Offer to download missing files via ls-download.py."""
+    ls_download = _find_ls_download()
     if not ls_download:
-        print("  ⚠ ls-download.py not found, can't auto-download.")
+        print("  ⚠ ls-download.py not found")
         return False
 
     print("\n  Missing files:")
     for m in missing:
         print(f"    ↓ {m['label']}: {m['url']}")
 
-    confirm = input("\n  Download missing files? (y/n): ").strip().lower()
-    if confirm != 'y':
+    if input("\n  Download? (y/n): ").strip().lower() != 'y':
         print("  Skipped.")
         return False
 
-    # Group by URL
+    # Group by URL to avoid redundant downloads
     by_url = {}
     for m in missing:
-        url = m["url"]
-        if url not in by_url:
-            by_url[url] = {"url": url, "platform": m["platform"], "types": set()}
-        by_url[url]["types"].add(m["type"])
+        if m["url"] not in by_url:
+            by_url[m["url"]] = {"url": m["url"], "platform": m["platform"], "types": set()}
+        by_url[m["url"]]["types"].add(m["type"])
 
     any_success = False
     for url, group in by_url.items():
-        types = group["types"]
-        dl_type = "both" if len(types) > 1 else next(iter(types))
+        dl_type = "both" if len(group["types"]) > 1 else next(iter(group["types"]))
         plat = group["platform"].upper()
-
         print(f"\n  Downloading {plat} ({dl_type})...")
+
         cmd = [
             sys.executable, ls_download,
             "--url", url,
@@ -589,190 +831,200 @@ def offer_downloads(missing, index):
             "--type", dl_type,
             "--output", CONFIG["nas_path"],
         ]
-
         try:
             result = subprocess.run(cmd)
             if result.returncode == 0:
-                print(f"  ✔ {plat} download complete.")
+                print(f"  ✔ {plat} complete.")
                 any_success = True
             else:
-                print(f"  ✗ {plat} download failed (exit {result.returncode}).")
+                print(f"  ✗ {plat} failed (exit {result.returncode})")
         except Exception as e:
-            print(f"  ✗ {plat} download error: {e}")
+            print(f"  ✗ {plat} error: {e}")
 
     return any_success
 
-# ── Main Audit Flow ──────────────────────────────────────────────────────────
 
-def audit(index):
-    """
-    Flow:
-        1. Read Obsidian → date + checkbox + notes (nothing else)
-        2. Load cache → find YouTube + Twitch streams by date
-        3. Scan NAS → find existing files
-        4. Build entry block from API data + NAS files
-        5. Print + copy to clipboard
-        6. If files missing → offer download → re-scan → rebuild
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+#  AUDIT FLOW
+# ══════════════════════════════════════════════════════════════════════════════
 
+def audit(index, yt_override=None, tw_override=None):
+    """
+    Reconstruct entry #index.
+
+    1. Parse Obsidian → checkbox, date, notes, existing video IDs
+    2. Scan NAS → existing files
+    3. Resolve IDs (override → entry URL → NAS → cache)
+    4. Build entry from resolved IDs
+    5. Write to Obsidian
+    6. Offer downloads for missing files
+    """
     print(f"\n{'='*60}")
     print(f"  Auditing entry #{index}")
     print(f"{'='*60}\n")
 
-    # ── 1. Read Obsidian (date + checkbox only) ──
-    entry = read_entry(index)
+    # ── 1. Parse entry ──
+    entry = parse_entry(index)
     if not entry["found"]:
         print(f"  ✗ Entry #{index} not found in Obsidian file.")
         return
 
     if not entry["date_obj"]:
-        print(f"  ✗ Could not parse date from entry #{index}.")
-        print(f"    Raw date_str: {entry['date_str']}")
+        print(f"  ✗ Could not parse date for #{index}")
+        if entry["date_str"]:
+            print(f"    Raw: {entry['date_str']}")
         return
 
-    print(f"  Date     : {entry['date_str']} {entry['tz_str']}")
+    print(f"  Date     : {entry['date_str']} {entry.get('tz_str') or ''}")
     print(f"  Checkbox : {entry['checkbox']}")
+    if entry["no_yt"]:
+        print(f"  YouTube  : ✗ (no stream)")
+    if entry["no_tw"]:
+        print(f"  Twitch   : ✗ (no stream)")
     print()
 
-    no_plat = entry.get("no_platform", set())
-
-    # ── 2. Search cache for streams ──
-    cache = load_cache()
-
-    if "YT" not in no_plat:
-        print("  Searching YouTube...")
-        yt_info = find_youtube_by_date(cache, entry["date_obj"])
-        if yt_info:
-            note = yt_info.get("note", "")
-            print(f"    ✔ {yt_info['title'][:60]}  {note}")
-        else:
-            print(f"    ✗ No YouTube stream found for {entry['date_str']}")
-    else:
-        print("  Skipping YouTube...")
-        yt_info = None
-
-    if "TW" not in no_plat:
-        print("  Searching Twitch...")
-        tw_info = find_twitch_by_date(cache, entry["date_obj"])
-        if tw_info:
-            note = tw_info.get("note", "")
-            print(f"    ✔ {tw_info['title'][:60]}  {note}")
-        else:
-            print(f"    ✗ No Twitch VOD found for {entry['date_str']}")
-    else:
-        print("  Skipping Twitch...")
-        tw_info = None
-    print()
-
-    # ── 3. Scan NAS ──
+    # ── 2. Scan NAS ──
     print("  Scanning NAS...")
     nas = scan_nas(index)
-
-    labels = {"yt_video": "YT video", "yt_chat": "YT chat",
-              "tw_video": "TW video", "tw_chat": "TW chat"}
-    for key, label in labels.items():
+    for key, label in [("yt_video", "YT video"), ("yt_chat", "YT chat"),
+                       ("tw_video", "TW video"), ("tw_chat", "TW chat")]:
         status = f"✔ {nas[key]}" if nas[key] else "✗ not found"
-        print(f"    {status[:2]} {label}: {status[2:]}")
+        print(f"    {status}")
+    print()
+
+    # ── 3. Resolve IDs ──
+    cache = load_cache()
+
+    yt_id, yt_src = (None, None) if entry["no_yt"] else resolve_id("youtube", entry, nas, cache, yt_override)
+    tw_id, tw_src = (None, None) if entry["no_tw"] else resolve_id("twitch",  entry, nas, cache, tw_override)
+
+    print("  ID Resolution:")
+    if not entry["no_yt"]:
+        print(f"    YT: {yt_id or '—'}" + (f"  ← {yt_src}" if yt_src else ""))
+    if not entry["no_tw"]:
+        print(f"    TW: {tw_id or '—'}" + (f"  ← {tw_src}" if tw_src else ""))
     print()
 
     # ── 4. Build entry ──
-    block = build_entry(index, entry, nas, yt_info, tw_info)
-    output_text = "\n".join(block)
+    block = build_entry(index, entry, nas, cache, yt_id, tw_id)
 
-    # ── 5. Write to Obsidian ──
-    print("  ┌─ Entry ────────────────────────────────────────────")
+    print("  ┌─ Reconstructed Entry ──────────────────────────────")
     for line in block:
         print(f"  │ {line}")
-    print("  └──────────────────────────────────────────────────────")
+    print("  └────────────────────────────────────────────────────")
     print()
 
-    confirm = input("  Write to Obsidian? (y/n): ").strip().lower()
-    if confirm == 'y':
+    # ── 5. Write ──
+    if input("  Write to Obsidian? (y/n): ").strip().lower() == 'y':
         if write_entry(index, block):
-            print("  ✔ Written to Obsidian file.")
+            print("  ✔ Written.")
         else:
-            print("  ✗ Failed to write to Obsidian file.")
+            print("  ✗ Write failed.")
     else:
         print("  Skipped.")
     print()
 
-    # ── 6. Check for missing files → offer download ──
-    yt_url = build_stream_url("youtube", yt_info["id"]) if yt_info else None
-    tw_url = build_stream_url("twitch", tw_info["id"]) if tw_info else None
-
-    # Also derive URLs from NAS if cache didn't have them
-    if not yt_url and nas["yt_video"]:
-        vid = extract_video_id_from_filename(nas["yt_video"])
-        if vid:
-            yt_url = build_stream_url("youtube", vid)
-    if not tw_url and nas["tw_video"]:
-        vid = extract_video_id_from_filename(nas["tw_video"])
-        if vid:
-            tw_url = build_stream_url("twitch", vid)
-
-    missing = identify_missing(nas, yt_url, tw_url)
-
+    # ── 6. Missing files → download ──
+    missing = _identify_missing(nas, yt_id, tw_id)
     if not missing:
-        print("  ✔ All files present on NAS.\n")
+        print("  ✔ All files present.\n")
         return
 
-    downloaded = offer_downloads(missing, index)
+    downloaded = _offer_downloads(missing, index)
+    if not downloaded:
+        return
 
-    if downloaded:
-        # Re-scan, rebuild, re-output
-        print("\n  Re-scanning NAS...")
-        nas = scan_nas(index)
-        for key, label in labels.items():
-            status = f"✔ {nas[key]}" if nas[key] else "✗ still missing"
-            print(f"    {status[:2]} {label}: {status[2:]}")
-        print()
+    # Re-scan and rebuild after download
+    print("\n  Re-scanning NAS...")
+    nas = scan_nas(index)
+    for key, label in [("yt_video", "YT video"), ("yt_chat", "YT chat"),
+                       ("tw_video", "TW video"), ("tw_chat", "TW chat")]:
+        status = f"✔ {nas[key]}" if nas[key] else "✗ still missing"
+        print(f"    {status}")
+    print()
 
-        block = build_entry(index, entry, nas, yt_info, tw_info)
-        output_text = "\n".join(block)
+    block = build_entry(index, entry, nas, cache, yt_id, tw_id)
+    print("  ┌─ Updated Entry ────────────────────────────────────")
+    for line in block:
+        print(f"  │ {line}")
+    print("  └────────────────────────────────────────────────────")
+    print()
 
-        print("  ┌─ Updated Entry ────────────────────────────────────")
-        for line in block:
-            print(f"  │ {line}")
-        print("  └──────────────────────────────────────────────────────")
-        print()
-
-        confirm = input("  Write to Obsidian? (y/n): ").strip().lower()
-        if confirm == 'y':
-            if write_entry(index, block):
-                print("  ✔ Written to Obsidian file.")
-            else:
-                print("  ✗ Failed to write to Obsidian file.")
+    if input("  Write to Obsidian? (y/n): ").strip().lower() == 'y':
+        if write_entry(index, block):
+            print("  ✔ Written.")
         else:
-            print("  Skipped.")
-        print()
+            print("  ✗ Write failed.")
+    print()
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # Argument handler
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print(__doc__)
-        return
+    parser = argparse.ArgumentParser(
+        description="Audit and reconstruct Obsidian livestream entries.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  ls-audit 515                            Reconstruct entry #515
+  ls-audit 515 --yt-id dQw4w9WgXcQ       Override YouTube ID for #515
+  ls-audit 515 --tw-id 2345678901        Override Twitch ID for #515
+  ls-audit --refresh                      Refresh all caches
+  ls-audit --refresh youtube              Refresh YouTube only
+  ls-audit --inject URL                   Inject video into cache from URL
+  ls-audit --inject --manual              Manually inject into cache
+  ls-audit --cache-info dQw4w9WgXcQ       Look up cached video by ID
+        """
+    )
 
-    # Re-freshing cache
-    if sys.argv[1] == "--refresh":
+    parser.add_argument("index", nargs="?", type=int,
+                        help="Entry index to audit")
+    parser.add_argument("--yt-id",
+                        help="Override YouTube video ID for this audit")
+    parser.add_argument("--tw-id",
+                        help="Override Twitch video ID for this audit")
+    parser.add_argument("--refresh", nargs="?", const="all",
+                        choices=["all", "youtube", "twitch"],
+                        help="Refresh stream cache")
+    parser.add_argument("--inject", nargs="?", const="__prompt__",
+                        metavar="URL",
+                        help="Inject video into cache (pass URL, or omit for manual)")
+    parser.add_argument("--manual", action="store_true",
+                        help="Use manual input for --inject")
+    parser.add_argument("--cache-info", metavar="ID",
+                        help="Look up a video ID in the cache")
+
+    args = parser.parse_args()
+
+    # ── Dispatch ──
+    if args.refresh is not None:
         cache = load_cache()
-        target = sys.argv[2] if len(sys.argv) > 2 else "all"
-        if target in ("all", "youtube"):
+        if args.refresh in ("all", "youtube"):
             refresh_youtube(cache, full=True)
-        if target in ("all", "twitch"):
+        if args.refresh in ("all", "twitch"):
             refresh_twitch(cache, full=True)
-        print("\n  Cache refreshed.")
+        print("\n  ✔ Cache refreshed.")
         return
 
-    # Audit entry
-    try:
-        index = int(sys.argv[1])
-    except ValueError:
-        print(f"  Error: '{sys.argv[1]}' is not a valid index number.")
+    if args.cache_info:
+        cache_info(args.cache_info)
         return
-    
-    audit(index)
+
+    if args.inject is not None:
+        if args.manual or args.inject == "__prompt__":
+            inject_video(url=None)
+        else:
+            inject_video(url=args.inject)
+        return
+
+    if args.index is None:
+        parser.print_help()
+        return
+
+    audit(args.index, yt_override=args.yt_id, tw_override=args.tw_id)
+
 
 if __name__ == "__main__":
     main()
