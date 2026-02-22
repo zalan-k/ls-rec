@@ -566,20 +566,6 @@ def _classify_video_id(vid):
     """Guess platform from a video ID."""
     return "twitch" if vid.lstrip('v').isdigit() else "youtube"
 
-def _entry_date_to_utc(entry):
-    """Convert entry's local date to UTC using its timezone tag."""
-    dt = entry["date_obj"]
-    if not dt:
-        return None
-    
-    tz_str = entry.get("tz_str", "")
-    m = re.search(r'GMT([+-]?\d+)', tz_str)
-    if m:
-        offset_hours = int(m.group(1))
-        dt = dt - datetime.timedelta(hours=offset_hours)
-    
-    return dt
-
 def _find_in_cache(cache, platform, target_date):
     """Search cache for a stream within ±1 hour of target_date."""
     streams = cache.get(platform, [])
@@ -650,9 +636,7 @@ def resolve_id(platform, entry, nas, cache, cli_override=None):
             else:
                 refresh_twitch(cache, full=False)
 
-        utc_date = _entry_date_to_utc(entry)
-        if utc_date:
-            match = _find_in_cache(cache, platform, utc_date)
+        match = _find_in_cache(cache, platform, entry)
         if match:
             label = "cache"
             if match.get("_fuzzy"):
