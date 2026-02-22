@@ -636,7 +636,7 @@ def resolve_id(platform, entry, nas, cache, cli_override=None):
             else:
                 refresh_twitch(cache, full=False)
 
-        match = _find_in_cache(cache, platform, entry)
+        match = _find_in_cache(cache, platform, entry["date_obj"])
         if match:
             label = "cache"
             if match.get("_fuzzy"):
