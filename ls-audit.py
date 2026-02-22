@@ -476,6 +476,11 @@ def parse_entry(index):
     if tz:
         result["tz_str"] = tz.group(1)
 
+    # Duration
+    dur_m = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', header)
+    if dur_m:
+        result["duration_str"] = dur_m.group(1)
+
     # Scan indented lines — tag-based, order-independent
     i = start + 1
     while i < len(lines):
@@ -731,7 +736,27 @@ def build_entry(index, entry, nas, cache, yt_id, tw_id):
     # Header (preserved: checkbox, date, timezone)
     date_str = entry["date_str"] or "UNKNOWN"
     tz_str = entry["tz_str"] or "(GMT-6)"
-    lines.append(f"- {entry['checkbox']} **{index}** : {date_str} {tz_str}  #stream")
+    # Resolve duration (longer of the two platforms)
+    durations = []
+    for vid_id, platform in [(yt_id, "youtube"), (tw_id, "twitch")]:
+        if not vid_id:
+            continue
+        for s in cache.get(platform, []):
+            if s["id"] == vid_id and s.get("duration"):
+                durations.append(s["duration"])
+                break
+
+    if durations:
+        dur = max(durations)
+        h, rem = divmod(int(dur), 3600)
+        m, s = divmod(rem, 60)
+        dur_str = f" [{h:02d}:{m:02d}:{s:02d}]"
+    elif entry.get("duration_str"):
+        dur_str = f" [{entry['duration_str']}]"
+    else:
+        dur_str = ""
+
+    lines.append(f"- {entry['checkbox']} **{index}** : {date_str} {tz_str}{dur_str}  #stream")
 
     # YouTube
     if entry["no_yt"]:
