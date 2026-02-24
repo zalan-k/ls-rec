@@ -24,6 +24,11 @@ from yt_dlp.utils import sanitize_filename
 DEFAULT_OUTPUT          = '/mnt/nas/edit-video_library/Tenma Maemi/archives/raws'
 TWITCH_DOWNLOADER_CLI   = '/mnt/nvme/livestream-recorder/twitch-downloader/TwitchDownloaderCLI'
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(SCRIPT_DIR, "config.json")) as f:
+    _CONFIG = json.load(f)
+YTDLP = os.path.join(_CONFIG["venv"], "bin", "yt-dlp")
+
 class ManualRecorder:
     def __init__(self, output_dir=None):
         self.output_dir = output_dir or DEFAULT_OUTPUT
@@ -64,7 +69,7 @@ class ManualRecorder:
         output_path = os.path.join(self.output_dir, f"{title}.mp4")
         
         cmd = [
-            "yt-dlp",
+            YTDLP,
             "-f", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "-o", f"{title}.%(ext)s",
             "--no-part",
@@ -108,7 +113,7 @@ class ManualRecorder:
     def _download_chat_ytdlp(self, url, title):
         """Download chat using yt-dlp (YouTube or fallback)."""
         cmd = [
-            "yt-dlp",
+            YTDLP,
             "--skip-download",
             "--write-subs",
             "--sub-langs", "live_chat",
@@ -125,7 +130,7 @@ class ManualRecorder:
         try:
             print("  ⌛ Getting stream info...")
             cmd = [
-                "yt-dlp",
+                YTDLP,
                 "--cookies-from-browser", "firefox",
                 "--dump-json",
                 url

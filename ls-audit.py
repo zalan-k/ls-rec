@@ -824,23 +824,39 @@ def _identify_missing(nas, yt_id, tw_id):
 
 
 def _offer_downloads(missing, index):
-    """Offer to download missing files via ls-download.py."""
     ls_download = _find_ls_download()
     if not ls_download:
         print("  ⚠ ls-download.py not found")
         return False
 
     print("\n  Missing files:")
-    for m in missing:
-        print(f"    ↓ {m['label']}: {m['url']}")
+    for i, m in enumerate(missing):
+        print(f"    {i+1}) {m['label']}: {m['url']}")
 
-    if input("\n  Download? (y/n): ").strip().lower() != 'y':
+    print("\n  Enter numbers to download (e.g. 1 3), 'a' for all, or Enter to skip:")
+    choice = input("  > ").strip().lower()
+
+    if not choice:
         print("  Skipped.")
         return False
 
-    # Group by URL to avoid redundant downloads
+    if choice == 'a':
+        selected = missing
+    else:
+        try:
+            indices = [int(x) - 1 for x in choice.split()]
+            selected = [missing[i] for i in indices if 0 <= i < len(missing)]
+        except ValueError:
+            print("  ✗ Invalid input.")
+            return False
+
+    if not selected:
+        print("  Nothing selected.")
+        return False
+
+    # Group selected by URL
     by_url = {}
-    for m in missing:
+    for m in selected:
         if m["url"] not in by_url:
             by_url[m["url"]] = {"url": m["url"], "platform": m["platform"], "types": set()}
         by_url[m["url"]]["types"].add(m["type"])
