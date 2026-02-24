@@ -26,7 +26,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".stream_cache.json")
 with open(os.path.join(SCRIPT_DIR, "config.json")) as f:
     CONFIG = json.load(f)
-YTDLP = os.path.join(CONFIG["venv"], "bin", "yt-dlp")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CACHE
@@ -85,7 +84,7 @@ def refresh_youtube(cache, full=False):
     print(f"  ⌛ Refreshing YouTube cache ({'full' if full else 'incremental'}, last {count})...")
 
     cmd = [
-        YTDLP, "--dump-json",
+        os.path.join(CONFIG["venv"], "bin", "yt-dlp"), "--dump-json",
         "--playlist-items", f"1:{count}",
         "--cookies-from-browser", "firefox",
         f"https://www.youtube.com/{CONFIG['youtube_handle']}/streams"
@@ -267,7 +266,7 @@ def inject_video(url=None):
     if url:
         print(f"  ⌛ Fetching metadata for: {url}")
         try:
-            cmd = [YTDLP, "--dump-json", "--cookies-from-browser", "firefox", url]
+            cmd = [os.path.join(CONFIG["venv"], "bin", "yt-dlp"), "--dump-json", "--cookies-from-browser", "firefox", url]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
             if result.returncode != 0:
@@ -718,7 +717,7 @@ def _get_title(video_id, platform, cache, nas_file):
     # Last resort: fetch from API rather than show "untitled"
     try:
         url = _build_stream_url(platform, video_id)
-        cmd = [YTDLP, "--dump-json", "--cookies-from-browser", "firefox",
+        cmd = [os.path.join(CONFIG["venv"], "bin", "yt-dlp"), "--dump-json", "--cookies-from-browser", "firefox",
                "--playlist-items", "1", url]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
