@@ -26,6 +26,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(SCRIPT_DIR, ".stream_cache.json")
 with open(os.path.join(SCRIPT_DIR, "config.json")) as f:
     CONFIG = json.load(f)
+YTDLP = os.path.join(CONFIG["venv"], "bin", "yt-dlp")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CACHE
@@ -84,7 +85,7 @@ def refresh_youtube(cache, full=False):
     print(f"  ⌛ Refreshing YouTube cache ({'full' if full else 'incremental'}, last {count})...")
 
     cmd = [
-        "yt-dlp", "--dump-json",
+        YTDLP, "--dump-json",
         "--playlist-items", f"1:{count}",
         "--cookies-from-browser", "firefox",
         f"https://www.youtube.com/{CONFIG['youtube_handle']}/streams"
@@ -266,7 +267,7 @@ def inject_video(url=None):
     if url:
         print(f"  ⌛ Fetching metadata for: {url}")
         try:
-            cmd = ["yt-dlp", "--dump-json", "--cookies-from-browser", "firefox", url]
+            cmd = [YTDLP, "--dump-json", "--cookies-from-browser", "firefox", url]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
             if result.returncode != 0:
@@ -665,6 +666,9 @@ def scan_nas(index):
 
     for filepath in glob.glob(os.path.join(CONFIG["nas_path"], f"{index}_*")):
         filename = os.path.basename(filepath)
+        # -- skip intermediate files
+        if re.search(r'\.f\d+\.\w+$', filename):
+            continue
         vid = _extract_video_id_from_filename(filename)
         if not vid:
             continue
@@ -692,7 +696,8 @@ def _build_stream_url(platform, video_id):
 
 
 def _build_shell_cmd(filename):
-    encoded = urllib.parse.quote(filename, safe='')
+    stem = os.path.splitext(filename)[0]
+    encoded = urllib.parse.quote(stem, safe='')
     return (f"obsidian://shell-commands/?vault={CONFIG['obsidian_vault']}"
             f"&execute={CONFIG['shellcmd_id']}&_arg0=raws/{encoded}")
 
@@ -706,16 +711,30 @@ def _title_from_filename(filename):
 
 
 def _get_title(video_id, platform, cache, nas_file):
-    """Resolve display title: cache → NAS filename → fallback."""
-    # Cache lookup
     for s in cache.get(platform, []):
         if s["id"] == video_id:
             return s.get("title")
-    # NAS filename
     if nas_file:
         return _title_from_filename(nas_file)
+    # Last resort: fetch from API rather than show "untitled"
+    try:
+        url = _build_stream_url(platform, video_id)
+        cmd = [YTDLP, "--dump-json", "--cookies-from-browser", "firefox",
+               "--playlist-items", "1", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            data = json.loads(result.stdout.strip())
+            title = data.get("title") or data.get("description")
+            if title:
+                # Opportunistically cache it
+                _upsert_cache(cache, {
+                    "id": video_id, "platform": platform, "title": title,
+                    "start_time": data.get("upload_date", ""), "injected": False,
+                })
+                return title
+    except Exception:
+        pass
     return None
-
 
 def _build_platform_line(tag, video_id, platform, title, video_file, chat_file):
     """Build one platform subline for the Obsidian entry."""
@@ -835,7 +854,7 @@ def _offer_downloads(missing, index):
         print(f"\n  Downloading {plat} ({dl_type})...")
 
         cmd = [
-            sys.executable, ls_download,
+            os.path.join(CONFIG["venv"], "bin", "python3"), ls_download,
             "--url", url,
             "--prefix", str(index),
             "--type", dl_type,

@@ -69,6 +69,7 @@ class ManualRecorder:
             "-o", f"{title}.%(ext)s",
             "--no-part",
             "--no-mtime",
+            "--concurrent-fragments", "16",   # add this
             "--cookies-from-browser", "firefox",
             url
         ]
