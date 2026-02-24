@@ -696,8 +696,7 @@ def _build_stream_url(platform, video_id):
 
 
 def _build_shell_cmd(filename):
-    stem = os.path.splitext(filename)[0]
-    encoded = urllib.parse.quote(stem, safe='')
+    encoded = urllib.parse.quote(filename, safe='')
     return (f"obsidian://shell-commands/?vault={CONFIG['obsidian_vault']}"
             f"&execute={CONFIG['shellcmd_id']}&_arg0=raws/{encoded}")
 
