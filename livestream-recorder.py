@@ -88,23 +88,95 @@ class CommandServer:
             return "\n".join(lines)
         
         elif cmd == "record":
-            if len(parts) < 2 or parts[1] not in ("youtube", "twitch"):
-                return "Usage: record <youtube|twitch>"
-            plat = parts[1]
-            result = rec.probe_platform(plat)
-            if not result:
-                return f"No live stream found on {plat}."
-            if result["stream_key"] in rec.active_streams:
-                return f"Already recording: {result['obsidian_title']}"
+            if len(parts) < 2:
+                return "Usage: record <youtube|twitch|url>"
+            target = parts[1]
             
-            obsidian_index, is_dual = rec.get_stream_index(plat, datetime.datetime.now())
-            rec.start_stream_recording(
-                result["stream_url"], plat, result["video_id"],
-                result["stream_title"], result["obsidian_title"],
-                result["obsidian_url"], obsidian_index, is_dual
-            )
-            return f"✔ Started recording {plat.upper()}: {result['obsidian_title']} (#{obsidian_index:03d})"
-        
+            # Platform shorthand (existing behavior)
+            if target in ("youtube", "twitch"):
+                result = rec.probe_platform(target)
+                if not result:
+                    return f"No live stream found on {target}."
+                if result["stream_key"] in rec.active_streams:
+                    return f"Already recording: {result['obsidian_title']}"
+                
+                obsidian_index, is_dual = rec.get_stream_index(target, datetime.datetime.now())
+                rec.start_stream_recording(
+                    result["stream_url"], target, result["video_id"],
+                    result["stream_title"], result["obsidian_title"],
+                    result["obsidian_url"], obsidian_index, is_dual
+                )
+                return f"✔ Started recording {target.upper()}: {result['obsidian_title']} (#{obsidian_index:03d})"
+            
+            # Direct URL
+            url = target
+            try:
+                probe_cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json",
+                            "--playlist-items", "1", url]
+                probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                if probe.returncode != 0:
+                    return f"✗ Could not fetch: {url}"
+                
+                data = json.loads(probe.stdout.strip())
+                platform = "twitch" if "twitch.tv" in url else "youtube"
+                title = data.get('fulltitle') or data.get('title') or 'Unknown'
+                video_id = data.get('id', 'unknown')
+                stream_key = f"{platform}_{video_id}"
+                if stream_key in rec.active_streams:
+                    return f"Already recording: {title}"
+                
+                if data.get('is_live', False):
+                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+                    stream_title = sanitize_filename(f"{title} [{video_id}] @ {timestamp}")
+                    obsidian_url = f"https://www.youtube.com/watch?v={video_id}" if platform == "youtube" else url
+                    obsidian_index, is_dual = rec.get_stream_index(platform, datetime.datetime.now())
+                    
+                    rec.start_stream_recording(
+                        url, platform, video_id, stream_title, title,
+                        obsidian_url, obsidian_index, is_dual
+                    )
+                    return f"✔ LIVE — recording started: {title} (#{obsidian_index:03d})"
+                else:
+                    watch_entry = {
+                        "title"      : title,
+                        "last_check" : time.time()
+                    }
+                    rec.watch_list[url] = watch_entry
+                    release_ts = data.get('release_timestamp')
+                    if release_ts:
+                        watch_entry["start_time"] = release_ts
+                        starts_in = release_ts - time.time()
+                        h, m = divmod(int(starts_in) // 60, 60)
+                        return f"✔ Not live yet, watching: {title} (starts in ~{h}h{m:02d}m)"
+                    
+                    return f"✔ Not live yet, watching: {title}"
+            
+            except Exception as e:
+                return f"✗ Error: {e}"
+
+        elif cmd == "unwatch":
+            if len(parts) < 2:
+                if not rec.watch_list:
+                    return "No watched URLs."
+                lines = ["Watched URLs:"]
+                for i, (url, info) in enumerate(rec.watch_list.items(), 1):
+                    lines.append(f"  {i}) {info['title']}")
+                    lines.append(f"     {url}")
+                return "\n".join(lines)
+            
+            url = parts[1]
+            if url in rec.watch_list:
+                removed = rec.watch_list.pop(url)
+                return f"✔ Removed: {removed['title']}"
+            # Try by index
+            try:
+                idx = int(url) - 1
+                key = list(rec.watch_list.keys())[idx]
+                removed = rec.watch_list.pop(key)
+                return f"✔ Removed: {removed['title']}"
+            except (ValueError, IndexError):
+                return "✗ URL not in watch list."
+
         else:
             return "Commands: status | check [youtube|twitch] | record <youtube|twitch>"
 
@@ -132,13 +204,12 @@ class LivestreamRecorder:
 
         # Intitial checks
         self.active_streams = {}
+        self.watch_list = {}
         self.create_output_dirs()
         self.check_disk_space()
         
         # Initialize variables for cleaner console output
-        self.first_stream_ping = True
-        self.last_status_line_count = 0
-        self.first_void_ping = True
+        self.was_streaming = False
         self.last_cleanup_date = None
         
         # Add cooldown tracking for testing
@@ -273,7 +344,7 @@ class LivestreamRecorder:
             logger.error(f"Error creating obsidian entry: {str(e)}")
             return False
 
-    def update_obsidian_entry(self, index, platform, title=None, url=None, stream_title=None):
+    def update_obsidian_entry(self, index, platform, title=None, url=None, stream_title=None, duration_seconds=None):
         """Update platform line or file path in an existing entry"""
         if not os.path.exists(self.config["obsidian"]):
             logger.warning("Obsidian file not found for update")
@@ -298,7 +369,35 @@ class LivestreamRecorder:
                 pattern = rf'(\t`{tag}` )\[📁\]\(\) \[📄\]\(\)'
                 replacement = f'\\1[📁]({shell_base}{encoded}.mp4) [📄]({shell_base}{encoded}.json)'
                 content = re.sub(pattern, replacement, content, count=1)
-            
+
+            # Update duration (keep longer of existing vs new)
+            if duration_seconds is not None:
+                idx_str = str(index).zfill(3)
+                h, rem = divmod(int(duration_seconds), 3600)
+                m, s = divmod(rem, 60)
+                new_dur_str = f"[{h:02d}:{m:02d}:{s:02d}]"
+                
+                existing_match = re.search(
+                    rf'\*\*{idx_str}\*\*.*?\[(\d{{2}}):(\d{{2}}):(\d{{2}})\]', content
+                )
+                
+                if existing_match:
+                    existing_secs = (int(existing_match.group(1)) * 3600 
+                                + int(existing_match.group(2)) * 60 
+                                + int(existing_match.group(3)))
+                    if duration_seconds > existing_secs:
+                        content = re.sub(
+                            rf'(\*\*{idx_str}\*\*.*?)\[\d{{2}}:\d{{2}}:\d{{2}}\]',
+                            rf'\1{new_dur_str}',
+                            content, count=1
+                        )
+                else:
+                    content = re.sub(
+                        rf'(\*\*{idx_str}\*\*.*?)\s+#stream',
+                        rf'\1 {new_dur_str}  #stream',
+                        content, count=1
+                    )
+
             with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
                 f.write(content)
             
@@ -309,6 +408,63 @@ class LivestreamRecorder:
             logger.error(f"Error updating obsidian entry: {str(e)}")
             return False
     
+    def probe_watchlist(self):
+        """Check watched URLs for live status, record when live."""
+        now = time.time()
+
+        for url in list(self.watch_list.keys()):
+            entry = self.watch_list[url]
+            start_time = entry.get("start_time")
+            if start_time:
+                until = start_time - now
+                if until > 4 * 3600:
+                    interval = 3600       # >4h: check hourly
+                elif until > 900:
+                    interval = 300        # 15m–4h: check every 5 min
+                else:
+                    interval = 60         # <15m: check every minute
+            else:
+                interval = 120
+
+            last_check = entry.get("last_check", 0)
+            if now - last_check < interval:
+                continue
+            try:
+                probe_cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json", url]
+                result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+                if result.returncode != 0:
+                    continue
+                
+                data = json.loads(result.stdout.strip())
+                if not data.get('is_live', False):
+                    release_ts = data.get('release_timestamp')
+                    if release_ts:
+                        entry["start_time"] = release_ts
+                    continue
+                
+                platform = "twitch" if "twitch.tv" in url else "youtube"
+                title = data.get('fulltitle') or data.get('title') or 'Unknown'
+                video_id = data.get('id', 'unknown')
+                stream_key = f"{platform}_{video_id}"
+                
+                if stream_key in self.active_streams:
+                    continue
+                
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')
+                stream_title = sanitize_filename(f"{title} [{video_id}] @ {timestamp}")
+                obsidian_url = f"https://www.youtube.com/watch?v={video_id}" if platform == "youtube" else url
+                obsidian_index, is_dual = self.get_stream_index(platform, datetime.datetime.now())
+                
+                logger.info(f"Watched stream went live: {title}")
+                self.start_stream_recording(
+                    url, platform, video_id, stream_title, title,
+                    obsidian_url, obsidian_index, is_dual
+                )
+                del self.watch_list[url]
+                
+            except Exception as e:
+                logger.warning(f"Watch list probe failed for {url}: {e}")
+
     def probe_platform(self, platform):
         """Probe a single platform for live stream. Returns dict with stream info or None."""
         services = {
@@ -443,18 +599,14 @@ class LivestreamRecorder:
                 "--retry-sleep",          "exp=1::10",
                 "--retry-sleep",          "fragment:exp=2::15",
                 "--socket-timeout",       "15",
-                "--cookies-from-browser", "firefox",
-                "--hls-use-mpegts"
-
+                "--cookies-from-browser", "firefox"
             ]
             if platform == "youtube":
                 cmd.extend([])
 
             if platform == "twitch":
                 cmd.extend([
-                    "--concurrent-fragments",   "4",
-                    "--recode-video",           "mp4",
-                    "--ppa",                    "VideoConvertor:-c copy -movflags +faststart",
+                    "--concurrent-fragments",   "4"
                     ])
 
             cmd.append(url)
@@ -468,6 +620,18 @@ class LivestreamRecorder:
             def monitor_completion():
                 process.wait()
                 
+                # # For YouTube: check if stream is still live before treating as complete
+                # if platform == "youtube" and not self.manual_termination_in_progress:
+                #     if process.returncode in (0, 1):
+                #         logger.warning(f"yt-dlp exited for YouTube stream — verifying stream is actually over...")
+                #         time.sleep(15)  # brief wait before re-probe
+                #         still_live = self.probe_platform("youtube")
+                #         if still_live and still_live["video_id"] == identifier:
+                #             logger.warning(f"Stream still live! yt-dlp dropped early. Restarting recording...")
+                #             # Start a fresh recording under the same index/title
+                #             self.start_video_recording(stream_key)
+                #             return  # don't run completion logic yet
+
                 if process.returncode == 0 or process.returncode == 1:
                     logger.info(f"Video download completed successfully: {stream_title}")
                 else:
@@ -749,28 +913,54 @@ class LivestreamRecorder:
             return False
 
     def _upload_file(self, src, dst):
-        """Unified file upload handler"""
         try:
             if os.path.exists(dst):
                 logger.info(f"File already exists on server, removing local copy: {os.path.basename(src)}")
                 os.remove(src)
-                return True
-            
-            if os.name == 'posix':  # macOS/Linux
-                result = subprocess.run(["rsync", "-av", "--remove-source-files", src, dst], check=True)
-                logger.info(f"Successfully uploaded {os.path.basename(src)} using rsync (exit code: {result})")
-            else:  # Windows
-                shutil.copy2(src, dst)
-                if os.path.getsize(src) == os.path.getsize(dst):
+                return True, None
+
+            if src.endswith('.mp4'):
+                # Get actual duration from file
+                duration = None
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1", src],
+                        capture_output=True, text=True
+                    )
+                    if probe.returncode == 0:
+                        duration = float(probe.stdout.strip())
+                except Exception:
+                    pass
+
+                # Remux with faststart for Premiere compatibility
+                result = subprocess.run(
+                    ["ffmpeg", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
                     os.remove(src)
-                    logger.info(f"Successfully uploaded {os.path.basename(src)} using shutil")
+                    logger.info(f"Successfully uploaded {os.path.basename(src)} (faststart remux)")
+                    return True, duration
                 else:
-                    raise Exception("Size mismatch after copy")
-            
-            return True
+                    logger.error(f"ffmpeg remux failed: {result.stderr[-200:]}")
+                    return False, None
+            else:
+                if os.name == 'posix':
+                    subprocess.run(["rsync", "-av", "--remove-source-files", src, dst], check=True)
+                    logger.info(f"Successfully uploaded {os.path.basename(src)} using rsync")
+                else:
+                    shutil.copy2(src, dst)
+                    if os.path.getsize(src) == os.path.getsize(dst):
+                        os.remove(src)
+                        logger.info(f"Successfully uploaded {os.path.basename(src)} using shutil")
+                    else:
+                        raise Exception("Size mismatch after copy")
+                return True, None
+
         except Exception as e:
             logger.error(f"Upload failed for {os.path.basename(src)}: {str(e)}")
-            return False    
+            return False, None
 
     def handle_stream_completion(self, stream_key, upload_files=True):
         if stream_key not in self.active_streams:
@@ -807,11 +997,13 @@ class LivestreamRecorder:
                 chat_file = os.path.join(self.config["output"], f"{stream_title}.json")
                 
                 uploaded_path = None
+                duration = None
                 
                 # Upload video file
                 if os.path.exists(video_file):
                     video_dst = os.path.join(self.config["nas_path"], f"{stream_title}.mp4")
-                    if self._upload_file(video_file, video_dst):
+                    success, duration = self._upload_file(video_file, video_dst)
+                    if success:
                         uploaded_path = video_dst
                 
                 # Upload chat file (simplified verification)
@@ -825,7 +1017,7 @@ class LivestreamRecorder:
                 
                 # Update Obsidian log with server file path
                 if uploaded_path and obsidian_index:
-                    self.update_obsidian_entry(obsidian_index, platform, stream_title=stream_title)
+                    self.update_obsidian_entry(obsidian_index, platform, stream_title=stream_title, duration_seconds=duration)
                     logger.info(f"Successfully uploaded and logged: {stream_title}")
             
             # Remove from active streams
@@ -837,41 +1029,6 @@ class LivestreamRecorder:
             if stream_key in self.active_streams:
                 del self.active_streams[stream_key]
     
-    def daily_maintenance(self):
-        logger.info("Running daily maintenance routine...")
-        
-        # Ensure disk space
-        self.check_disk_space()
-
-        # Ensure temporary output directory is cleaned
-        try:
-            # Find all straggler files
-            video_files = glob.glob(os.path.join(self.config["output"], "*.mp4"))
-            chat_files = glob.glob(os.path.join(self.config["output"], "*.json"))
-            
-            if not video_files and not chat_files:
-                logger.info("No files to clean up.")
-                return
-            logger.info(f"Found {len(video_files)} video files and {len(chat_files)} chat files in temp directory")
-            
-            # Process all files using unified upload handler
-            all_files = [(f, f"{self.config['nas_path']}/{os.path.basename(f)}") for f in video_files + chat_files]
-            
-            for src_file, dst_file in all_files:
-                try:
-                    logger.info(f"Attempting to upload straggler file: {os.path.basename(src_file)}")
-                    if self._upload_file(src_file, dst_file):
-                        logger.info(f"Successfully uploaded straggler file: {os.path.basename(src_file)}")
-                    else:
-                        logger.error(f"Failed to upload straggler file: {os.path.basename(src_file)}")
-                except Exception as e:
-                    logger.error(f"Error processing straggler file {src_file}: {str(e)}")
-        
-            logger.info("Cleanup complete.")
-                    
-        except Exception as e:
-            logger.error(f"Error during daily cleanup: {str(e)}")
-    
     def run(self):
         """Main loop to check for livestreams and manage recordings"""
         logger.info(f"  > Starting livestream monitoring (ping frequency: {self.config['check_interval']} seconds)")
@@ -882,81 +1039,45 @@ class LivestreamRecorder:
         
         try:
             while True:
-                # Check if we should run daily cleanup
-                now = datetime.datetime.now()
-                if (now.hour == self.config["cleanup_hour"] and self.last_cleanup_date != now.date()):
-                    if self.active_streams:
-                        logger.info("Skipping daily maintenance - active streams in progress")
-                    else:
-                        # self.daily_maintenance()
-                        self.last_cleanup_date = datetime.datetime.now().date()
-                
                 # If we have active streams, show status
                 if self.active_streams:
-                    self.first_void_ping = True
-
-                    if self.first_stream_ping:
-                        active_count = len(self.active_streams)
-                        logger.info(f"Active streams: {active_count}")
-                        self.first_stream_ping = False
+                    if not self.was_streaming:
+                        logger.info(f"Active streams: {len(self.active_streams)}")
+                        self.was_streaming = True
 
                 else:
                     # Check if we're in cooldown period
                     if not self.is_monitoring_allowed():
+                        now = datetime.datetime.now()
                         cooldown_remaining = max(0, (self.monitoring_cooldown_until - now).total_seconds())
                         progress = int(20 * (1 - cooldown_remaining / self.config["cooldown_duration"]))
                         current_time = now.strftime("%H:%M:%S")
-                        cooldown_status = f"[{current_time}] Cooldown: [{'#'*progress}{'.'*(20-progress)}] {cooldown_remaining:.0f}s"
-                        self.print_status(cooldown_status, overwrite=True)
+                        print(f"[{current_time}] Cooldown: [{'#'*progress}{'.'*(20-progress)}] {cooldown_remaining:.0f}s")
                         time.sleep(self.config["check_interval"])
                         continue
                     
-                    if self.first_void_ping:
+                    if self.was_streaming:
                         logger.info("No active streams, checking for new livestreams")
-                        print()
-                        self.first_void_ping = False
-                        self.first_stream_ping = True
-                    
-                    # Reset status line count to ensure proper overwriting
-                    self.last_status_line_count = 1
-                    
-                    # Check for new streams (these run async so won't block)
+                        self.was_streaming = False
+
+                    # Check for new streams (async)
                     self.check_stream_status()
                     
                     if not self.active_streams:
-                        current_time = datetime.datetime.now().strftime("%H:%M:%S")
-                        next_check = (datetime.datetime.now() 
-                                      + datetime.timedelta(seconds=self.config["check_interval"])).strftime("%H:%M:%S")
-                        final_status = f"[{current_time}] No active livestreams detected. Next check at {next_check}."
-                        
-                        # Update the status line (overwrite previous status)
-                        self.print_status(final_status, overwrite=True)
+                        current_time = datetime.datetime.now()
+                        next_check = (current_time + datetime.timedelta(seconds=self.config["check_interval"]))
+                        print(f"[{current_time.strftime('%H:%M:%S')}] No active livestreams detected. Next check at {next_check.strftime('%H:%M:%S')}.")
                 
+                # Check watched URLs
+                if self.watch_list:
+                    self.probe_watchlist()
+
                 # Wait for next check
                 time.sleep(self.config["check_interval"])
         
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt, shutting down")
             self.shutdown()
-    
-    def print_status(self, message, overwrite=False):
-        """Print status messages to console, with option to overwrite previous lines"""
-        if overwrite and self.last_status_line_count > 0:
-            # Move cursor up and clear lines
-            sys.stdout.write(f"\033[{self.last_status_line_count}A")  # Move cursor up
-            sys.stdout.write("\033[J")  # Clear from cursor to end of screen
-        
-        # Print the new message
-        print(message)
-        
-        # Count the number of lines in the message
-        if isinstance(message, str):
-            self.last_status_line_count = message.count('\n') + 1
-        else:
-            self.last_status_line_count = 1
-        
-        # Force the output to display immediately
-        sys.stdout.flush()
     
     def create_output_dirs(self):
         Path(self.config["output"]).mkdir(parents=True, exist_ok=True)
@@ -977,12 +1098,8 @@ class LivestreamRecorder:
                 output_free_gb = free_bytes.value / (1024**3)
             
             logger.info(f"  > Disk space available: {output_free_gb:.2f} GB.")
-            
-            # Warn if disk space is low (less than 10GB)
             if output_free_gb < 10:
-                lsw = f"Low disk space: {output_free_gb:.2f} GB remaining."
-                logger.warning(lsw)
-                self.print_status(f"⚠️ WARNING: {lsw}", overwrite=False)
+                logger.warning(f"Low disk space: {output_free_gb:.2f} GB remaining.")
         except Exception as e:
             logger.error(f"Error checking disk space: {str(e)}")
         
