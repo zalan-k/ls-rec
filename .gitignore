@@ -1,2 +1,4 @@
 config.json
 .stream_cache.json
+__pycache__/
+*.pyc

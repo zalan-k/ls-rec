@@ -344,30 +344,31 @@ class LivestreamRecorder:
             logger.error(f"Error creating obsidian entry: {str(e)}")
             return False
 
-    def update_obsidian_entry(self, index, platform, title=None, url=None, stream_title=None, duration_seconds=None):
+    def update_obsidian_entry(self, index, platform, title=None, url=None, stream_title=None, duration_seconds=None, video_ext=".mp4"):
         """Update platform line or file path in an existing entry"""
         if not os.path.exists(self.config["obsidian"]):
             logger.warning("Obsidian file not found for update")
             return False
-        
+
         try:
             tag = "YT" if platform == "youtube" else "TW"
             with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
                 content = f.read()
-            
+
             # Update platform title/url
             if title and url:
                 pattern = rf'(\t`{tag}` )[^\n]*\n'
                 replacement = f'\\1[📁]() [📄]() [ {title} ]({url})\n'
                 content = re.sub(pattern, replacement, content, count=1)
-            
+
             # Update file path
             if stream_title:
                 shell_base = (f"obsidian://shell-commands/?vault={self.config['obsidian_vault']}"
                             f"&execute={self.config['shellcmd_id']}&_arg0=raws/")
                 encoded = urllib.parse.quote(stream_title, safe='')
+                ext = video_ext if video_ext and video_ext.startswith('.') else f".{video_ext or 'mp4'}"
                 pattern = rf'(\t`{tag}` )\[📁\]\(\) \[📄\]\(\)'
-                replacement = f'\\1[📁]({shell_base}{encoded}.mp4) [📄]({shell_base}{encoded}.json)'
+                replacement = f'\\1[📁]({shell_base}{encoded}{ext}) [📄]({shell_base}{encoded}.json)'
                 content = re.sub(pattern, replacement, content, count=1)
 
             # Update duration (keep longer of existing vs new)
@@ -498,7 +499,7 @@ class LivestreamRecorder:
             else:
                 stream_url = svc['url']
                 obsidian_title = data.get('description')
-                obsidian_url = f"{svc['url']}/video/{video_id.lstrip('v')}"
+                obsidian_url = f"{svc['url']}/videos/{video_id.lstrip('v')}"
             
             raw_title = f"{obsidian_title} [{video_id}] @ {timestamp}"
             stream_title = sanitize_filename(raw_title)
@@ -587,8 +588,16 @@ class LivestreamRecorder:
         stream_title = stream["stream_title"]
         
         try:
-            # Build yt-dlp command structure
-            fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            # Build yt-dlp command structure.
+            # YouTube: use plain "best" — constraining to mp4/avc1 produces
+            # poor quality and causes yt-dlp to drop the recording after ~4h
+            # on long streams. The output container may end up as webm/mkv.
+            # Twitch: keep mp4/avc1 selection, since HLS VODs segment cleanly.
+            fmt = (
+                "best"
+                if platform == "youtube"
+                else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            )
             cmd = [
                 "yt-dlp",
                 "--format",               fmt,
@@ -601,8 +610,6 @@ class LivestreamRecorder:
                 "--socket-timeout",       "15",
                 "--cookies-from-browser", "firefox"
             ]
-            if platform == "youtube":
-                cmd.extend([])
 
             if platform == "twitch":
                 cmd.extend([
@@ -912,6 +919,43 @@ class LivestreamRecorder:
             logger.error(f"Error merging chat fragments: {str(e)}")
             return False
 
+    def _find_recorded_video(self, stream_title):
+        """Return the path to the recorded video file for stream_title, or None.
+
+        yt-dlp may emit mp4/mkv/webm/ts depending on the stream; we glob
+        candidate extensions rather than assuming mp4. Intermediate
+        fragment files (e.g. `.f140.m4a`) are skipped.
+        """
+        output_dir = self.config["output"]
+        video_exts = (".mp4", ".mkv", ".webm", ".ts", ".flv", ".mov")
+        for ext in video_exts:
+            candidate = os.path.join(output_dir, f"{stream_title}{ext}")
+            if os.path.exists(candidate):
+                return candidate
+        # Fallback: glob for anything matching the title, skip fragment/intermediate files
+        for path in sorted(glob.glob(os.path.join(output_dir, f"{stream_title}.*"))):
+            base = os.path.basename(path)
+            if re.search(r'\.f\d+\.\w+$', base):
+                continue
+            if base.endswith('.json') or base.endswith('.part'):
+                continue
+            if os.path.splitext(base)[1].lower() in video_exts:
+                return path
+        return None
+
+    def _probe_duration(self, src):
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", src],
+                capture_output=True, text=True
+            )
+            if probe.returncode == 0 and probe.stdout.strip():
+                return float(probe.stdout.strip())
+        except Exception:
+            pass
+        return None
+
     def _upload_file(self, src, dst):
         try:
             if os.path.exists(dst):
@@ -919,21 +963,13 @@ class LivestreamRecorder:
                 os.remove(src)
                 return True, None
 
-            if src.endswith('.mp4'):
-                # Get actual duration from file
-                duration = None
-                try:
-                    probe = subprocess.run(
-                        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                        "-of", "default=noprint_wrappers=1:nokey=1", src],
-                        capture_output=True, text=True
-                    )
-                    if probe.returncode == 0:
-                        duration = float(probe.stdout.strip())
-                except Exception:
-                    pass
+            ext = os.path.splitext(src)[1].lower()
+            is_video = ext in (".mp4", ".mkv", ".webm", ".ts", ".flv", ".mov")
 
-                # Remux with faststart for Premiere compatibility
+            if ext == '.mp4':
+                duration = self._probe_duration(src)
+
+                # Remux with faststart for Premiere compatibility (mp4 only)
                 result = subprocess.run(
                     ["ffmpeg", "-i", src, "-c", "copy", "-movflags", "+faststart", dst],
                     capture_output=True, text=True
@@ -945,18 +981,21 @@ class LivestreamRecorder:
                 else:
                     logger.error(f"ffmpeg remux failed: {result.stderr[-200:]}")
                     return False, None
+
+            # Non-mp4 video (webm/mkv/ts/...) or chat/other files: just copy to NAS.
+            duration = self._probe_duration(src) if is_video else None
+
+            if os.name == 'posix':
+                subprocess.run(["rsync", "-av", "--remove-source-files", src, dst], check=True)
+                logger.info(f"Successfully uploaded {os.path.basename(src)} using rsync")
             else:
-                if os.name == 'posix':
-                    subprocess.run(["rsync", "-av", "--remove-source-files", src, dst], check=True)
-                    logger.info(f"Successfully uploaded {os.path.basename(src)} using rsync")
+                shutil.copy2(src, dst)
+                if os.path.getsize(src) == os.path.getsize(dst):
+                    os.remove(src)
+                    logger.info(f"Successfully uploaded {os.path.basename(src)} using shutil")
                 else:
-                    shutil.copy2(src, dst)
-                    if os.path.getsize(src) == os.path.getsize(dst):
-                        os.remove(src)
-                        logger.info(f"Successfully uploaded {os.path.basename(src)} using shutil")
-                    else:
-                        raise Exception("Size mismatch after copy")
-                return True, None
+                    raise Exception("Size mismatch after copy")
+            return True, duration
 
         except Exception as e:
             logger.error(f"Upload failed for {os.path.basename(src)}: {str(e)}")
@@ -993,18 +1032,23 @@ class LivestreamRecorder:
             
             # Upload files to server if requested
             if upload_files and os.path.exists(self.config["nas_path"]):
-                video_file = os.path.join(self.config["output"], f"{stream_title}.mp4")
                 chat_file = os.path.join(self.config["output"], f"{stream_title}.json")
-                
+
                 uploaded_path = None
+                uploaded_ext = None
                 duration = None
-                
-                # Upload video file
-                if os.path.exists(video_file):
-                    video_dst = os.path.join(self.config["nas_path"], f"{stream_title}.mp4")
+
+                # Locate the actual recorded video file — yt-dlp picks the
+                # extension based on the chosen format (mp4/mkv/webm/ts...),
+                # so we glob instead of assuming .mp4.
+                video_file = self._find_recorded_video(stream_title)
+                if video_file:
+                    video_ext = os.path.splitext(video_file)[1]
+                    video_dst = os.path.join(self.config["nas_path"], f"{stream_title}{video_ext}")
                     success, duration = self._upload_file(video_file, video_dst)
                     if success:
                         uploaded_path = video_dst
+                        uploaded_ext = video_ext
                 
                 # Upload chat file (simplified verification)
                 if os.path.exists(chat_file):
@@ -1017,7 +1061,7 @@ class LivestreamRecorder:
                 
                 # Update Obsidian log with server file path
                 if uploaded_path and obsidian_index:
-                    self.update_obsidian_entry(obsidian_index, platform, stream_title=stream_title, duration_seconds=duration)
+                    self.update_obsidian_entry(obsidian_index, platform, stream_title=stream_title, duration_seconds=duration, video_ext=uploaded_ext)
                     logger.info(f"Successfully uploaded and logged: {stream_title}")
             
             # Remove from active streams

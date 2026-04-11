@@ -445,10 +445,12 @@ def parse_entry(index):
     with open(CONFIG["obsidian"], 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
-    # Find header
+    # Find header — entries are stored zero-padded to 3 digits (e.g. **005**)
+    idx_str = f"{int(index):03d}"
+    header_re = re.compile(rf'\*\*{idx_str}\*\*\s*:')
     start = None
     for i, line in enumerate(lines):
-        if re.search(rf'\*\*{index}\*\*\s*:', line):
+        if header_re.search(line):
             start = i
             break
     if start is None:
@@ -531,9 +533,11 @@ def write_entry(index, new_lines):
     with open(CONFIG["obsidian"], 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
+    idx_str = f"{int(index):03d}"
+    header_re = re.compile(rf'\*\*{idx_str}\*\*\s*:')
     start = None
     for i, line in enumerate(lines):
-        if re.search(rf'\*\*{index}\*\*\s*:', line):
+        if header_re.search(line):
             start = i
             break
     if start is None:
@@ -655,31 +659,57 @@ def resolve_id(platform, entry, nas, cache, cli_override=None):
 #  NAS SCANNER
 # ══════════════════════════════════════════════════════════════════════════════
 
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".ts", ".flv", ".mov")
+
+
 def scan_nas(index):
-    """Scan NAS for files matching this index prefix."""
+    """Scan NAS for files matching this index prefix.
+
+    Entries are zero-padded to 3 digits on disk (e.g. `005_title...`), but
+    older/manual files may use the bare index. We match both.
+    """
     found = {"yt_video": None, "yt_chat": None, "tw_video": None, "tw_chat": None}
 
     if not os.path.exists(CONFIG["nas_path"]):
         print("  ⚠ NAS not mounted")
         return found
 
-    for filepath in glob.glob(os.path.join(CONFIG["nas_path"], f"{index}_*")):
-        filename = os.path.basename(filepath)
-        # -- skip intermediate files
-        if re.search(r'\.f\d+\.\w+$', filename):
-            continue
-        vid = _extract_video_id_from_filename(filename)
-        if not vid:
-            continue
+    idx_padded = f"{int(index):03d}"
+    patterns = [f"{idx_padded}_*"]
+    if str(index) != idx_padded:
+        patterns.append(f"{index}_*")
 
-        platform = _classify_video_id(vid)
-        ext = os.path.splitext(filename)[1].lower()
-        prefix = "yt" if platform == "youtube" else "tw"
+    seen = set()
+    for pat in patterns:
+        for filepath in glob.glob(os.path.join(CONFIG["nas_path"], pat)):
+            filename = os.path.basename(filepath)
+            if filename in seen:
+                continue
+            seen.add(filename)
 
-        if ext == ".mp4":
-            found[f"{prefix}_video"] = filename
-        elif ext == ".json":
-            found[f"{prefix}_chat"] = filename
+            # Skip intermediate fragment files like `title.f140.m4a`
+            if re.search(r'\.f\d+\.\w+$', filename):
+                continue
+            # Only accept files whose numeric prefix matches exactly
+            m = re.match(r'^(\d+)_', filename)
+            if not m or int(m.group(1)) != int(index):
+                continue
+
+            vid = _extract_video_id_from_filename(filename)
+            if not vid:
+                continue
+
+            platform = _classify_video_id(vid)
+            ext = os.path.splitext(filename)[1].lower()
+            prefix = "yt" if platform == "youtube" else "tw"
+
+            if ext in VIDEO_EXTS:
+                # Prefer mp4 if multiple recordings exist
+                existing = found[f"{prefix}_video"]
+                if not existing or (ext == ".mp4" and not existing.lower().endswith(".mp4")):
+                    found[f"{prefix}_video"] = filename
+            elif ext == ".json":
+                found[f"{prefix}_chat"] = filename
 
     return found
 
@@ -773,7 +803,7 @@ def build_entry(index, entry, nas, cache, yt_id, tw_id):
     else:
         dur_str = ""
 
-    lines.append(f"- {entry['checkbox']} **{index}** : {date_str} {tz_str}{dur_str}  #stream")
+    lines.append(f"- {entry['checkbox']} **{int(index):03d}** : {date_str} {tz_str}{dur_str}  #stream")
 
     # YouTube
     if entry["no_yt"]:
