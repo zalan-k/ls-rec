@@ -17,8 +17,10 @@ Options:
     --output    Output directory (default: NAS raws path)
 """
 
-import os, json, subprocess, datetime, sys, signal, atexit, argparse
+import os, re, glob, json, subprocess, datetime, sys, signal, atexit, argparse
 from yt_dlp.utils import sanitize_filename
+
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".ts", ".flv", ".mov")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DEFAULT_OUTPUT          = '/mnt/nas/edit-video_library/Tenma Maemi/archives/raws'
@@ -42,15 +44,21 @@ class ManualRecorder:
         sys.exit(1)
     
     def _run_download(self, cmd, title, check_path, label):
-        """Run a download command and verify output."""
+        """Run a download command and verify output.
+
+        check_path may be an exact path or a glob pattern (for formats whose
+        extension is decided by yt-dlp). Resolves to the first non-intermediate
+        video file matched.
+        """
         try:
             subprocess.run(cmd, cwd=self.output_dir, check=True, env=os.environ.copy())
-            
-            if os.path.exists(check_path):
+
+            resolved = self._resolve_output(check_path)
+            if resolved:
                 # Rename yt-dlp chat format to plain .json
-                if ".live_chat.json" in check_path:
-                    final = check_path.replace(".live_chat.json", ".json")
-                    os.rename(check_path, final)
+                if resolved.endswith(".live_chat.json"):
+                    final = resolved[:-len(".live_chat.json")] + ".json"
+                    os.rename(resolved, final)
                 print(f"  ✔ {label} completed: {title}")
                 return True
             else:
@@ -62,29 +70,68 @@ class ManualRecorder:
         except Exception as e:
             print(f"  ✗ {label} error: {e}")
             return False
+
+    @staticmethod
+    def _resolve_output(check_path):
+        """Return the actual downloaded file for an exact or glob check_path."""
+        if "*" not in check_path and "?" not in check_path:
+            return check_path if os.path.exists(check_path) else None
+
+        candidates = []
+        for path in glob.glob(check_path):
+            base = os.path.basename(path)
+            # Skip yt-dlp fragment/intermediate files like `title.f140.m4a`
+            if re.search(r'\.f\d+\.\w+$', base):
+                continue
+            if base.endswith(".part") or base.endswith(".ytdl"):
+                continue
+            ext = os.path.splitext(base)[1].lower()
+            if ext in VIDEO_EXTS or ext == ".json":
+                candidates.append(path)
+        if not candidates:
+            return None
+        # Prefer mp4, then the largest file (likely the muxed output)
+        candidates.sort(key=lambda p: (0 if p.endswith(".mp4") else 1, -os.path.getsize(p)))
+        return candidates[0]
     
     def download_video(self, url, title):
         """Download video from URL."""
         print(f"\n  ↓ Downloading video: {title}")
-        output_path = os.path.join(self.output_dir, f"{title}.mp4")
-        
+
+        # YouTube: plain "best" — avoid mp4/avc1 constraints that hurt
+        # quality and cause long-stream breakage. Output ext set by yt-dlp.
+        # Twitch: keep the mp4/avc1 format and remux to mp4 (VODs are HLS).
+        if "twitch.tv" in url:
+            fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            expected_ext = ".mp4"
+        else:
+            fmt = "best"
+            expected_ext = None  # determined by yt-dlp
+
         cmd = [
             YTDLP,
-            "-f", "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "-f", fmt,
             "-o", f"{title}.%(ext)s",
             "--no-part",
             "--no-mtime",
-            "--concurrent-fragments", "16",   # add this
+            "--concurrent-fragments", "16",
             "--cookies-from-browser", "firefox",
             url
         ]
-        
+
         # Twitch VODs need remux
         if "twitch.tv" in url:
             cmd.insert(-1, "--remux-video")
             cmd.insert(-1, "mp4")
-        
-        return self._run_download(cmd, title, output_path, "Video")
+
+        # For YouTube we can't predict the extension up front; pass a glob
+        # pattern and let _run_download resolve it after the fact.
+        if expected_ext:
+            check_path = os.path.join(self.output_dir, f"{title}{expected_ext}")
+        else:
+            check_path = os.path.join(self.output_dir, f"{title}.*")
+
+        return self._run_download(cmd, title, check_path, "Video")
     
     def download_chat(self, url, title):
         """Download chat from URL."""
