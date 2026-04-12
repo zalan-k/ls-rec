@@ -211,43 +211,62 @@ class LivestreamRecorder:
 
     def _cmd_status(self) -> str:
         lines = []
-
-        # Active recordings
-        if self.active_streams:
-            lines.append(f"Recording ({len(self.active_streams)}):")
-            for _, s in self.active_streams.items():
-                elapsed = str(datetime.datetime.now() - s["start_time"]).split(".")[0]
-                state = ("recording"
-                         if s.get("video_process") and s["video_process"].poll() is None
-                         else "stopped")
-                lines.append(f"  [{s['platform'].upper()}] {s['obsidian_title']}")
-                lines.append(f"    {state} | {elapsed} | {s['url']}")
-        else:
-            lines.append("No active recordings.")
-
-        # Watch list
+ 
+        # ── Monitored ────────────────────────────────────────────
+        lines.append("")
+        lines.append(" ─── Monitored ──────────────────────────────────────────────────────")
         if self.watch_list:
-            lines.append(f"\nWatching ({len(self.watch_list)}):")
-            for i, (url, info) in enumerate(self.watch_list.items(), 1):
-                eta = ""
+            t_w = 30  # title width
+            lines.append(f"  {'Platform'} │ {'Title':<{t_w}} │ ETA")
+            lines.append(f"  ─────────┼─{'─' * t_w}─┼─────────────────────")
+            for url, info in self.watch_list.items():
+                platform = "TW" if "twitch.tv" in url else "YT"
+                title = info.get("title", "Unknown")
+                if len(title) > t_w - 3:
+                    title = title[: t_w - 3] + "..."
                 start_ts = info.get("start_time")
                 if start_ts:
                     until = start_ts - time.time()
                     if until > 0:
                         h, m = divmod(int(until) // 60, 60)
-                        eta = f" (starts in ~{h}h{m:02d}m)"
+                        eta = f"~{h}h{m:02d}m"
                     else:
-                        eta = " (should be live)"
-                lines.append(f"  {i}) {info['title']}{eta}")
-                lines.append(f"     {url}")
-
-        # Last check times
+                        eta = "should be live"
+                else:
+                    eta = "unknown"
+                lines.append(f"  {platform:<8} │ {title:<{t_w}} │ {eta}")
+        else:
+            lines.append("  (none)")
+ 
+        # ── Recording ────────────────────────────────────────────
         lines.append("")
+        lines.append(" ─── Recording ─────────────────────────────────────────────────────")
+        if self.active_streams:
+            t_w = 30
+            lines.append(f"  {'Platform'} │ {'Title':<{t_w}} │ {'Elapsed':<8} │ URL")
+            lines.append(f"  ─────────┼─{'─' * t_w}─┼──────────┼─────────────────────")
+            for _, s in self.active_streams.items():
+                plat = s["platform"][:2].upper()
+                title = s.get("obsidian_title", "Unknown")
+                if len(title) > t_w - 3:
+                    title = title[: t_w - 3] + "..."
+                elapsed = str(datetime.datetime.now() - s["start_time"]).split(".")[0]
+                url = s.get("url", "")
+                # Shorten URL for display
+                url_short = url.replace("https://www.", "").replace("https://", "")
+                lines.append(f"  {plat:<8} │ {title:<{t_w}} │ {elapsed:<8} │ {url_short}")
+        else:
+            lines.append("  (none)")
+ 
+        # ── Last Checked ─────────────────────────────────────────
+        lines.append("")
+        lines.append(" ─── Last Checked ──────────────────────────────────────────────────")
         for plat in ("youtube", "twitch"):
             t = self.last_check_time.get(plat)
             ts = t.strftime("%H:%M:%S") if t else "never"
-            lines.append(f"Last checked {plat}: {ts}")
-
+            lines.append(f"  {plat.capitalize():<7} │ {ts}")
+ 
+        lines.append("")
         return "\n".join(lines)
 
     def _cmd_check(self, platform: str | None) -> str:
