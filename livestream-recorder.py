@@ -4,6 +4,8 @@ import os, re, glob, time, json, logging, subprocess, datetime, sys, shutil, sig
 from pathlib import Path
 from yt_dlp.utils import sanitize_filename
 
+import ls_common
+
 # Setup logging with proper UTF-8 encoding
 logging.basicConfig(
     level=logging.INFO,
@@ -111,13 +113,9 @@ class CommandServer:
             # Direct URL
             url = target
             try:
-                probe_cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json",
-                            "--playlist-items", "1", url]
-                probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
-                if probe.returncode != 0:
+                data = rec.ytdlp.probe(url, playlist_items="1")
+                if not data:
                     return f"✗ Could not fetch: {url}"
-                
-                data = json.loads(probe.stdout.strip())
                 platform = "twitch" if "twitch.tv" in url else "youtube"
                 title = data.get('fulltitle') or data.get('title') or 'Unknown'
                 video_id = data.get('id', 'unknown')
@@ -182,21 +180,14 @@ class CommandServer:
 
 class LivestreamRecorder:
     def __init__(self):
-        self.config = {
-            "youtube"           : '@TenmaMaemi',
-            "twitch"            : 'tenma',
-            "priority"          : "youtube",
-            "output"            : "/mnt/nvme/livestream-recorder/tempfiles",
-            "obsidian"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/Tenma Maemi Livestreams.md",
-            "obsidian_vault"    : "archives",
-            "shellcmd_id"       : "4gtship619",
-            "nas_path"          : "/mnt/nas/edit-video_library/Tenma Maemi/archives/raws",
-            "check_interval"    :  60,
-            "cleanup_hour"      :   3,
-            "cooldown_duration" :  30,
-            "dual_stream_cycle" :  10
-        }
-        
+        # Single source of truth: config.json (loaded via ls_common).
+        # Tunables (check_interval, cooldown_duration, ...) have defaults
+        # applied by load_config(); paths / handles / API keys are required.
+        self.config = ls_common.load_config()
+        self.ytdlp = ls_common.YtDlp(self.config)
+        self.cache = ls_common.StreamCache()
+        self.obsidian = ls_common.Obsidian(self.config)
+
         # Startup banner
         logger.info("=" * 60)
         logger.info("Livestream Recorder starting...")
@@ -286,129 +277,8 @@ class LivestreamRecorder:
                 return stream["obsidian_index"], True
         
         # No partner - get new index from Obsidian
-        return self.get_next_obsidian_index(), False
+        return self.obsidian.next_index(), False
 
-    def get_next_obsidian_index(self):
-        """Get the next available index from the Obsidian log file"""
-        if not os.path.exists(self.config["obsidian"]):
-            return 1
-        
-        try:
-            with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            if matches := re.findall(r'\*\*(\d{3})\*\*', content):
-                return max(int(m) for m in matches) + 1
-            return 1
-        except Exception as e:
-            logger.error(f"Error reading obsidian file for index: {str(e)}")
-            return 1
-    
-    def create_obsidian_entry(self, index, platform, title, url):
-        """Create a new Obsidian entry with both platform lines"""
-        if not os.path.exists(os.path.dirname(self.config["obsidian"])):
-            logger.warning(f"NAS path unavailable: {os.path.dirname(self.config['obsidian'])}")
-            return False
-        
-        now = datetime.datetime.now()
-        utc_offset = now.astimezone().utcoffset()
-        hours_offset = int(utc_offset.total_seconds() / 3600)
-        tz_str = f"GMT{hours_offset:+d}"
-        today = now.strftime(f"%Y.%m.%d %H:%M ({tz_str})")
-
-        yt_line = f"[📁]() [📄]() [ {title} ]({url})" if platform == "youtube" else ""
-        tw_line = f"[📁]() [📄]() [ {title} ]({url})" if platform == "twitch" else ""
-        
-        try:
-            try:
-                with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                    content = f.read()
-            except FileNotFoundError:
-                content = ""
-            
-            entry = (
-                f"- [ ] **{index:03d}** : {today}  #stream\n"
-                f"\t`YT` {yt_line}\n"
-                f"\t`TW` {tw_line}\n"
-                f"\t- [ ] \n"
-                f"---\n"
-            )
-            
-            with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(entry + content)
-            
-            logger.info(f"Created new Obsidian entry #{index:03d}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error creating obsidian entry: {str(e)}")
-            return False
-
-    def update_obsidian_entry(self, index, platform, title=None, url=None, stream_title=None, duration_seconds=None, video_ext=".mp4"):
-        """Update platform line or file path in an existing entry"""
-        if not os.path.exists(self.config["obsidian"]):
-            logger.warning("Obsidian file not found for update")
-            return False
-
-        try:
-            tag = "YT" if platform == "youtube" else "TW"
-            with open(self.config["obsidian"], 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # Update platform title/url
-            if title and url:
-                pattern = rf'(\t`{tag}` )[^\n]*\n'
-                replacement = f'\\1[📁]() [📄]() [ {title} ]({url})\n'
-                content = re.sub(pattern, replacement, content, count=1)
-
-            # Update file path
-            if stream_title:
-                shell_base = (f"obsidian://shell-commands/?vault={self.config['obsidian_vault']}"
-                            f"&execute={self.config['shellcmd_id']}&_arg0=raws/")
-                encoded = urllib.parse.quote(stream_title, safe='')
-                ext = video_ext if video_ext and video_ext.startswith('.') else f".{video_ext or 'mp4'}"
-                pattern = rf'(\t`{tag}` )\[📁\]\(\) \[📄\]\(\)'
-                replacement = f'\\1[📁]({shell_base}{encoded}{ext}) [📄]({shell_base}{encoded}.json)'
-                content = re.sub(pattern, replacement, content, count=1)
-
-            # Update duration (keep longer of existing vs new)
-            if duration_seconds is not None:
-                idx_str = str(index).zfill(3)
-                h, rem = divmod(int(duration_seconds), 3600)
-                m, s = divmod(rem, 60)
-                new_dur_str = f"[{h:02d}:{m:02d}:{s:02d}]"
-                
-                existing_match = re.search(
-                    rf'\*\*{idx_str}\*\*.*?\[(\d{{2}}):(\d{{2}}):(\d{{2}})\]', content
-                )
-                
-                if existing_match:
-                    existing_secs = (int(existing_match.group(1)) * 3600 
-                                + int(existing_match.group(2)) * 60 
-                                + int(existing_match.group(3)))
-                    if duration_seconds > existing_secs:
-                        content = re.sub(
-                            rf'(\*\*{idx_str}\*\*.*?)\[\d{{2}}:\d{{2}}:\d{{2}}\]',
-                            rf'\1{new_dur_str}',
-                            content, count=1
-                        )
-                else:
-                    content = re.sub(
-                        rf'(\*\*{idx_str}\*\*.*?)\s+#stream',
-                        rf'\1 {new_dur_str}  #stream',
-                        content, count=1
-                    )
-
-            with open(self.config["obsidian"], 'w', encoding='utf-8') as f:
-                f.write(content)
-            
-            logger.info(f"Updated Obsidian entry #{index:03d} ({platform})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating obsidian entry: {str(e)}")
-            return False
-    
     def probe_watchlist(self):
         """Check watched URLs for live status, record when live."""
         now = time.time()
@@ -431,12 +301,9 @@ class LivestreamRecorder:
             if now - last_check < interval:
                 continue
             try:
-                probe_cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json", url]
-                result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
-                if result.returncode != 0:
+                data = self.ytdlp.probe(url)
+                if not data:
                     continue
-                
-                data = json.loads(result.stdout.strip())
                 if not data.get('is_live', False):
                     release_ts = data.get('release_timestamp')
                     if release_ts:
@@ -470,22 +337,19 @@ class LivestreamRecorder:
         """Probe a single platform for live stream. Returns dict with stream info or None."""
         services = {
             'youtube': {
-                'url': f"https://www.youtube.com/{self.config['youtube']}/live",
-                'extra_args': ["--playlist-items", "1"]
+                'url': f"https://www.youtube.com/{self.config['youtube_handle']}/live",
+                'playlist_items': "1",
             },
             'twitch': {
-                'url': f"https://www.twitch.tv/{self.config['twitch']}",
-                'extra_args': []
+                'url': f"https://www.twitch.tv/{self.config['twitch_user']}",
+                'playlist_items': None,
             }
         }
         svc = services[platform]
         try:
-            cmd = ["yt-dlp", "--cookies-from-browser", "firefox", "--dump-json"] + svc['extra_args'] + [svc['url']]
-            process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if process.returncode != 0:
+            data = self.ytdlp.probe(svc['url'], playlist_items=svc['playlist_items'])
+            if not data:
                 return None
-            
-            data = json.loads(process.stdout.strip())
             if not data.get('is_live', False):
                 return None
             
@@ -542,10 +406,23 @@ class LivestreamRecorder:
         
         # Update Obsidian log
         if is_dual:
-            self.update_obsidian_entry(obsidian_index, platform, title=obsidian_title, url=obsidian_url)
+            self.obsidian.update_entry(obsidian_index, platform, title=obsidian_title, url=obsidian_url)
         else:
-            self.create_obsidian_entry(obsidian_index, platform, obsidian_title, obsidian_url)
-        
+            self.obsidian.create_entry(obsidian_index, platform, obsidian_title, obsidian_url)
+
+        # Cache upsert — record platform side of this stream against internal
+        # index so ls-audit doesn't have to rediscover it via date matching.
+        tag = "yt" if platform == "youtube" else "tw"
+        self.cache.upsert(
+            obsidian_index,
+            **{
+                f"{tag}_id":        identifier,
+                f"{tag}_title":     obsidian_title,
+                f"{tag}_starttime": datetime.datetime.now().isoformat(),
+            },
+        )
+        self.cache.save()
+
         # Prepend index to stream title for filename
         stream_title = f"{obsidian_index:03d}_{stream_title}"
 
@@ -588,36 +465,7 @@ class LivestreamRecorder:
         stream_title = stream["stream_title"]
         
         try:
-            # Build yt-dlp command structure.
-            # YouTube: use plain "best" — constraining to mp4/avc1 produces
-            # poor quality and causes yt-dlp to drop the recording after ~4h
-            # on long streams. The output container may end up as webm/mkv.
-            # Twitch: keep mp4/avc1 selection, since HLS VODs segment cleanly.
-            fmt = (
-                "best"
-                if platform == "youtube"
-                else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-            )
-            cmd = [
-                "yt-dlp",
-                "--format",               fmt,
-                "-o",                     f"{stream_title}.%(ext)s",
-                "--no-part",
-                "--retries",              "10",
-                "--fragment-retries",     "3",
-                "--retry-sleep",          "exp=1::10",
-                "--retry-sleep",          "fragment:exp=2::15",
-                "--socket-timeout",       "15",
-                "--cookies-from-browser", "firefox"
-            ]
-
-            if platform == "twitch":
-                cmd.extend([
-                    "--concurrent-fragments",   "4"
-                    ])
-
-            cmd.append(url)
-            
+            cmd = self.ytdlp.build_live_cmd(url, platform, f"{stream_title}.%(ext)s")
             process = subprocess.Popen(cmd, cwd=self.config["output"])
             self.active_streams[stream_key]["video_process"] = process
             
@@ -675,7 +523,7 @@ class LivestreamRecorder:
             self.active_streams[stream_key]["chat_stop_event"] = stop_event
 
             if platform == "twitch":
-                channel = self.config["twitch"]
+                channel = self.config["twitch_user"]
                 stream_start = int(stream["start_time"].timestamp() * 1000)
                 output_path = os.path.join(self.config["output"], f"{stream_title}.json")
                 
@@ -825,16 +673,8 @@ class LivestreamRecorder:
             else:
                 def chat_download_thread():
                     try:
-                        cmd = [
-                            "yt-dlp",
-                            "--skip-download",
-                            "--write-subs",
-                            "--sub-langs", "live_chat",
-                            "--cookies-from-browser", "firefox",
-                            "-o", f"{stream_title}.%(ext)s",
-                            url
-                        ]
-                        
+                        cmd = self.ytdlp.build_chat_cmd(url, f"{stream_title}.%(ext)s")
+
                         process = subprocess.Popen(
                             cmd,
                             cwd=self.config["output"],
@@ -1061,7 +901,12 @@ class LivestreamRecorder:
                 
                 # Update Obsidian log with server file path
                 if uploaded_path and obsidian_index:
-                    self.update_obsidian_entry(obsidian_index, platform, stream_title=stream_title, duration_seconds=duration, video_ext=uploaded_ext)
+                    self.obsidian.update_entry(obsidian_index, platform, stream_title=stream_title, duration_seconds=duration, video_ext=uploaded_ext)
+                    # Mirror the duration into the cache entry for this index.
+                    if duration is not None:
+                        tag = "yt" if platform == "youtube" else "tw"
+                        self.cache.upsert(obsidian_index, **{f"{tag}_duration": int(duration)})
+                        self.cache.save()
                     logger.info(f"Successfully uploaded and logged: {stream_title}")
             
             # Remove from active streams
