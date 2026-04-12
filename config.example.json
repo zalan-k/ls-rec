@@ -1,11 +1,20 @@
 {
-    "obsidian"             : "",
-    "obsidian_vault"       : "",
+    "obsidian"             : "/path/to/Tenma Maemi Livestreams.md",
+    "obsidian_vault"       : "archives",
     "shellcmd_id"          : "",
-    "nas_path"             : "",
-    "youtube_handle"       : "",
-    "twitch_user"          : "",
+    "nas_path"             : "/mnt/nas/.../raws",
+    "output"               : "/mnt/nvme/livestream-recorder/tempfiles",
+    "venv"                 : "/path/to/venv",
+    "youtube_handle"       : "@ChannelHandle",
+    "twitch_user"          : "channel",
     "twitch_user_id"       : "",
     "twitch_client_id"     : "",
-    "twitch_client_secret" : ""
+    "twitch_client_secret" : "",
+
+    "priority"             : "youtube",
+    "check_interval"       : 60,
+    "cleanup_hour"         : 3,
+    "cooldown_duration"    : 30,
+    "dual_stream_cycle"    : 10,
+    "cookies_browser"      : "firefox"
 }

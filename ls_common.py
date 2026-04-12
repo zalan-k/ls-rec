@@ -70,7 +70,7 @@ def load_config(path: str = CONFIG_PATH) -> dict[str, Any]:
     cfg = dict(_DEFAULTS)
     cfg.update(raw)
 
-    missing = [k for k in _REQUIRED_KEYS if not cfg.get(k)]
+    missing = [k for k in _REQUIRED_KEYS if k not in cfg]
     if missing:
         raise ValueError(f"config.json missing required keys: {missing}")
 
@@ -553,6 +553,127 @@ class Obsidian:
         self.path = config["obsidian"]
 
     # ── read ──────────────────────────────────────────────────────────────────
+
+    def parse_entry(self, index: int) -> dict:
+        """Minimal parse of entry #index — used by ls-audit.
+
+        Returns: found, checkbox, date_str, date_obj, tz_str, duration_str,
+        yt_id, tw_id, no_yt, no_tw, notes.
+
+        Only the fields worth preserving across a rebuild are extracted;
+        titles, URLs and file links are discarded and regenerated from IDs.
+        """
+        result: dict[str, Any] = {
+            "found": False,
+            "checkbox": "[ ]",
+            "date_str": None, "date_obj": None, "tz_str": None,
+            "duration_str": None,
+            "yt_id": None, "tw_id": None,
+            "no_yt": False, "no_tw": False,
+            "notes": [],
+        }
+
+        if not os.path.exists(self.path):
+            return result
+
+        with open(self.path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        idx_str = f"{int(index):03d}"
+        header_re = re.compile(rf"\*\*{idx_str}\*\*\s*:")
+        start = None
+        for i, line in enumerate(lines):
+            if header_re.search(line):
+                start = i
+                break
+        if start is None:
+            return result
+
+        result["found"] = True
+        header = lines[start]
+
+        cb = re.search(r"\[([ x])\]", header)
+        if cb:
+            result["checkbox"] = f"[{cb.group(1)}]"
+
+        dm = re.search(r"(\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2})", header)
+        if dm:
+            result["date_str"] = dm.group(1)
+            try:
+                result["date_obj"] = datetime.datetime.strptime(dm.group(1), "%Y.%m.%d %H:%M")
+            except ValueError:
+                pass
+
+        tz = re.search(r"(\(GMT[^)]*\))", header)
+        if tz:
+            result["tz_str"] = tz.group(1)
+
+        dur_m = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", header)
+        if dur_m:
+            result["duration_str"] = dur_m.group(1)
+
+        i = start + 1
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if stripped == "---" or re.match(r"^-\s*\[.\]\s*\*\*\d+\*\*", line):
+                break
+
+            if re.match(r"^\t`YT`", line):
+                if re.search(r"[✗✘]", line):
+                    result["no_yt"] = True
+                else:
+                    for url in re.findall(r"\]\(([^)]+)\)", line):
+                        vid, plat = extract_video_id_from_url(url)
+                        if vid and plat == "youtube":
+                            result["yt_id"] = vid
+                            break
+            elif re.match(r"^\t`TW`", line):
+                if re.search(r"[✗✘]", line):
+                    result["no_tw"] = True
+                else:
+                    for url in re.findall(r"\]\(([^)]+)\)", line):
+                        vid, plat = extract_video_id_from_url(url)
+                        if vid and plat == "twitch":
+                            result["tw_id"] = vid
+                            break
+            else:
+                result["notes"].append(line)
+            i += 1
+
+        return result
+
+    def write_entry(self, index: int, new_lines: list[str]) -> bool:
+        """Replace entry #index with `new_lines` (a list of raw lines, no trailing \\n required)."""
+        if not os.path.exists(self.path):
+            return False
+
+        with open(self.path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        idx_str = f"{int(index):03d}"
+        header_re = re.compile(rf"\*\*{idx_str}\*\*\s*:")
+        start = None
+        for i, line in enumerate(lines):
+            if header_re.search(line):
+                start = i
+                break
+        if start is None:
+            return False
+
+        end = start + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if stripped == "---" or re.match(r"^-\s*\[.\]\s*\*\*\d+\*\*", lines[end]):
+                break
+            end += 1
+
+        replacement = [(l if l.endswith("\n") else l + "\n") for l in new_lines]
+        lines[start:end] = replacement
+
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        return True
 
     def next_index(self) -> int:
         if not os.path.exists(self.path):
