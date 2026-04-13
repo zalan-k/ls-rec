@@ -216,28 +216,40 @@ class LivestreamRecorder:
         # ── Monitored ────────────────────────────────────────────
         lines.append("")
         lines.append(" ─── Monitored ──────────────────────────────────────────────────────")
-        if self.watch_list:
-            t_w = 30  # title width
-            lines.append(f"  {'Platform'} │ {'Title':<{t_w}} │ ETA")
-            lines.append(f"  ─────────┼─{'─' * t_w}─┼─────────────────────")
-            for url, info in self.watch_list.items():
-                platform = "TW" if "twitch.tv" in url else "YT"
-                title = info.get("title", "Unknown")
-                if len(title) > t_w - 3:
-                    title = title[: t_w - 3] + "..."
-                start_ts = info.get("start_time")
-                if start_ts:
-                    until = start_ts - time.time()
-                    if until > 0:
-                        h, m = divmod(int(until) // 60, 60)
-                        eta = f"~{h}h{m:02d}m"
-                    else:
-                        eta = "should be live"
+        t_w = 30  # title width
+
+        # Default channels (always pinged)
+        defaults = [
+            ("YT", self.config["youtube_handle"], f"{self.config['check_interval']}s"),
+            ("TW", self.config["twitch_user"], f"{self.config['check_interval']}s"),
+        ]
+        # Watch list entries
+        watched = []
+        for url, info in self.watch_list.items():
+            plat = "TW" if "twitch.tv" in url else "YT"
+            title = info.get("title", "Unknown")
+            if len(title) > t_w - 3:
+                title = title[: t_w - 3] + "..."
+            start_ts = info.get("start_time")
+            if start_ts:
+                until = start_ts - time.time()
+                if until > 0:
+                    h, m = divmod(int(until) // 60, 60)
+                    eta = f"~{h}h{m:02d}m"
                 else:
-                    eta = "unknown"
-                lines.append(f"  {platform:<8} │ {title:<{t_w}} │ {eta}")
-        else:
-            lines.append("  (none)")
+                    eta = "should be live"
+            else:
+                eta = "unknown"
+            watched.append((plat, title, eta))
+
+        lines.append(f"  {'Platform'} │ {'Title':<{t_w}} │ Interval")
+        lines.append(f"  ─────────┼─{'─' * t_w}─┼─────────────────────")
+        for plat, name, interval in defaults:
+            lines.append(f"  {plat:<8} │ {name:<{t_w}} │ {interval}")
+        if watched:
+            lines.append(f"  ─────────┼─{'─' * t_w}─┼─────────────────────")
+            for plat, title, eta in watched:
+                lines.append(f"  {plat:<8} │ {title:<{t_w}} │ {eta}")
  
         # ── Recording ────────────────────────────────────────────
         lines.append("")
