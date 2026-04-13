@@ -24,6 +24,7 @@ from yt_dlp.utils import sanitize_filename
 import ls_common
 
 SOCKET_PATH = "/tmp/livestream-recorder.sock"
+YT_ROTATION_SECONDS = 3.5 * 3600
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  LOGGING (daemon only — configured lazily so CLI commands stay clean)
@@ -417,7 +418,6 @@ class LivestreamRecorder:
         }
 
     def _check_streams(self):
-        """Auto-probe configured channels for new live streams."""
         if not self._is_monitoring_allowed():
             return
         for platform in ("youtube", "twitch"):
@@ -546,12 +546,70 @@ class LivestreamRecorder:
             target=self._record_chat, args=(stream_key,), daemon=True,
         ).start()
 
+    def _merge_video_parts(self, parts: list[str], output_path: str) -> bool:
+        """Merge multiple video segments into one file via ffmpeg concat."""
+        if len(parts) == 1:
+            # Single file, just rename
+            os.rename(parts[0], output_path)
+            return True
+ 
+        # Build concat list file
+        concat_list = output_path + ".concat.txt"
+        try:
+            with open(concat_list, "w") as f:
+                for p in parts:
+                    # ffmpeg concat requires escaped single quotes in paths
+                    escaped = p.replace("'", "'\\''")
+                    f.write(f"file '{escaped}'\n")
+ 
+            logger.info(f"Merging {len(parts)} segments → {os.path.basename(output_path)}")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", concat_list, "-c", "copy", output_path],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                logger.error(f"Merge failed: {r.stderr[-300:]}")
+                return False
+ 
+            # Verify merged file exists and has reasonable size
+            if not os.path.exists(output_path):
+                return False
+            merged_size = os.path.getsize(output_path)
+            parts_size = sum(os.path.getsize(p) for p in parts)
+            if merged_size < parts_size * 0.9:
+                logger.error("Merged file suspiciously small, keeping parts")
+                os.remove(output_path)
+                return False
+ 
+            # Clean up parts
+            for p in parts:
+                os.remove(p)
+            logger.info(f"Merged {len(parts)} parts successfully")
+            return True
+ 
+        except Exception as e:
+            logger.error(f"Merge error: {e}")
+            return False
+        finally:
+            if os.path.exists(concat_list):
+                os.remove(concat_list)
+
     def _record_video(self, stream_key: str):
         stream = self.active_streams[stream_key]
         url = stream["url"]
         platform = stream["platform"]
-        title = stream["stream_title"]
-
+        base_title = stream["stream_title"]
+ 
+        # Track segment number and file list
+        part = stream.get("_video_part", 1)
+        stream["_video_part"] = part
+        if "_video_parts" not in stream:
+            stream["_video_parts"] = []
+ 
+        # Part suffix only on segment 2+
+        title = f"{base_title}_part{part}" if part > 1 else base_title
+ 
         try:
             cmd = ls_common.ytdlp_live_cmd(
                 self.config, url, platform, f"{title}.%(ext)s",
@@ -559,26 +617,86 @@ class LivestreamRecorder:
             process = subprocess.Popen(cmd, cwd=self.config["output"])
             stream["video_process"] = process
             logger.info(f"Video started: {title}")
-
+ 
             def monitor():
-                process.wait()
+                rotate = (platform == "youtube"
+                          and not self.manual_termination_in_progress)
+ 
+                if rotate:
+                    start = time.time()
+                    while process.poll() is None:
+                        elapsed = time.time() - start
+                        if elapsed >= YT_ROTATION_SECONDS:
+                            logger.info("3h rotation — starting new segment")
+ 
+                            # Spawn next segment BEFORE killing this one
+                            stream["_video_part"] = part + 1
+                            self._record_video(stream_key)
+ 
+                            # Give new process time to connect
+                            time.sleep(5)
+ 
+                            # Kill old process
+                            process.terminate()
+                            try:
+                                process.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+ 
+                            # Register this part file
+                            part_file = self._find_video(title)
+                            if part_file:
+                                stream["_video_parts"].append(part_file)
+                                logger.info(f"Segment saved: {part_file}")
+ 
+                            return  # new monitor handles the rest
+ 
+                        time.sleep(1)
+                else:
+                    process.wait()
+ 
+                # Process exited (stream ended, crash, or manual termination)
                 rc = process.returncode
+ 
+                # Register this (final) part file
+                part_file = self._find_video(title)
+                if part_file:
+                    stream["_video_parts"].append(part_file)
+ 
+                # YouTube: check if stream is actually still live
+                if (platform == "youtube"
+                        and rc in (0, 1)
+                        and not self.manual_termination_in_progress):
+                    time.sleep(15)
+                    still_live = self._probe_platform("youtube")
+                    if (still_live
+                            and still_live["video_id"] == stream["identifier"]):
+                        logger.warning(
+                            "yt-dlp exited but stream still live — restarting"
+                        )
+                        stream["_video_part"] = part + 1
+                        self._record_video(stream_key)
+                        return
+ 
                 if rc in (0, 1):
                     logger.info(f"Video complete: {title}")
                 else:
                     logger.error(f"Video failed ({rc}): {title}")
+ 
                 self._handle_completion(stream_key)
+ 
                 if self.manual_termination_in_progress:
                     active = [
                         s for s in self.active_streams.values()
-                        if s.get("video_process") and s["video_process"].poll() is None
+                        if s.get("video_process")
+                        and s["video_process"].poll() is None
                     ]
                     if not active:
                         print("All streams finished. Cooldown active.")
                         self.manual_termination_in_progress = False
-
+ 
             threading.Thread(target=monitor, daemon=True).start()
-
+ 
         except Exception as e:
             logger.error(f"Video start error: {e}")
             self.active_streams.pop(stream_key, None)
@@ -656,17 +774,54 @@ class LivestreamRecorder:
             if not upload or not os.path.exists(self.config["nas_path"]):
                 return
 
+            # Merge video parts if multiple segments exist
+            parts = stream.get("_video_parts", [])
+            # Filter to files that still exist
+            parts = [p for p in parts if os.path.exists(p)]
+
             # Upload video
             duration = None
             uploaded_ext = None
-            video_file = self._find_video(title)
-            if video_file:
-                ext = os.path.splitext(video_file)[1]
-                dst = os.path.join(self.config["nas_path"], f"{title}{ext}")
-                ok, dur = self._upload(video_file, dst)
-                if ok:
-                    uploaded_ext = ext
-                    duration = dur
+
+            if parts:
+                # Determine output extension from the first part
+                ext = os.path.splitext(parts[0])[1]
+                merged_path = os.path.join(
+                    self.config["output"], f"{title}{ext}",
+                )
+ 
+                if self._merge_video_parts(parts, merged_path):
+                    duration = ls_common.probe_duration(merged_path)
+                    dst = os.path.join(
+                        self.config["nas_path"], f"{title}{ext}",
+                    )
+                    ok, dur = self._upload(merged_path, dst)
+                    if ok:
+                        uploaded_ext = ext
+                        duration = dur or duration
+                else:
+                    # Merge failed — upload parts individually as fallback
+                    logger.warning("Merge failed, uploading parts separately")
+                    for p in parts:
+                        ext = os.path.splitext(p)[1]
+                        dst = os.path.join(
+                            self.config["nas_path"], os.path.basename(p),
+                        )
+                        self._upload(p, dst)
+                    uploaded_ext = os.path.splitext(parts[0])[1]
+                    duration = ls_common.probe_duration(parts[-1])
+            else:
+                # Fallback: no parts tracked, try finding video the old way
+                video_file = self._find_video(title)
+                if video_file:
+                    ext = os.path.splitext(video_file)[1]
+                    dst = os.path.join(
+                        self.config["nas_path"], f"{title}{ext}",
+                    )
+                    ok, dur = self._upload(video_file, dst)
+                    if ok:
+                        uploaded_ext = ext
+                        duration = dur
 
             # Upload chat
             chat_file = os.path.join(self.config["output"], f"{title}.json")
@@ -767,44 +922,43 @@ class LivestreamRecorder:
 
         try:
             while True:
+                # Cooldown after manual termination
+                if not self._is_monitoring_allowed():
+                    now = datetime.datetime.now()
+                    remain = max(
+                        0,
+                        (self.monitoring_cooldown_until - now).total_seconds(),
+                    )
+                    pct = int(
+                        20 * (1 - remain / self.config["cooldown_duration"])
+                    )
+                    ts = now.strftime("%H:%M:%S")
+                    print(
+                        f"[{ts}] Cooldown: "
+                        f"[{'#' * pct}{'.' * (20 - pct)}] {remain:.0f}s"
+                    )
+                    time.sleep(self.config["check_interval"])
+                    continue
+
+                # Always probe, even while already recording
+                self._check_streams()
+
                 if self.active_streams:
                     if not self.was_streaming:
                         logger.info(f"Active: {len(self.active_streams)}")
                         self.was_streaming = True
                 else:
-                    # Cooldown after manual termination
-                    if not self._is_monitoring_allowed():
-                        now = datetime.datetime.now()
-                        remain = max(
-                            0,
-                            (self.monitoring_cooldown_until - now).total_seconds(),
-                        )
-                        pct = int(
-                            20 * (1 - remain / self.config["cooldown_duration"])
-                        )
-                        ts = now.strftime("%H:%M:%S")
-                        print(
-                            f"[{ts}] Cooldown: "
-                            f"[{'#' * pct}{'.' * (20 - pct)}] {remain:.0f}s"
-                        )
-                        time.sleep(self.config["check_interval"])
-                        continue
-
                     if self.was_streaming:
                         logger.info("All streams ended, resuming monitoring")
                         self.was_streaming = False
-
-                    self._check_streams()
-
-                    if not self.active_streams:
-                        now = datetime.datetime.now()
-                        nxt = now + datetime.timedelta(
-                            seconds=self.config["check_interval"],
-                        )
-                        print(
-                            f"[{now.strftime('%H:%M:%S')}] "
-                            f"No streams. Next: {nxt.strftime('%H:%M:%S')}"
-                        )
+                    now = datetime.datetime.now()
+                    nxt = now + datetime.timedelta(
+                        seconds=self.config["check_interval"],
+                    )
+                    print(
+                        f"[{now.strftime('%H:%M:%S')}] "
+                        f"No streams. Next: {nxt.strftime('%H:%M:%S')}"
+                    )
 
                 # Watch list
                 if self.watch_list:
