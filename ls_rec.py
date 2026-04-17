@@ -558,48 +558,87 @@ class LivestreamRecorder:
             target=self._record_chat, args=(stream_key,), daemon=True,
         ).start()
 
-    def _merge_video_parts(self, parts: list[str], output_path: str) -> bool:
-        """Merge multiple video segments into one file via ffmpeg concat."""
-        if len(parts) == 1:
-            # Single file, just rename
-            os.rename(parts[0], output_path)
+    def _merge_video_parts(self, parts_info: list[dict], output_path: str) -> bool:
+        """Merge multiple video segments, trimming DVR overlap."""
+        paths = [p["path"] for p in parts_info]
+
+        if len(paths) == 1:
+            os.rename(paths[0], output_path)
             return True
- 
-        # Build concat list file
+
         concat_list = output_path + ".concat.txt"
+        trimmed_files = []
         try:
+            for i, entry in enumerate(parts_info):
+                p = entry["path"]
+
+                if i == 0:
+                    trimmed_files.append(p)
+                    continue
+
+                # Compute overlap: how much longer the previous file is
+                # than the wall-clock gap between segment starts
+                prev = parts_info[i - 1]
+                wall_clock = entry["started_at"] - prev["started_at"]
+                prev_dur = ls_common.probe_duration(prev["path"])
+
+                # Only trim if previous segment is >30s longer than wall clock
+                # (genuine DVR overlap, not just timestamp jitter)
+                if prev_dur and prev_dur > wall_clock + 30:
+                    overlap = prev_dur - wall_clock
+                    trimmed = p + ".trimmed" + os.path.splitext(p)[1]
+                    r = subprocess.run(
+                        ["ffmpeg", "-y", "-ss", str(overlap),
+                        "-i", p, "-c", "copy", trimmed],
+                        capture_output=True, text=True,
+                    )
+                    if r.returncode == 0 and os.path.exists(trimmed):
+                        trimmed_files.append(trimmed)
+                        logger.info(
+                            f"Trimmed {overlap:.0f}s overlap from "
+                            f"{os.path.basename(p)}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Trim failed for {os.path.basename(p)}, "
+                            f"using untrimmed"
+                        )
+                        trimmed_files.append(p)
+                else:
+                    trimmed_files.append(p)
+
             with open(concat_list, "w") as f:
-                for p in parts:
-                    # ffmpeg concat requires escaped single quotes in paths
+                for p in trimmed_files:
                     escaped = p.replace("'", "'\\''")
                     f.write(f"file '{escaped}'\n")
- 
-            logger.info(f"Merging {len(parts)} segments → {os.path.basename(output_path)}")
+
+            logger.info(
+                f"Merging {len(paths)} segments → "
+                f"{os.path.basename(output_path)}"
+            )
             r = subprocess.run(
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                 "-i", concat_list, "-c", "copy", output_path],
+                "-i", concat_list, "-c", "copy", output_path],
                 capture_output=True, text=True,
             )
             if r.returncode != 0:
                 logger.error(f"Merge failed: {r.stderr[-300:]}")
                 return False
- 
-            # Verify merged file exists and has reasonable size
+
             if not os.path.exists(output_path):
                 return False
-            merged_size = os.path.getsize(output_path)
-            parts_size = sum(os.path.getsize(p) for p in parts)
-            if merged_size < parts_size * 0.9:
-                logger.error("Merged file suspiciously small, keeping parts")
-                os.remove(output_path)
-                return False
- 
-            # Clean up parts
-            for p in parts:
-                os.remove(p)
-            logger.info(f"Merged {len(parts)} parts successfully")
+
+            # Clean up parts and trimmed intermediates
+            for p in paths:
+                if os.path.exists(p):
+                    os.remove(p)
+            for p in trimmed_files:
+                if p not in paths and os.path.exists(p):
+                    os.remove(p)
+
+            logger.info(f"Merged {len(paths)} parts successfully")
             return True
- 
+
         except Exception as e:
             logger.error(f"Merge error: {e}")
             return False
@@ -628,6 +667,8 @@ class LivestreamRecorder:
             )
             process = subprocess.Popen(cmd, cwd=self.config["output"])
             stream["video_process"] = process
+            if part == 1:
+                stream["_segment_start"] = time.time()
             logger.info(f"Video started: {title}")
  
             def monitor():
@@ -639,29 +680,30 @@ class LivestreamRecorder:
                     while process.poll() is None:
                         elapsed = time.time() - start
                         if elapsed >= YT_ROTATION_SECONDS:
-                            logger.info("3h rotation — starting new segment")
- 
-                            # Spawn next segment BEFORE killing this one
-                            stream["_video_part"] = part + 1
-                            self._record_video(stream_key)
- 
-                            # Give new process time to connect
-                            time.sleep(5)
- 
-                            # Kill old process
+                            logger.info("3.5h rotation — stopping current segment")
+
+                            # Kill old process, let it finalize properly
                             process.terminate()
                             try:
-                                process.wait(timeout=10)
+                                process.wait(timeout=180)
                             except subprocess.TimeoutExpired:
                                 process.kill()
- 
-                            # Register this part file
+
+                            # Register this part with its wall-clock start
                             part_file = self._find_video(title)
                             if part_file:
-                                stream["_video_parts"].append(part_file)
+                                stream["_video_parts"].append({
+                                    "path": part_file,
+                                    "started_at": stream.get("_segment_start", start),
+                                })
                                 logger.info(f"Segment saved: {part_file}")
- 
-                            return  # new monitor handles the rest
+
+                            # Rotate chat, then start new video
+                            stream["_video_part"] = part + 1
+                            stream["_segment_start"] = time.time()
+                            self._rotate_chat(stream_key, part + 1)
+                            self._record_video(stream_key)
+                            return
  
                         time.sleep(1)
                 else:
@@ -673,7 +715,10 @@ class LivestreamRecorder:
                 # Register this (final) part file
                 part_file = self._find_video(title)
                 if part_file:
-                    stream["_video_parts"].append(part_file)
+                    stream["_video_parts"].append({
+                        "path": part_file,
+                        "started_at": stream.get("_segment_start", time.time()),
+                    })
  
                 # YouTube: check if stream is actually still live
                 if (platform == "youtube"
@@ -681,13 +726,13 @@ class LivestreamRecorder:
                         and not self.manual_termination_in_progress):
                     time.sleep(15)
                     still_live = self._probe_platform("youtube")
-                    if (still_live
-                            and still_live["video_id"] == stream["identifier"]):
-                        logger.warning(
-                            "yt-dlp exited but stream still live — restarting"
-                        )
+                    if still_live and still_live["video_id"] == stream["identifier"]:
+                        logger.warning("yt-dlp exited but stream still live — restarting")
+
                         stream["_video_part"] = part + 1
+                        stream["_segment_start"] = time.time()
                         self._record_video(stream_key)
+                        self._rotate_chat(stream_key, part + 1)
                         return
  
                 if rc in (0, 1):
@@ -713,10 +758,12 @@ class LivestreamRecorder:
             logger.error(f"Video start error: {e}")
             self.active_streams.pop(stream_key, None)
 
-    def _record_chat(self, stream_key: str):
+    def _record_chat(self, stream_key: str, part: int = 1):
         stream = self.active_streams[stream_key]
         platform = stream["platform"]
-        title = stream["stream_title"]
+        base_title = stream["stream_title"]
+        title = f"{base_title}_part{part}" if part > 1 else base_title
+        stream["_chat_title"] = title
         stop_event = threading.Event()
         stream["chat_stop_event"] = stop_event
 
@@ -760,6 +807,27 @@ class LivestreamRecorder:
         stream["chat_thread"] = thread
         logger.info(f"Chat started: {title}")
 
+    def _rotate_chat(self, stream_key: str, new_part: int):
+        """Stop current chat recorder, wait for its fragment merge, start a new one."""
+        stream = self.active_streams[stream_key]
+
+        old_stop   = stream.get("chat_stop_event")
+        old_thread = stream.get("chat_thread")
+        old_title  = stream.get("_chat_title")
+
+        if old_stop:
+            old_stop.set()
+        if old_thread:
+            old_thread.join(timeout=15)   # lets merge_chat_fragments finish
+
+        if old_title:
+            chat_file = os.path.join(self.config["output"], f"{old_title}.json")
+            if os.path.exists(chat_file):
+                stream.setdefault("_chat_parts", []).append(chat_file)
+                logger.info(f"Chat segment saved: {old_title}.json")
+
+        self._record_chat(stream_key, part=new_part)
+
     # ── completion & upload ───────────────────────────────────────────────
 
     def _handle_completion(self, stream_key: str, upload: bool = True):
@@ -781,67 +849,107 @@ class LivestreamRecorder:
             if stream.get("chat_stop_event"):
                 stream["chat_stop_event"].set()
                 if stream.get("chat_thread"):
-                    stream["chat_thread"].join(timeout=5)
-
+                    stream["chat_thread"].join(timeout=15)   # was 5
+            
             if not upload or not os.path.exists(self.config["nas_path"]):
                 return
+            
+            # Collect all chat parts: prior rotations + the final segment
+            chat_parts = list(stream.get("_chat_parts", []))
+            final_title = stream.get("_chat_title") or title
+            final_chat = os.path.join(self.config["output"], f"{final_title}.json")
+            if os.path.exists(final_chat) and final_chat not in chat_parts:
+                chat_parts.append(final_chat)
+            chat_parts = [p for p in chat_parts
+                        if os.path.exists(p) and os.path.getsize(p) > 100]
+
+            if len(chat_parts) == 1:
+                chat_dst = os.path.join(self.config["nas_path"], f"{title}.json")
+                self._upload(chat_parts[0], chat_dst)
+            elif len(chat_parts) > 1 and platform == "youtube":
+                # YouTube live_chat is JSONL — concat line-wise
+                merged_chat = os.path.join(
+                    self.config["output"], f"{title}.merged_chat.json",
+                )
+                try:
+                    with open(merged_chat, "w", encoding="utf-8") as out:
+                        for p in chat_parts:
+                            with open(p, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            out.write(content)
+                            if content and not content.endswith("\n"):
+                                out.write("\n")
+                    chat_dst = os.path.join(self.config["nas_path"], f"{title}.json")
+                    ok, _ = self._upload(merged_chat, chat_dst)
+                    if ok:
+                        for p in chat_parts:
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.error(f"Chat merge error: {e}")
+                    for p in chat_parts:
+                        dst = os.path.join(self.config["nas_path"], os.path.basename(p))
+                        self._upload(p, dst)
 
             # Merge video parts if multiple segments exist
-            parts = stream.get("_video_parts", [])
-            # Filter to files that still exist
-            parts = [p for p in parts if os.path.exists(p)]
+            raw_parts = stream.get("_video_parts", [])
+            # Filter to files that still exist and aren't stubs
+            parts_info = []
+            for entry in raw_parts:
+                p = entry["path"]
+                if not os.path.exists(p):
+                    continue
+                dur = ls_common.probe_duration(p)
+                if dur is None or dur < 10:
+                    logger.warning(
+                        f"Dropping bad segment: {os.path.basename(p)} "
+                        f"(duration={dur})"
+                    )
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                    continue
+                parts_info.append(entry)
 
-            # Upload video
             duration = None
             uploaded_ext = None
 
-            if parts:
-                # Determine output extension from the first part
-                ext = os.path.splitext(parts[0])[1]
+            if parts_info:
+                ext = os.path.splitext(parts_info[0]["path"])[1]
                 merged_path = os.path.join(
-                    self.config["output"], f"{title}{ext}",
+                    self.config["output"], f"{title}.merged{ext}",
                 )
- 
-                if self._merge_video_parts(parts, merged_path):
+
+                if self._merge_video_parts(parts_info, merged_path):
                     duration = ls_common.probe_duration(merged_path)
-                    dst = os.path.join(
-                        self.config["nas_path"], f"{title}{ext}",
-                    )
+                    dst = os.path.join(self.config["nas_path"], f"{title}{ext}")
                     ok, dur = self._upload(merged_path, dst)
                     if ok:
                         uploaded_ext = ext
                         duration = dur or duration
                 else:
-                    # Merge failed — upload parts individually as fallback
                     logger.warning("Merge failed, uploading parts separately")
-                    for p in parts:
+                    for entry in parts_info:
+                        p = entry["path"]
                         ext = os.path.splitext(p)[1]
                         dst = os.path.join(
                             self.config["nas_path"], os.path.basename(p),
                         )
                         self._upload(p, dst)
-                    uploaded_ext = os.path.splitext(parts[0])[1]
-                    duration = ls_common.probe_duration(parts[-1])
+                    uploaded_ext = os.path.splitext(parts_info[0]["path"])[1]
+                    duration = ls_common.probe_duration(parts_info[-1]["path"])
             else:
-                # Fallback: no parts tracked, try finding video the old way
                 video_file = self._find_video(title)
                 if video_file:
                     ext = os.path.splitext(video_file)[1]
-                    dst = os.path.join(
-                        self.config["nas_path"], f"{title}{ext}",
-                    )
+                    dst = os.path.join(self.config["nas_path"], f"{title}{ext}")
                     ok, dur = self._upload(video_file, dst)
                     if ok:
                         uploaded_ext = ext
                         duration = dur
-
-            # Upload chat
-            chat_file = os.path.join(self.config["output"], f"{title}.json")
-            if os.path.exists(chat_file) and os.path.getsize(chat_file) > 100:
-                chat_dst = os.path.join(
-                    self.config["nas_path"], f"{title}.json",
-                )
-                self._upload(chat_file, chat_dst)
 
             # Update obsidian + cache with file paths and duration
             if uploaded_ext and obs_idx:
