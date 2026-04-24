@@ -19,6 +19,198 @@ import ls_common
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  MEDIA ANALYSIS  (video duration + chat stats)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _seconds_to_hhmmss(value) -> str:
+    """Convert a numeric seconds value to HH:MM:SS. Returns 'UNKNOWN' on any failure."""
+    try:
+        secs = int(float(value))
+        if secs < 0:
+            # Negative offset (pre-stream YT chat) — show with leading minus
+            h, rem = divmod(-secs, 3600)
+            m, s = divmod(rem, 60)
+            return f"-{h:02d}:{m:02d}:{s:02d}"
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    except Exception:
+        return "UNKNOWN"
+
+
+def analyze_video_file(filepath: str) -> dict:
+    """
+    Return video duration via ffprobe.
+    Result keys: duration_secs (float|None), duration_str (str).
+    Never raises.
+    """
+    result = {"duration_secs": None, "duration_str": "UNKNOWN"}
+    try:
+        dur = ls_common.probe_duration(filepath)
+        if dur is not None:
+            result["duration_secs"] = dur
+            result["duration_str"] = _seconds_to_hhmmss(dur)
+    except Exception:
+        pass
+    return result
+
+
+def _extract_yt_chat_timestamp_secs(entry: dict) -> float | None:
+    """
+    Pull videoOffsetTimeMsec from a yt-dlp live_chat JSONL entry.
+    Returns seconds (may be negative for pre-stream), or None.
+
+    The field lives at the top level of each JSONL object, not nested
+    inside replayChatItemAction (which only contains the action payloads).
+    """
+    try:
+        # Primary: top-level field (standard yt-dlp live_chat format)
+        raw = entry.get("videoOffsetTimeMsec")
+        if raw is not None:
+            return int(raw) / 1000.0
+        # Fallback: some older recordings nest it differently
+        raw = entry.get("replayChatItemAction", {}).get("videoOffsetTimeMsec")
+        if raw is not None:
+            return int(raw) / 1000.0
+    except Exception:
+        pass
+    return None
+
+
+def analyze_chat_file(filepath: str) -> dict:
+    """
+    Analyze a chat JSON/JSONL file.
+
+    Supports:
+      • Twitch: JSON array, ``timestamp`` field in **microseconds** relative
+        to stream start (produced by ls_common.record_twitch_chat).
+      • YouTube: JSONL, ``replayChatItemAction.videoOffsetTimeMsec`` in
+        **milliseconds** relative to video start (yt-dlp live_chat format).
+
+    Result keys:
+      count       – int or "UNKNOWN"
+      first_ts    – "HH:MM:SS" of earliest message (or "UNKNOWN")
+      last_ts     – "HH:MM:SS" of latest  message (or "UNKNOWN")
+      format      – "twitch" | "youtube" | "unknown"
+
+    Never raises; any parse failure replaces the affected value with "UNKNOWN".
+    """
+    result: dict = {
+        "count": "UNKNOWN",
+        "first_ts": "UNKNOWN",
+        "last_ts": "UNKNOWN",
+        "format": "unknown",
+    }
+
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read().strip()
+        if not raw:
+            result["count"] = 0
+            return result
+
+        messages: list[dict] = []
+        timestamps: list[float] = []
+
+        # ── Try Twitch: well-formed JSON array ────────────────────────────
+        parsed_as_array = False
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                parsed_as_array = True
+                result["format"] = "twitch"
+                for msg in data:
+                    if not isinstance(msg, dict):
+                        continue
+                    messages.append(msg)
+                    ts_raw = msg.get("timestamp")
+                    if ts_raw is not None:
+                        try:
+                            timestamps.append(int(ts_raw) / 1_000_000.0)
+                        except Exception:
+                            pass
+        except json.JSONDecodeError:
+            pass
+
+        # ── Try YouTube: JSONL ─────────────────────────────────────────────
+        if not parsed_as_array:
+            result["format"] = "youtube"
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if isinstance(entry, dict):
+                        messages.append(entry)
+                        secs = _extract_yt_chat_timestamp_secs(entry)
+                        if secs is not None:
+                            timestamps.append(secs)
+                except (json.JSONDecodeError, Exception):
+                    continue
+
+        result["count"] = len(messages)
+
+        if timestamps:
+            result["first_ts"] = _seconds_to_hhmmss(min(timestamps))
+            result["last_ts"]  = _seconds_to_hhmmss(max(timestamps))
+
+    except Exception:
+        pass
+
+    return result
+
+
+def _print_media_analysis(config: dict, nas: dict):
+    """
+    Print ffmpeg duration and chat stats for all files found on NAS.
+    Called after the NAS scan table inside audit(). Never raises.
+    """
+    nas_root = config.get("nas_path", "")
+    rows = [
+        ("yt_video", "YT video"),
+        ("yt_chat",  "YT chat "),
+        ("tw_video", "TW video"),
+        ("tw_chat",  "TW chat "),
+    ]
+
+    any_present = any(nas.get(k) for k, _ in rows)
+    if not any_present:
+        return
+
+    print("  Media analysis:")
+
+    for key, label in rows:
+        filename = nas.get(key)
+        if not filename:
+            continue
+        filepath = os.path.join(nas_root, filename)
+        if not os.path.exists(filepath):
+            print(f"    {label} : ⚠ file missing from disk")
+            continue
+
+        ext = os.path.splitext(filename)[1].lower()
+
+        if ext in ls_common.VIDEO_EXTS:
+            info = analyze_video_file(filepath)
+            print(f"    {label} : {info['duration_str']}")
+
+        elif ext == ".json":
+            info = analyze_chat_file(filepath)
+            count   = info["count"]
+            first   = info["first_ts"]
+            last    = info["last_ts"]
+            fmt     = info["format"]
+            count_s = str(count) if isinstance(count, int) else count
+            print(
+                f"    {label} : {count_s} messages  "
+                f"({first} → {last})"
+            )
+
+    print()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  NAS SCANNER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -555,6 +747,9 @@ def audit(config: dict, index: int,
         print(f"    {status}")
     print()
 
+    # 2b. Media analysis (duration + chat stats)
+    _print_media_analysis(config, nas)
+
     # 3. Resolve IDs
     cache = ls_common.load_cache()
 
@@ -607,6 +802,9 @@ def audit(config: dict, index: int,
         status = f"✔ {nas[key]}" if nas[key] else "✗ still missing"
         print(f"    {status}")
     print()
+
+    # Re-run media analysis on freshly downloaded files
+    _print_media_analysis(config, nas)
 
     block = build_entry(config, cache, index, entry, nas, yt_id, tw_id)
     print("  ┌─ Updated ──────────────────────────────────────────")
