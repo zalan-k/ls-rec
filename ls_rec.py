@@ -25,6 +25,7 @@ import ls_common
 
 SOCKET_PATH = "/tmp/livestream-recorder.sock"
 YT_ROTATION_SECONDS = 3.5 * 3600
+YT_ROTATION_OVERLAP = 60
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  LOGGING (daemon only — configured lazily so CLI commands stay clean)
@@ -558,57 +559,90 @@ class LivestreamRecorder:
             target=self._record_chat, args=(stream_key,), daemon=True,
         ).start()
 
-    def _merge_video_parts(self, parts_info: list[dict], output_path: str) -> bool:
-        """Merge multiple video segments, trimming DVR overlap."""
+    def _repair_part(self, src: str, dst: str,
+                     seek: float | None = None) -> bool:
+        """
+        Re-mux a video segment with error tolerance. Fixes broken trailing
+        frames from interrupted recordings and optionally trims the start.
+        Stream-copy only — no re-encoding.
+        """
+        cmd = ["ffmpeg", "-y", "-err_detect", "ignore_err"]
+        if seek is not None:
+            cmd += ["-ss", str(seek)]
+        cmd += [
+            "-fflags", "+genpts+igndts",
+            "-i", src,
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            dst,
+        ]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as e:
+            logger.error(f"Repair invocation failed: {e}")
+            return False
+        if r.returncode != 0 or not os.path.exists(dst):
+            logger.warning(f"Repair failed: {r.stderr[-300:]}")
+            return False
+        return True
+
+    def _merge_video_parts(self, parts_info: list[dict],
+                           output_path: str) -> bool:
+        """Repair each part, trim DVR overlap, then concat-copy."""
         paths = [p["path"] for p in parts_info]
 
+        # Single part: still repair to clean up any broken tail
         if len(paths) == 1:
-            os.rename(paths[0], output_path)
+            p = paths[0]
+            if self._repair_part(p, output_path):
+                if os.path.exists(p) and p != output_path:
+                    os.remove(p)
+                return True
+            # Repair failed — fall back to plain rename
+            logger.warning("Repair failed on single part, using as-is")
+            os.rename(p, output_path)
             return True
 
         concat_list = output_path + ".concat.txt"
-        trimmed_files = []
+        intermediate_files: list[str] = []
+        concat_inputs: list[str] = []
+
         try:
             for i, entry in enumerate(parts_info):
                 p = entry["path"]
+                seek: float | None = None
 
-                if i == 0:
-                    trimmed_files.append(p)
-                    continue
+                if i > 0:
+                    prev = parts_info[i - 1]
+                    wall_clock = entry["started_at"] - prev["started_at"]
+                    prev_dur = ls_common.probe_duration(prev["path"])
+                    # Only trim if previous segment is >30s longer than wall
+                    # clock — genuine DVR overlap, not timestamp jitter
+                    if prev_dur and prev_dur > wall_clock + 30:
+                        seek = prev_dur - wall_clock
 
-                # Compute overlap: how much longer the previous file is
-                # than the wall-clock gap between segment starts
-                prev = parts_info[i - 1]
-                wall_clock = entry["started_at"] - prev["started_at"]
-                prev_dur = ls_common.probe_duration(prev["path"])
+                ext = os.path.splitext(p)[1]
+                repaired = p + ".repaired" + ext
 
-                # Only trim if previous segment is >30s longer than wall clock
-                # (genuine DVR overlap, not just timestamp jitter)
-                if prev_dur and prev_dur > wall_clock + 30:
-                    overlap = prev_dur - wall_clock
-                    trimmed = p + ".trimmed" + os.path.splitext(p)[1]
-                    r = subprocess.run(
-                        ["ffmpeg", "-y", "-ss", str(overlap),
-                        "-i", p, "-c", "copy", trimmed],
-                        capture_output=True, text=True,
-                    )
-                    if r.returncode == 0 and os.path.exists(trimmed):
-                        trimmed_files.append(trimmed)
+                if self._repair_part(p, repaired, seek=seek):
+                    concat_inputs.append(repaired)
+                    intermediate_files.append(repaired)
+                    if seek:
                         logger.info(
-                            f"Trimmed {overlap:.0f}s overlap from "
+                            f"Repaired & trimmed {seek:.0f}s from "
                             f"{os.path.basename(p)}"
                         )
                     else:
-                        logger.warning(
-                            f"Trim failed for {os.path.basename(p)}, "
-                            f"using untrimmed"
-                        )
-                        trimmed_files.append(p)
+                        logger.info(f"Repaired: {os.path.basename(p)}")
                 else:
-                    trimmed_files.append(p)
+                    logger.warning(
+                        f"Repair failed for {os.path.basename(p)}, "
+                        f"using raw"
+                    )
+                    concat_inputs.append(p)
 
             with open(concat_list, "w") as f:
-                for p in trimmed_files:
+                for p in concat_inputs:
                     escaped = p.replace("'", "'\\''")
                     f.write(f"file '{escaped}'\n")
 
@@ -617,23 +651,21 @@ class LivestreamRecorder:
                 f"{os.path.basename(output_path)}"
             )
             r = subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", concat_list, "-c", "copy", output_path],
+                ["ffmpeg", "-y",
+                 "-err_detect", "ignore_err",
+                 "-f", "concat", "-safe", "0",
+                 "-i", concat_list,
+                 "-fflags", "+genpts",
+                 "-c", "copy", output_path],
                 capture_output=True, text=True,
             )
-            if r.returncode != 0:
-                logger.error(f"Merge failed: {r.stderr[-300:]}")
+            if r.returncode != 0 or not os.path.exists(output_path):
+                logger.error(f"Concat-copy merge failed: {r.stderr[-300:]}")
                 return False
 
-            if not os.path.exists(output_path):
-                return False
-
-            # Clean up parts and trimmed intermediates
+            # Success: clean up originals (intermediates handled in finally)
             for p in paths:
                 if os.path.exists(p):
-                    os.remove(p)
-            for p in trimmed_files:
-                if p not in paths and os.path.exists(p):
                     os.remove(p)
 
             logger.info(f"Merged {len(paths)} parts successfully")
@@ -645,6 +677,12 @@ class LivestreamRecorder:
         finally:
             if os.path.exists(concat_list):
                 os.remove(concat_list)
+            for p in intermediate_files:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
     def _record_video(self, stream_key: str):
         stream = self.active_streams[stream_key]
@@ -665,11 +703,17 @@ class LivestreamRecorder:
             cmd = ls_common.ytdlp_live_cmd(
                 self.config, url, platform, f"{title}.%(ext)s",
             )
-            process = subprocess.Popen(cmd, cwd=self.config["output"])
+            log_path = os.path.join(self.config["output"], f"{title}.ytdlp.log")
+            log_fh = open(log_path, "ab", buffering=0)
+            process = subprocess.Popen(
+                cmd, cwd=self.config["output"],
+                stdout=log_fh, stderr=subprocess.STDOUT,
+            )
             stream["video_process"] = process
+            stream["_video_log_fh"] = log_fh
             if part == 1:
                 stream["_segment_start"] = time.time()
-            logger.info(f"Video started: {title}")
+            logger.info(f"Video started: {title} (log: {os.path.basename(log_path)})")
  
             def monitor():
                 rotate = (platform == "youtube"
@@ -677,10 +721,27 @@ class LivestreamRecorder:
  
                 if rotate:
                     start = time.time()
+                    spawn_at = YT_ROTATION_SECONDS - YT_ROTATION_OVERLAP
                     while process.poll() is None:
                         elapsed = time.time() - start
-                        if elapsed >= YT_ROTATION_SECONDS:
-                            logger.info("3.5h rotation — stopping current segment")
+                        if elapsed >= spawn_at:
+                            logger.info(
+                                f"Pre-rotation: spawning part {part + 1} "
+                                f"{YT_ROTATION_OVERLAP}s before cutover"
+                            )
+                            
+                            old_segment_start = stream.get("_segment_start", start)
+                            stream["_video_part"] = part + 1
+                            stream["_segment_start"] = time.time()
+                            self._record_video(stream_key)
+
+                            rotation_deadline = start + YT_ROTATION_SECONDS
+                            while (time.time() < rotation_deadline
+                                   and process.poll() is None):
+                                time.sleep(1)
+
+                            self._rotate_chat(stream_key, part + 1)
+                            logger.info(f"Terminating part {part} after overlap")
 
                             # Kill old process, let it finalize properly
                             process.terminate()
@@ -688,21 +749,20 @@ class LivestreamRecorder:
                                 process.wait(timeout=180)
                             except subprocess.TimeoutExpired:
                                 process.kill()
+                            try:
+                                log_fh.close()
+                            except Exception:
+                                pass
 
                             # Register this part with its wall-clock start
                             part_file = self._find_video(title)
                             if part_file:
                                 stream["_video_parts"].append({
                                     "path": part_file,
-                                    "started_at": stream.get("_segment_start", start),
+                                    "started_at": old_segment_start,
                                 })
                                 logger.info(f"Segment saved: {part_file}")
 
-                            # Rotate chat, then start new video
-                            stream["_video_part"] = part + 1
-                            stream["_segment_start"] = time.time()
-                            self._rotate_chat(stream_key, part + 1)
-                            self._record_video(stream_key)
                             return
  
                         time.sleep(1)
@@ -711,6 +771,10 @@ class LivestreamRecorder:
  
                 # Process exited (stream ended, crash, or manual termination)
                 rc = process.returncode
+                try:
+                    log_fh.close()
+                except Exception:
+                    pass
  
                 # Register this (final) part file
                 part_file = self._find_video(title)

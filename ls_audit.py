@@ -387,8 +387,12 @@ def _build_platform_line(config: dict, tag: str, video_id: str | None,
                          video_file: str | None,
                          chat_file: str | None) -> str:
     """Build one platform sub-line for the Obsidian entry."""
-    vid_link = (f"[📁]({ls_common.build_shell_cmd(config, video_file)})"
-                if video_file else "[📁]()")
+    if video_file:
+        vid_link = f"[📁]({ls_common.build_shell_cmd(config, video_file)})"
+    elif chat_file:
+        vid_link = "[📁.×]()"
+    else:
+        vid_link = "[📁]()"
     chat_link = (f"[📄]({ls_common.build_shell_cmd(config, chat_file)})"
                  if chat_file else "[📄]()")
     display = title or "untitled"
