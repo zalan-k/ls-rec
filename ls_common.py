@@ -105,17 +105,15 @@ def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
     return entries
 
 
-def ytdlp_live_cmd(config: dict, url: str, platform: str,
-                   output_template: str) -> list[str]:
-    """Build command for live stream recording.
+def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) -> list[str]:
+    if platform == "youtube":
+        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        extra = ["--downloader-args",  "ffmpeg:-loglevel error"]
+    else:
+        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        extra = ["--concurrent-fragments", "4"]
 
-    YouTube uses plain 'best' — constraining to mp4/avc1 caused yt-dlp to
-    drop long streams after ~4h. Container may end up as webm/mkv.
-    Twitch keeps mp4/avc1 since HLS VODs segment cleanly.
-    """
-    fmt = ("best" if platform == "youtube"
-           else "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best")
-    cmd = _ytdlp_base(config) + [
+    return _ytdlp_base(config) + [
         "--format",           fmt,
         "-o",                 output_template,
         "--no-part",
@@ -124,11 +122,7 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str,
         "--retry-sleep",      "exp=1::10",
         "--retry-sleep",      "fragment:exp=2::15",
         "--socket-timeout",   "15",
-    ]
-    if platform == "twitch":
-        cmd += ["--concurrent-fragments", "4"]
-    cmd.append(url)
-    return cmd
+    ] + extra + [url]
 
 
 def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
@@ -859,19 +853,33 @@ def probe_duration(filepath: str) -> float | None:
 
 
 def merge_chat_fragments(output_dir: str, stream_title: str) -> bool:
-    """Merge yt-dlp live_chat fragment files into a single .json file."""
-    base = f"{stream_title}.live_chat.json"
-    main_part = os.path.join(output_dir, f"{base}.part")
-    frag_pattern = os.path.join(output_dir, f"{base}.part-Frag*.part")
-    final_output = os.path.join(output_dir, f"{stream_title}.json")
+    base          = f"{stream_title}.live_chat.json"
+    main_part     = os.path.join(output_dir, f"{base}.part")
+    frag_pattern  = os.path.join(output_dir, f"{base}.part-Frag*.part")
+    final_yt      = os.path.join(output_dir, base)
+    final_output  = os.path.join(output_dir, f"{stream_title}.json")
 
     try:
+        frags_present = bool(glob.glob(frag_pattern)) or os.path.exists(main_part)
+
+        if os.path.exists(final_yt) and not frags_present:
+            if os.path.exists(final_output):
+                os.remove(final_output)
+            os.rename(final_yt, final_output)
+            return True
+
+        # Case 1: interrupted — assemble fragments
         all_lines: list[str] = []
         if os.path.exists(main_part):
             with open(main_part, "r", encoding="utf-8") as f:
                 all_lines.extend(f.readlines())
         for frag in sorted(glob.glob(frag_pattern)):
             with open(frag, "r", encoding="utf-8") as f:
+                all_lines.extend(f.readlines())
+        # Edge case: yt-dlp left both a final file AND fragments — fold the
+        # final file into the assembly so nothing is lost
+        if os.path.exists(final_yt) and frags_present:
+            with open(final_yt, "r", encoding="utf-8") as f:
                 all_lines.extend(f.readlines())
 
         if not all_lines:
@@ -880,11 +888,12 @@ def merge_chat_fragments(output_dir: str, stream_title: str) -> bool:
         with open(final_output, "w", encoding="utf-8") as f:
             f.writelines(all_lines)
 
-        # Cleanup fragments
         if os.path.exists(main_part):
             os.remove(main_part)
         for frag in sorted(glob.glob(frag_pattern)):
             os.remove(frag)
+        if os.path.exists(final_yt):
+            os.remove(final_yt)
         return True
     except Exception:
         return False

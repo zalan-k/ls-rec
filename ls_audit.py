@@ -12,6 +12,7 @@ Usage:
     ls-audit --cache-info ID                Look up cached video by ID
 """
 
+from cProfile import label
 import os, re, glob, sys, json, subprocess, datetime, argparse
 from yt_dlp.utils import sanitize_filename
 
@@ -174,8 +175,7 @@ def _print_media_analysis(config: dict, nas: dict):
         ("tw_chat",  "TW chat "),
     ]
 
-    any_present = any(nas.get(k) for k, _ in rows)
-    if not any_present:
+    if not any(nas.get(k) for k, _ in rows):
         return
 
     print("  Media analysis:")
@@ -183,6 +183,7 @@ def _print_media_analysis(config: dict, nas: dict):
     for key, label in rows:
         filename = nas.get(key)
         if not filename:
+            print(f"    {label} : —")
             continue
         filepath = os.path.join(nas_root, filename)
         if not os.path.exists(filepath):
@@ -190,7 +191,6 @@ def _print_media_analysis(config: dict, nas: dict):
             continue
 
         ext = os.path.splitext(filename)[1].lower()
-
         if ext in ls_common.VIDEO_EXTS:
             info = analyze_video_file(filepath)
             print(f"    {label} : {info['duration_str']}")
@@ -200,12 +200,8 @@ def _print_media_analysis(config: dict, nas: dict):
             count   = info["count"]
             first   = info["first_ts"]
             last    = info["last_ts"]
-            fmt     = info["format"]
-            count_s = str(count) if isinstance(count, int) else count
-            print(
-                f"    {label} : {count_s} messages  "
-                f"({first} → {last})"
-            )
+            count_s = str(count).rjust(4) if isinstance(count, int) else count
+            print(f"    {label} : {count_s} messages  ({first} → {last})")
 
     print()
 
@@ -743,11 +739,11 @@ def audit(config: dict, index: int,
     print()
 
     # 2. NAS scan
-    print("  Scanning NAS...")
+    print("  Archive scan:")
     nas = scan_nas(config, index)
     for key, label in [("yt_video", "YT video"), ("yt_chat", "YT chat"),
                        ("tw_video", "TW video"), ("tw_chat", "TW chat")]:
-        status = f"✔ {nas[key]}" if nas[key] else "✗ not found"
+        status = f"✓ {nas[key]}" if nas[key] else "✗ not found"
         print(f"    {status}")
     print()
 
@@ -764,9 +760,9 @@ def audit(config: dict, index: int,
 
     print("  IDs:")
     if not entry["no_yt"]:
-        print(f"    YT: {yt_id or '—'}" + (f"  ← {yt_src}" if yt_src else ""))
+        print(f"    [YT] {yt_id or '—'}")
     if not entry["no_tw"]:
-        print(f"    TW: {tw_id or '—'}" + (f"  ← {tw_src}" if tw_src else ""))
+        print(f"    [TW] {tw_id or '—'}")
     print()
 
     # 4. Build entry
@@ -779,7 +775,7 @@ def audit(config: dict, index: int,
     # 5. Write
     if input("  Write to Obsidian? (y/n): ").strip().lower() == "y":
         if ls_common.obsidian_write_entry(config, index, block):
-            print("  ✔ Written.")
+            print("  ✓ Written.")
         else:
             print("  ✗ Write failed.")
     else:

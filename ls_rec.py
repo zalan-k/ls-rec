@@ -550,8 +550,10 @@ class LivestreamRecorder:
             "chat_thread":     None,
             "chat_stop_event": None,
             "obsidian_index":  obsidian_index,
+            "_rotation_done":  threading.Event(),      # ← add
+            "_all_video_processes": [],                # ← add
         }
-
+        self.active_streams[stream_key]["_rotation_done"].set()
         threading.Thread(
             target=self._record_video, args=(stream_key,), daemon=True,
         ).start()
@@ -586,9 +588,8 @@ class LivestreamRecorder:
             return False
         return True
 
-    def _merge_video_parts(self, parts_info: list[dict],
-                           output_path: str) -> bool:
-        """Repair each part, trim DVR overlap, then concat-copy."""
+    def _merge_video_parts(self, parts_info: list[dict], output_path: str) -> bool:
+        parts_info = sorted(parts_info, key=lambda x: x["started_at"])
         paths = [p["path"] for p in parts_info]
 
         # Single part: still repair to clean up any broken tail
@@ -710,9 +711,9 @@ class LivestreamRecorder:
                 stdout=log_fh, stderr=subprocess.STDOUT,
             )
             stream["video_process"] = process
+            stream["_all_video_processes"].append(process)
             stream["_video_log_fh"] = log_fh
-            if part == 1:
-                stream["_segment_start"] = time.time()
+            stream["_segment_start"] = time.time()
             logger.info(f"Video started: {title} (log: {os.path.basename(log_path)})")
  
             def monitor():
@@ -725,14 +726,14 @@ class LivestreamRecorder:
                     while process.poll() is None:
                         elapsed = time.time() - start
                         if elapsed >= spawn_at:
-                            logger.info(
-                                f"Pre-rotation: spawning part {part + 1} "
-                                f"{YT_ROTATION_OVERLAP}s before cutover"
-                            )
+                            still_live = self._probe_platform(platform)
+                            if not still_live or still_live["video_id"] != stream["identifier"]:
+                                logger.info("Stream ended before rotation threshold, skipping rotation")
+                                break
                             
                             old_segment_start = stream.get("_segment_start", start)
                             stream["_video_part"] = part + 1
-                            stream["_segment_start"] = time.time()
+                            stream["_rotation_done"].clear()
                             self._record_video(stream_key)
 
                             rotation_deadline = start + YT_ROTATION_SECONDS
@@ -762,7 +763,7 @@ class LivestreamRecorder:
                                     "started_at": old_segment_start,
                                 })
                                 logger.info(f"Segment saved: {part_file}")
-
+                            stream["_rotation_done"].set() 
                             return
  
                         time.sleep(1)
@@ -794,7 +795,6 @@ class LivestreamRecorder:
                         logger.warning("yt-dlp exited but stream still live — restarting")
 
                         stream["_video_part"] = part + 1
-                        stream["_segment_start"] = time.time()
                         self._record_video(stream_key)
                         self._rotate_chat(stream_key, part + 1)
                         return
@@ -843,28 +843,48 @@ class LivestreamRecorder:
         else:
             # YouTube: yt-dlp live_chat
             def run():
-                try:
-                    cmd = ls_common.ytdlp_chat_cmd(
-                        self.config, stream["url"], f"{title}.%(ext)s",
-                    )
-                    proc = subprocess.Popen(
-                        cmd, cwd=self.config["output"],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True,
-                    )
-                    stream["chat_process"] = proc
-                    while proc.poll() is None:
+                max_retries = 10
+                retry_delay = 30
+                attempt = 0
+                while not stop_event.is_set() and attempt < max_retries:
+                    try:
+                        cmd = ls_common.ytdlp_chat_cmd(
+                            self.config, stream["url"], f"{title}.%(ext)s",
+                        )
+                        proc = subprocess.Popen(
+                            cmd, cwd=self.config["output"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        stream["chat_process"] = proc
+                        while proc.poll() is None:
+                            if stop_event.is_set():
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill()
+                                break
+                            time.sleep(0.5)
+
                         if stop_event.is_set():
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
                             break
-                        time.sleep(0.5)
-                    ls_common.merge_chat_fragments(self.config["output"], title)
-                except Exception as e:
-                    logger.error(f"Chat error: {e}")
+                        rc = proc.returncode
+                        if rc == 0:
+                            break  # clean exit
+                        attempt += 1
+                        logger.warning(
+                            f"Chat exited unexpectedly (rc={rc}), "
+                            f"retry {attempt}/{max_retries} in {retry_delay}s"
+                        )
+                        time.sleep(retry_delay)
+                    except Exception as e:
+                        attempt += 1
+                        logger.error(f"Chat error (attempt {attempt}): {e}")
+                        if not stop_event.is_set():
+                            time.sleep(retry_delay)
+
+                ls_common.merge_chat_fragments(self.config["output"], title)
 
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
@@ -903,11 +923,19 @@ class LivestreamRecorder:
         obs_idx = stream.get("obsidian_index")
         logger.info(f"Completing: {title}")
 
+        rotation_done = stream.get("_rotation_done")
+        if rotation_done and not rotation_done.is_set():
+            logger.info("Waiting for rotation to finish registering segment...")
+            rotation_done.wait(timeout=200)
+
         try:
             # Stop video if still running
             vp = stream.get("video_process")
             if vp and vp.poll() is None:
                 vp.terminate()
+            for proc in stream.get("_all_video_processes", []):
+                if proc is not vp and proc.poll() is None:
+                    proc.terminate()
 
             # Stop chat
             if stream.get("chat_stop_event"):
