@@ -7,7 +7,7 @@ Obsidian entry helpers, Twitch IRC chat recorder, and utilities.
 
 import datetime, glob, json, os, re, socket, subprocess, time
 import urllib.parse, urllib.request
-from typing import Any, Optional
+from typing import Any
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_PATH = os.path.join(SCRIPT_DIR, ".vod_cache.json")
@@ -106,23 +106,44 @@ def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
 
 
 def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) -> list[str]:
-    if platform == "youtube":
-        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-        extra = ["--downloader-args",  "ffmpeg:-loglevel error"]
-    else:
-        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        extra = ["--concurrent-fragments", "4"]
+    """Build command for live stream capture.
 
-    return _ytdlp_base(config) + [
-        "--format",           fmt,
-        "-o",                 output_template,
+    YouTube uses --live-from-start with the native HLS downloader, pulling
+    from the broadcast beginning via DVR. The native handler is required
+    because --live-from-start has no equivalent under ffmpeg-as-downloader;
+    yt-dlp still invokes ffmpeg as a subprocess for the final mux.
+
+    Twitch uses the native HLS downloader at the live edge with parallel
+    fragment fetching.
+    """
+    common = [
         "--no-part",
         "--retries",          "10",
-        "--fragment-retries", "3",
         "--retry-sleep",      "exp=1::10",
         "--retry-sleep",      "fragment:exp=2::15",
         "--socket-timeout",   "15",
-    ] + extra + [url]
+    ]
+
+    if platform == "youtube":
+        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        extra = [
+            "--format",                fmt,
+            "-o",                      output_template,
+            "--live-from-start",
+            "--hls-prefer-native",
+            "--concurrent-fragments",  "4",
+            "--fragment-retries",      "10",
+        ]
+    else:  # twitch
+        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        extra = [
+            "--format",                fmt,
+            "-o",                      output_template,
+            "--concurrent-fragments",  "4",
+            "--fragment-retries",      "3",
+        ]
+
+    return _ytdlp_base(config) + extra + common + [url]
 
 
 def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
@@ -141,7 +162,12 @@ def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
 
 
 def ytdlp_chat_cmd(config: dict, url: str, output_template: str) -> list[str]:
-    """Build command for chat download via yt-dlp live_chat subs."""
+    """Build command for chat download via yt-dlp live_chat subs.
+
+    Note: no --live-from-start here. yt-dlp's live_chat extractor already
+    pulls chat replay from broadcast start by default, which captures the
+    pre-stream waiting room.
+    """
     return _ytdlp_base(config) + [
         "--skip-download", "--write-subs",
         "--sub-langs", "live_chat",
@@ -847,6 +873,21 @@ def probe_duration(filepath: str) -> float | None:
         )
         if r.returncode == 0 and r.stdout.strip():
             return float(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def probe_bitrate(filepath: str) -> int | None:
+    """Get container overall bitrate in bps via ffprobe. None on failure."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=bit_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1", filepath],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.strip())
     except Exception:
         pass
     return None
