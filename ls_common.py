@@ -106,16 +106,6 @@ def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
 
 
 def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) -> list[str]:
-    """Build command for live stream capture.
-
-    YouTube uses --live-from-start with the native HLS downloader, pulling
-    from the broadcast beginning via DVR. The native handler is required
-    because --live-from-start has no equivalent under ffmpeg-as-downloader;
-    yt-dlp still invokes ffmpeg as a subprocess for the final mux.
-
-    Twitch uses the native HLS downloader at the live edge with parallel
-    fragment fetching.
-    """
     common = [
         "--no-part",
         "--retries",          "10",
@@ -129,8 +119,6 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) 
         extra = [
             "--format",                fmt,
             "-o",                      output_template,
-            "--live-from-start",
-            "--hls-prefer-native",
             "--concurrent-fragments",  "4",
             "--fragment-retries",      "10",
         ]
@@ -162,12 +150,6 @@ def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
 
 
 def ytdlp_chat_cmd(config: dict, url: str, output_template: str) -> list[str]:
-    """Build command for chat download via yt-dlp live_chat subs.
-
-    Note: no --live-from-start here. yt-dlp's live_chat extractor already
-    pulls chat replay from broadcast start by default, which captures the
-    pre-stream waiting room.
-    """
     return _ytdlp_base(config) + [
         "--skip-download", "--write-subs",
         "--sub-langs", "live_chat",
