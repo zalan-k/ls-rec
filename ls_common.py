@@ -104,7 +104,6 @@ def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
             continue
     return entries
 
-
 def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) -> list[str]:
     common = [
         "--no-part",
@@ -115,12 +114,16 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) 
     ]
 
     if platform == "youtube":
-        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        fmt = ("299-dash+140-dash/298-dash+140-dash/137-dash+140-dash/"
+               "bestvideo[format_id$=-dash][ext=mp4]+bestaudio[format_id$=-dash][ext=m4a]/"
+               "bestvideo+bestaudio/best")
         extra = [
             "--format",                fmt,
             "-o",                      output_template,
+            "--live-from-start",
             "--concurrent-fragments",  "4",
             "--fragment-retries",      "10",
+            "--extractor-args",        "youtube:player-client=web",
         ]
     else:  # twitch
         fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
@@ -155,7 +158,6 @@ def ytdlp_chat_cmd(config: dict, url: str, output_template: str) -> list[str]:
         "--sub-langs", "live_chat",
         "-o", output_template, url,
     ]
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  TWITCH HELIX API
