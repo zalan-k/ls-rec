@@ -114,13 +114,10 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) 
     ]
 
     if platform == "youtube":
-        fmt = ("299-dash+140-dash/298-dash+140-dash/137-dash+140-dash/"
-               "bestvideo[format_id$=-dash][ext=mp4]+bestaudio[format_id$=-dash][ext=m4a]/"
-               "bestvideo+bestaudio/best")
+        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
         extra = [
             "--format",                fmt,
             "-o",                      output_template,
-            "--live-from-start",
             "--concurrent-fragments",  "4",
             "--fragment-retries",      "10",
             "--extractor-args",        "youtube:player-client=web",
