@@ -877,7 +877,7 @@ def probe_bitrate(filepath: str) -> int | None:
 def merge_chat_fragments(output_dir: str, stream_title: str) -> bool:
     base          = f"{stream_title}.live_chat.json"
     main_part     = os.path.join(output_dir, f"{base}.part")
-    frag_pattern  = os.path.join(output_dir, f"{base}.part-Frag*.part")
+    frag_pattern  = os.path.join(output_dir, f"{glob.escape(base)}.part-Frag*.part")
     final_yt      = os.path.join(output_dir, base)
     final_output  = os.path.join(output_dir, f"{stream_title}.json")
 

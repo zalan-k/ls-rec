@@ -1086,13 +1086,10 @@ class LivestreamRecorder:
             logger.error(f"Watchdog terminate failed: {e}")
 
     def _find_part_files(self, stream_title: str) -> list[str]:
-        """Locate all video part files for a recording, sorted by part number.
-
-        Excludes yt-dlp internal fragment files (`.fNNN.ext`), log files, and
-        state files (`.part`, `.ytdl`, etc.).
-        """
         output_dir = self.config["output"]
-        pattern    = os.path.join(output_dir, f"{stream_title}.part*.*")
+        pattern    = os.path.join(
+            output_dir, f"{glob.escape(stream_title)}.part*.*"
+        )
         parts: list[str] = []
         for p in sorted(glob.glob(pattern)):
             base = os.path.basename(p)
