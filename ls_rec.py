@@ -749,6 +749,7 @@ class LivestreamRecorder:
             process = subprocess.Popen(
                 cmd, cwd=self.config["output"],
                 stdout=log_fh, stderr=subprocess.STDOUT,
+                start_new_session=True
             )
             stream["video_process"]       = process
             stream["_video_log_fh"]       = log_fh
@@ -764,11 +765,12 @@ class LivestreamRecorder:
                 args=(stream_key, process, log_fh, title, part_num),
                 daemon=True,
             ).start()
-            threading.Thread(
-                target=self._rotation_watcher,
-                args=(stream_key, process, title, part_num),
-                daemon=True,
-            ).start()
+            if platform == "youtube":
+                threading.Thread(
+                    target=self._rotation_watcher,
+                    args=(stream_key, process, title, part_num),
+                    daemon=True,
+                ).start()
         except Exception as e:
             logger.error(f"Video start error: {e}")
             self.active_streams.pop(stream_key, None)
@@ -993,7 +995,7 @@ class LivestreamRecorder:
         # SIGTERM the predecessor
         if old_process.poll() is None:
             try:
-                old_process.terminate()
+                self._stop_process(old_process)
                 logger.info(
                     f"Rotated: part {old_part_num:02d} → "
                     f"{stream.get('_part_num'):02d}"
@@ -1101,69 +1103,111 @@ class LivestreamRecorder:
                 parts.append(p)
         return parts
 
+    def _moov_is_first(self, path: str) -> bool:
+        """True if moov precedes mdat (i.e. faststart took effect)."""
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    header = f.read(8)
+                    if len(header) < 8:
+                        return False
+                    size = int.from_bytes(header[:4], "big")
+                    box  = header[4:8]
+                    if box == b"moov":
+                        return True
+                    if box == b"mdat":
+                        return False
+                    if size == 1:                  # 64-bit largesize follows
+                        size = int.from_bytes(f.read(8), "big")
+                        f.seek(size - 16, 1)
+                    elif size == 0:                # box runs to EOF
+                        return False
+                    else:
+                        f.seek(size - 8, 1)
+        except Exception:
+            return False
+
+    def _cleanup(self, paths: list[str]):
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
     def _merge_parts(self, parts: list[str], dest_mp4: str) -> tuple[bool, float | None]:
-        """Concat parts via ffmpeg concat demuxer; output is .mp4 with faststart.
-
-        Single-part case is a one-shot remux (no concat list). Multi-part case
-        writes a concat list and runs the demuxer. Both apply +faststart in the
-        same ffmpeg invocation, so the upload step doesn't need to re-process.
-
-        Returns (success, duration_seconds_or_None). On success, source parts
-        are deleted; on failure, sources remain so you can recover manually.
-        """
         if not parts:
             return False, None
 
+        list_file = None
         if len(parts) == 1:
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-i", parts[0], "-c", "copy",
-                "-movflags", "+faststart", dest_mp4],
-                capture_output=True, text=True, timeout=600,
-            )
-            if r.returncode != 0:
-                logger.error(f"ffmpeg remux failed: {r.stderr[-300:]}")
-                return False, None
-            try:
-                os.remove(parts[0])
-            except OSError:
-                pass
-            return True, ls_common.probe_duration(dest_mp4)
-
-        list_file = dest_mp4 + ".concat.txt"
-        try:
+            cmd = ["ffmpeg", "-y", "-i", parts[0], "-c", "copy",
+                "-movflags", "+faststart", dest_mp4]
+        else:
+            list_file = dest_mp4 + ".concat.txt"
             with open(list_file, "w") as f:
                 for p in parts:
-                    escaped = p.replace("'", r"'\''")
-                    f.write(f"file '{escaped}'\n")
+                    f.write("file '%s'\n" % p.replace("'", r"'\''"))
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                "-c", "copy", "-movflags", "+faststart", dest_mp4]
 
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", list_file, "-c", "copy",
-                "-movflags", "+faststart", dest_mp4],
+        r   = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        dur = ls_common.probe_duration(dest_mp4)
+
+        # Happy path: body is valid AND moov is up front.
+        if os.path.exists(dest_mp4) and dur and self._moov_is_first(dest_mp4):
+            if r.returncode != 0:
+                logger.warning(f"ffmpeg rc={r.returncode} but output valid + faststart OK; accepting")
+            self._cleanup(parts + ([list_file] if list_file else []))
+            logger.info(f"Merged {len(parts)} part(s) + faststart → {os.path.basename(dest_mp4)}")
+            return True, dur
+
+        # Body exists but faststart didn't take → re-run faststart over it, then swap.
+        if os.path.exists(dest_mp4) and dur:
+            logger.warning(f"Faststart not confirmed (rc={r.returncode}); re-running over body")
+            fs_tmp = dest_mp4 + ".fs.mp4"
+            r2 = subprocess.run(
+                ["ffmpeg", "-y", "-i", dest_mp4, "-c", "copy",
+                "-movflags", "+faststart", fs_tmp],
                 capture_output=True, text=True, timeout=1800,
             )
-            if r.returncode != 0:
-                logger.error(f"ffmpeg concat failed: {r.stderr[-300:]}")
-                return False, None
-
-            for p in parts:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-            try:
-                os.remove(list_file)
-            except OSError:
-                pass
-
-            logger.info(f"Merged {len(parts)} parts → {os.path.basename(dest_mp4)}")
-            return True, ls_common.probe_duration(dest_mp4)
-        except Exception as e:
-            logger.error(f"Merge error: {e}")
+            if os.path.exists(fs_tmp) and self._moov_is_first(fs_tmp) and ls_common.probe_duration(fs_tmp):
+                os.replace(fs_tmp, dest_mp4)
+                self._cleanup(parts + ([list_file] if list_file else []))
+                logger.info(f"Recovered faststart → {os.path.basename(dest_mp4)}")
+                return True, ls_common.probe_duration(dest_mp4)
+            self._cleanup([fs_tmp])
+            logger.error(f"Faststart recovery failed (rc={r2.returncode}): {r2.stderr[-300:]}")
+            logger.error(f"Parts + body preserved for manual recovery: {os.path.basename(dest_mp4)}")
             return False, None
+
+        # No usable body at all.
+        logger.error(f"Merge produced no valid output: {r.stderr[-300:]}")
+        self._cleanup([list_file] if list_file else [])
+        return False, None
 
 
     # ── completion & upload ───────────────────────────────────────────────
+
+    def _stop_process(self, process, timeout=45):
+        if process is None or process.poll() is not None:
+            return
+        try:
+            pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            return
+
+        for sig, wait_s in ((signal.SIGINT, timeout),
+                            (signal.SIGTERM, 15),
+                            (signal.SIGKILL, 10)):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                return            # group already gone — clean exit
+            try:
+                process.wait(timeout=wait_s)
+                return
+            except subprocess.TimeoutExpired:
+                continue
 
     def _handle_completion(self, stream_key: str, upload: bool = True):
         """Stop chat, merge parts, upload, write final metadata."""
@@ -1176,13 +1220,7 @@ class LivestreamRecorder:
         logger.info(f"Completing: {title}")
 
         try:
-            vp = stream.get("video_process")
-            if vp and vp.poll() is None:
-                try:
-                    vp.terminate()
-                    vp.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    vp.kill()
+            self._stop_process(stream.get("video_process"))
 
             if stream.get("chat_stop_event"):
                 stream["chat_stop_event"].set()
