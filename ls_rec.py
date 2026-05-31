@@ -37,16 +37,6 @@ BITRATE_PROBE_MIN_MB = 30     # ffprobe once file reaches this size
 RESTART_MAX          = 10     # bounded restart attempts per stream
 RESTART_DELAY_S      = 15     # backoff between restart attempts
 
-# Rotation: trigger when this much content has been recorded in a part
-ROTATION_TARGET_SECONDS  = 2 * 3600    # 2h
-ROTATION_SAFETY_CEILING  = 5 * 3600    # 5h wall-clock cap (manifest expiration guard)
-
-# Polling cadence in the rotation watcher
-MAX_POLL_INTERVAL        = 30 * 60     # 30 min — cap when far from target
-PROBE_FAST_INTERVAL      = 1.0         # within 1m of target
-PROBE_SLOW_INTERVAL      = 5.0         # fallback if ffprobe latency is high
-PROBE_SLOW_THRESHOLD     = 1.0         # seconds — Pi 5 adapter threshold
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  LOGGING (daemon only — configured lazily so CLI commands stay clean)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -709,19 +699,23 @@ class LivestreamRecorder:
             "_bitrate_bps":        None,
             "_watchdog_triggered": False,
             "_restart_count":      0,
-            # Multi-part / rotation
-            "_part_num":              0,    # incremented by _record_video
-            "_current_part_num":      None,
-            "_current_part_path":     None,
+            # Recording lifecycle
+            "_from_start":       (platform == "youtube"),
+            "_part_num":         0,      # Twitch: incremented per part. from-start: pinned to 1.
+            "_current_part_num": None,
         }
         self._record_video(stream_key)
         self._record_chat(stream_key)
 
     def _record_video(self, stream_key: str):
-        """Spawn yt-dlp for the next part. Also starts monitor + rotation watcher.
+        """Spawn yt-dlp for this stream.
 
-        Each invocation writes to `<title>.part<NN>.<ext>` so failure restarts
-        AND rotations both produce fresh files without truncating prior content.
+        Twitch (live-edge): each call writes a fresh `<title>.partNN.<ext>`, so
+        failure restarts produce new files that are concatenated at completion.
+
+        YouTube (--live-from-start): always part01. A restart re-invokes yt-dlp
+        against the SAME output template so it resumes its own download from
+        .ytdl state, rather than re-pulling from the broadcast start.
         """
         stream = self.active_streams.get(stream_key)
         if stream is None:
@@ -731,10 +725,13 @@ class LivestreamRecorder:
         platform = stream["platform"]
         title    = stream["stream_title"]
 
-        stream["_part_num"] += 1
-        part_num = stream["_part_num"]
-        stream["_current_part_num"]  = part_num
-        stream["_current_part_path"] = None  # resolved lazily by _sample_stream
+        if stream["_from_start"]:
+            part_num = 1
+            stream["_part_num"] = 1
+        else:
+            stream["_part_num"] += 1
+            part_num = stream["_part_num"]
+        stream["_current_part_num"] = part_num
 
         output_template = f"{title}.part{part_num:02d}.%(ext)s"
         log_path = os.path.join(
@@ -765,12 +762,6 @@ class LivestreamRecorder:
                 args=(stream_key, process, log_fh, title, part_num),
                 daemon=True,
             ).start()
-            if platform == "youtube":
-                threading.Thread(
-                    target=self._rotation_watcher,
-                    args=(stream_key, process, title, part_num),
-                    daemon=True,
-                ).start()
         except Exception as e:
             logger.error(f"Video start error: {e}")
             self.active_streams.pop(stream_key, None)
@@ -849,7 +840,7 @@ class LivestreamRecorder:
         return bool(data and data.get("is_live") and data.get("id") == stream["identifier"])
 
     def _video_monitor(self, stream_key, process, log_fh, title, part_num):
-        """Wait for yt-dlp exit, then classify: rotated-out / natural-end / failure."""
+        """Wait for yt-dlp exit, then classify: superseded / natural-end / failure."""
         process.wait()
         rc = process.returncode
         try:
@@ -861,9 +852,9 @@ class LivestreamRecorder:
         if stream is None:
             return
 
-        # Rotated out? The rotation logic spawned a successor before SIGTERM'ing us.
+        # Stale-monitor guard: a newer process already supersedes this one.
         if stream.get("video_process") is not process:
-            logger.info(f"Part {part_num:02d} exited after rotation (rc={rc}): {title}")
+            logger.info(f"Part {part_num:02d} superseded (rc={rc}): {title}")
             return
 
         if self.manual_termination_in_progress:
@@ -911,109 +902,6 @@ class LivestreamRecorder:
 
         self._record_video(stream_key)
 
-    def _rotation_watcher(self, stream_key, my_process, title, part_num):
-        """Per-part thread: poll content duration via ffprobe; trigger rotation
-        when content reaches ROTATION_TARGET_SECONDS (or wall-clock hits the
-        safety ceiling).
-
-        Polling cadence:
-        far from target: estimated_remaining minutes, capped at MAX_POLL_INTERVAL
-        within 1m of target: 1s — or 5s if recent ffprobe took > 1s
-        """
-        start_wall    = time.time()
-        probe_latency = 0.0
-
-        while True:
-            stream = self.active_streams.get(stream_key)
-            if stream is None or stream.get("video_process") is not my_process:
-                return
-            if my_process.poll() is not None:
-                return
-            if self.manual_termination_in_progress:
-                return
-
-            wall_elapsed = time.time() - start_wall
-
-            # Probe content duration on current part file (lazy-resolved by sampler)
-            part_path = stream.get("_current_part_path")
-            content_seconds = 0.0
-            if part_path and os.path.exists(part_path):
-                t0  = time.time()
-                dur = ls_common.probe_duration(part_path)
-                probe_latency = time.time() - t0
-                if dur is not None:
-                    content_seconds = dur
-
-            # Decision: rotate now?
-            if content_seconds >= ROTATION_TARGET_SECONDS:
-                logger.info(
-                    f"Rotation triggered: content {content_seconds/60:.1f}m "
-                    f">= {ROTATION_TARGET_SECONDS/60:.0f}m, part {part_num:02d}: {title}"
-                )
-                self._rotate(stream_key)
-                return
-            if wall_elapsed >= ROTATION_SAFETY_CEILING:
-                lag_m = (wall_elapsed - content_seconds) / 60
-                logger.warning(
-                    f"Rotation safety ceiling: wall {wall_elapsed/60:.1f}m, "
-                    f"content {content_seconds/60:.1f}m, lag {lag_m:.1f}m: {title}"
-                )
-                self._rotate(stream_key)
-                return
-
-            # Sleep interval
-            if content_seconds <= 0 or wall_elapsed <= 0:
-                poll_interval = 30.0
-            else:
-                rate = content_seconds / wall_elapsed
-                if rate <= 0:
-                    poll_interval = 60.0
-                else:
-                    estimated_wait = (ROTATION_TARGET_SECONDS - content_seconds) / rate
-                    if estimated_wait <= 60:
-                        poll_interval = (
-                            PROBE_SLOW_INTERVAL if probe_latency > PROBE_SLOW_THRESHOLD
-                            else PROBE_FAST_INTERVAL
-                        )
-                    else:
-                        poll_interval = min(estimated_wait - 60, MAX_POLL_INTERVAL)
-
-            time.sleep(poll_interval)
-
-    def _rotate(self, stream_key: str):
-        """Spawn the next part, then SIGTERM the old one.
-
-        Ordering matters: spawn-then-kill creates a brief overlap at the boundary
-        instead of a gap. Overlap can be deduped in post; a gap can't be recovered.
-        The old part's monitor sees the SIGTERM exit, finds video_process has
-        been replaced, and exits without trying to restart or complete.
-        """
-        stream = self.active_streams.get(stream_key)
-        if stream is None:
-            return
-
-        old_process  = stream.get("video_process")
-        old_part_num = stream.get("_part_num")
-        if old_process is None:
-            return
-
-        # Fresh failure budget for the new part
-        stream["_restart_count"] = 0
-
-        # Spawn successor (updates stream["video_process"])
-        self._record_video(stream_key)
-
-        # SIGTERM the predecessor
-        if old_process.poll() is None:
-            try:
-                self._stop_process(old_process)
-                logger.info(
-                    f"Rotated: part {old_part_num:02d} → "
-                    f"{stream.get('_part_num'):02d}"
-                )
-            except Exception as e:
-                logger.error(f"Rotation SIGTERM error: {e}")
-
     def _monitor_loop(self):
         """Background sampler: file growth + watchdog, every SAMPLE_INTERVAL_S."""
         while not self._monitor_stop.is_set():
@@ -1032,25 +920,43 @@ class LivestreamRecorder:
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
 
+    def _current_growing_file(self, title: str, part_num: int) -> str | None:
+        """Largest non-sidecar file matching this part's prefix.
+
+        Under --live-from-start the file that grows mid-recording is yt-dlp's
+        in-progress fragment (`<title>.partNN.f<code>.<ext>`), not the merged
+        `<title>.partNN.<ext>` (which only exists after yt-dlp finishes). For
+        Twitch live-edge it's the part file itself. Taking the largest match
+        works for both without hard-coding yt-dlp's fragment naming.
+        """
+        pattern = os.path.join(
+            self.config["output"], f"{glob.escape(title)}.part{part_num:02d}*",
+        )
+        best, best_size = None, -1
+        for p in glob.glob(pattern):
+            base = os.path.basename(p)
+            # NB: keep `.part` — under --live-from-start the growing format file
+            # is `<title>.partNN.f<code>.<ext>.part` until that format completes.
+            if base.endswith((".log", ".ytdl", ".json", ".concat.txt",
+                              ".frag.json")):
+                continue
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            if sz > best_size:
+                best, best_size = p, sz
+        return best
+
     def _sample_stream(self, stream: dict, now: float):
-        """Sample current part file size for watchdog and the bitrate probe."""
+        """Sample the growing file's size for the watchdog and bitrate probe."""
         title    = stream["stream_title"]
         part_num = stream.get("_current_part_num")
         if part_num is None:
             return
 
-        # Lazy-resolve the current part's path (yt-dlp picks extension at runtime)
-        file_path = stream.get("_current_part_path")
-        if not file_path or not os.path.exists(file_path):
-            for ext in ls_common.VIDEO_EXTS:
-                candidate = os.path.join(
-                    self.config["output"], f"{title}.part{part_num:02d}{ext}",
-                )
-                if os.path.exists(candidate):
-                    file_path = candidate
-                    stream["_current_part_path"] = candidate
-                    break
-        if not file_path or not os.path.exists(file_path):
+        file_path = self._current_growing_file(title, part_num)
+        if not file_path:
             return
 
         try:
@@ -1105,37 +1011,14 @@ class LivestreamRecorder:
         parts: list[str] = []
         for p in sorted(glob.glob(pattern)):
             base = os.path.basename(p)
-            if base.endswith((".log", ".part", ".ytdl", ".frag.json")):
+            if base.endswith((".log", ".part", ".ytdl", ".frag.json", ".temp")):
                 continue
-            if re.search(r"\.part\d{2}\.f\d+\.\w+$", base):
+            # yt-dlp per-format intermediates: .partNN.f299.mp4, .partNN.f299-dash.mp4, .partNN.f140.m4a
+            if re.search(r"\.part\d{2}\.f\d+(-\w+)?\.\w+$", base):
                 continue
             if os.path.splitext(p)[1].lower() in ls_common.VIDEO_EXTS:
                 parts.append(p)
         return parts
-
-    def _moov_is_first(self, path: str) -> bool:
-        """True if moov precedes mdat (i.e. faststart took effect)."""
-        try:
-            with open(path, "rb") as f:
-                while True:
-                    header = f.read(8)
-                    if len(header) < 8:
-                        return False
-                    size = int.from_bytes(header[:4], "big")
-                    box  = header[4:8]
-                    if box == b"moov":
-                        return True
-                    if box == b"mdat":
-                        return False
-                    if size == 1:                  # 64-bit largesize follows
-                        size = int.from_bytes(f.read(8), "big")
-                        f.seek(size - 16, 1)
-                    elif size == 0:                # box runs to EOF
-                        return False
-                    else:
-                        f.seek(size - 8, 1)
-        except Exception:
-            return False
 
     def _cleanup(self, paths: list[str]):
         for p in paths:
@@ -1148,51 +1031,36 @@ class LivestreamRecorder:
         if not parts:
             return False, None
 
-        list_file = None
+        # Single part: YouTube from-start is already a merged mp4; Twitch wrote one file.
         if len(parts) == 1:
-            cmd = ["ffmpeg", "-y", "-i", parts[0], "-c", "copy",
-                "-movflags", "+faststart", dest_mp4]
-        else:
-            list_file = dest_mp4 + ".concat.txt"
-            with open(list_file, "w") as f:
-                for p in parts:
-                    f.write("file '%s'\n" % p.replace("'", r"'\''"))
-            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
-                "-c", "copy", "-movflags", "+faststart", dest_mp4]
+            src = parts[0]
+            if src.lower().endswith(".mp4"):
+                if os.path.abspath(src) != os.path.abspath(dest_mp4):
+                    os.replace(src, dest_mp4)
+            else:  # Twitch .ts → remux to mp4 (stream copy, no re-encode)
+                r = subprocess.run(["ffmpeg", "-y", "-i", src, "-c", "copy", dest_mp4],
+                                capture_output=True, text=True, timeout=1800)
+                if not (os.path.exists(dest_mp4) and ls_common.probe_duration(dest_mp4)):
+                    logger.error(f"Remux failed: {r.stderr[-300:]}")
+                    return False, None      # leave src in place for recovery
+                self._cleanup([src])
+            dur = ls_common.probe_duration(dest_mp4)
+            return (dur is not None), dur
 
-        r   = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        # Multi-part (Twitch restart recovery only): concat, stream copy.
+        list_file = dest_mp4 + ".concat.txt"
+        with open(list_file, "w") as f:
+            for p in parts:
+                f.write("file '%s'\n" % p.replace("'", r"'\''"))
+        r = subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                            "-c", "copy", dest_mp4], capture_output=True, text=True, timeout=1800)
         dur = ls_common.probe_duration(dest_mp4)
-
-        # Happy path: body is valid AND moov is up front.
-        if os.path.exists(dest_mp4) and dur and self._moov_is_first(dest_mp4):
-            if r.returncode != 0:
-                logger.warning(f"ffmpeg rc={r.returncode} but output valid + faststart OK; accepting")
-            self._cleanup(parts + ([list_file] if list_file else []))
-            logger.info(f"Merged {len(parts)} part(s) + faststart → {os.path.basename(dest_mp4)}")
-            return True, dur
-
-        # Body exists but faststart didn't take → re-run faststart over it, then swap.
         if os.path.exists(dest_mp4) and dur:
-            logger.warning(f"Faststart not confirmed (rc={r.returncode}); re-running over body")
-            fs_tmp = dest_mp4 + ".fs.mp4"
-            r2 = subprocess.run(
-                ["ffmpeg", "-y", "-i", dest_mp4, "-c", "copy",
-                "-movflags", "+faststart", fs_tmp],
-                capture_output=True, text=True, timeout=1800,
-            )
-            if os.path.exists(fs_tmp) and self._moov_is_first(fs_tmp) and ls_common.probe_duration(fs_tmp):
-                os.replace(fs_tmp, dest_mp4)
-                self._cleanup(parts + ([list_file] if list_file else []))
-                logger.info(f"Recovered faststart → {os.path.basename(dest_mp4)}")
-                return True, ls_common.probe_duration(dest_mp4)
-            self._cleanup([fs_tmp])
-            logger.error(f"Faststart recovery failed (rc={r2.returncode}): {r2.stderr[-300:]}")
-            logger.error(f"Parts + body preserved for manual recovery: {os.path.basename(dest_mp4)}")
-            return False, None
-
-        # No usable body at all.
-        logger.error(f"Merge produced no valid output: {r.stderr[-300:]}")
-        self._cleanup([list_file] if list_file else [])
+            self._cleanup(parts + [list_file])
+            logger.info(f"Merged {len(parts)} parts → {os.path.basename(dest_mp4)}")
+            return True, dur
+        logger.error(f"Concat failed (rc={r.returncode}): {r.stderr[-300:]}")
+        self._cleanup([list_file])           # leave parts in place for recovery
         return False, None
 
 
@@ -1249,7 +1117,15 @@ class LivestreamRecorder:
             # ── Video: merge parts → .mp4 with faststart → upload ──
             parts = self._find_part_files(title)
             if not parts:
-                logger.warning(f"No video parts found for: {title}")
+                if stream.get("_from_start") and glob.glob(os.path.join(
+                        self.config["output"], f"{glob.escape(title)}.part*.f*.*")):
+                    logger.warning(
+                        f"No merged file for {title}: yt-dlp left unmerged from-start "
+                        f"fragments (stopped before its own merge). Fragments preserved; "
+                        f"re-run yt-dlp to resume+finalize, or merge the f-streams manually."
+                    )
+                else:
+                    logger.warning(f"No video parts found for: {title}")
                 return
 
             merged_local = os.path.join(self.config["output"], f"{title}.mp4")

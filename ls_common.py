@@ -58,10 +58,13 @@ def load_config(path: str | None = None) -> dict[str, Any]:
 #  Functions that build yt-dlp command lines. The binary path and cookie
 #  args are resolved from config so callers never construct their own argv.
 
-def _ytdlp_base(config: dict) -> list[str]:
+def _ytdlp_base(config: dict, cookies: bool = True) -> list[str]:
     venv = config.get("venv")
     binary = os.path.join(venv, "bin", "yt-dlp") if venv else "yt-dlp"
-    return [binary, "--cookies-from-browser", config.get("cookies_browser", "firefox")]
+    base = [binary]
+    if cookies:
+        base += ["--cookies-from-browser", config.get("cookies_browser", "firefox")]
+    return base
 
 
 def ytdlp_probe(config: dict, url: str, *,
@@ -106,7 +109,6 @@ def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
 
 def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) -> list[str]:
     common = [
-        "--no-part",
         "--retries",          "10",
         "--retry-sleep",      "exp=1::10",
         "--retry-sleep",      "fragment:exp=2::15",
@@ -116,22 +118,24 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) 
     if platform == "youtube":
         fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
         extra = [
+            "--live-from-start",       # ensure we get the whole stream, not just from now
             "--format",                fmt,
             "-o",                      output_template,
             "--concurrent-fragments",  "4",
             "--fragment-retries",      "10",
-            "--extractor-args",        "youtube:player-client=web",
+            "--merge-output-format",   "mp4"
         ]
     else:  # twitch
         fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
         extra = [
+            "--no-part",
             "--format",                fmt,
             "-o",                      output_template,
             "--concurrent-fragments",  "4",
             "--fragment-retries",      "3",
         ]
 
-    return _ytdlp_base(config) + extra + common + [url]
+    return _ytdlp_base(config, cookies=(platform != "youtube")) + extra + common + [url]
 
 
 def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
