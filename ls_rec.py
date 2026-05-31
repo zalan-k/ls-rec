@@ -231,7 +231,7 @@ class LivestreamRecorder:
                 vp = s.get("video_process")
                 if vp and vp.poll() is None:
                     try:
-                        vp.terminate()
+                        os.killpg(os.getpgid(vp.pid), signal.SIGINT)
                     except Exception:
                         pass
                 # Stop chat
@@ -844,6 +844,10 @@ class LivestreamRecorder:
 
     # ── monitor / watchdog ────────────────────────────────────────────────
 
+    def _source_still_live(self, stream: dict) -> bool:
+        data = ls_common.ytdlp_probe(self.config, stream["url"], playlist_items="1")
+        return bool(data and data.get("is_live") and data.get("id") == stream["identifier"])
+
     def _video_monitor(self, stream_key, process, log_fh, title, part_num):
         """Wait for yt-dlp exit, then classify: rotated-out / natural-end / failure."""
         process.wait()
@@ -869,6 +873,13 @@ class LivestreamRecorder:
             return
 
         if rc == 0:
+            if not self.manual_termination_in_progress and self._source_still_live(stream):
+                logger.warning(f"Part {part_num:02d} exited rc=0 but {title} still live; resuming")
+                stream["_restart_count"] = 0          # clean exit — don't charge the restart budget
+                time.sleep(3)                          # short: minimize the gap, no backoff needed
+                if stream_key in self.active_streams and not self.manual_termination_in_progress:
+                    self._record_video(stream_key)     # new part, SAME entry/index
+                return
             logger.info(f"Part {part_num:02d} complete (rc=0): {title}")
             self._handle_completion(stream_key)
             return
@@ -1082,8 +1093,7 @@ class LivestreamRecorder:
             f"{stream['stream_title']}, killing yt-dlp (PID {vp.pid})"
         )
         try:
-            vp.terminate()
-            # Don't wait here — let the monitor thread handle the exit and restart
+            threading.Thread(target=self._stop_process, args=(vp,), kwargs={"timeout": 10}, daemon=True).start()
         except Exception as e:
             logger.error(f"Watchdog terminate failed: {e}")
 
