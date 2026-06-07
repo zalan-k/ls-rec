@@ -120,13 +120,14 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) 
         extra = [
             "--live-from-start",       # ensure we get the whole stream, not just from now
             "--format",                fmt,
+            "--extractor-args",        "youtube:player_client=web",
             "-o",                      output_template,
             "--concurrent-fragments",  "4",
             "--fragment-retries",      "10",
             "--merge-output-format",   "mp4"
         ]
     else:  # twitch
-        fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        fmt = "best"
         extra = [
             "--no-part",
             "--format",                fmt,
