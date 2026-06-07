@@ -752,6 +752,7 @@ class LivestreamRecorder:
             stream["_video_log_fh"]       = log_fh
             stream["_last_growth_ts"]     = time.time()
             stream["_watchdog_triggered"] = False
+            stream["_part_started_ts"]    = time.time()
             logger.info(
                 f"Part {part_num:02d} started: {title} "
                 f"(PID {process.pid}, log: {os.path.basename(log_path)})"
@@ -865,15 +866,27 @@ class LivestreamRecorder:
 
         if rc == 0:
             if not self.manual_termination_in_progress and self._source_still_live(stream):
-                logger.warning(f"Part {part_num:02d} exited rc=0 but {title} still live; resuming")
-                stream["_restart_count"] = 0          # clean exit — don't charge the restart budget
-                time.sleep(3)                          # short: minimize the gap, no backoff needed
+                elapsed = time.time() - stream.get("_part_started_ts", 0)
+                if elapsed < 30:
+                    # Pathological: rc=0 within seconds while still live = the
+                    # 642 "already downloaded" loop. Charge the budget and back
+                    # off so it can't spin; give up after RESTART_MAX.
+                    stream["_restart_count"] = stream.get("_restart_count", 0) + 1
+                    if stream["_restart_count"] >= RESTART_MAX:
+                        logger.error(f"Part {part_num:02d} rc=0 instant-looping {RESTART_MAX}x; stopping: {title}")
+                        self._handle_completion(stream_key)
+                        return
+                    logger.warning(f"Part {part_num:02d} rc=0 after {elapsed:.0f}s, still live; backoff {stream['_restart_count']}/{RESTART_MAX}: {title}")
+                    time.sleep(RESTART_DELAY_S)
+                else:
+                    # Healthy-length part that ended while still live: genuine
+                    # resume, reset the budget.
+                    stream["_restart_count"] = 0
+                    logger.warning(f"Part {part_num:02d} exited rc=0 but {title} still live; resuming")
+                    time.sleep(3)
                 if stream_key in self.active_streams and not self.manual_termination_in_progress:
-                    self._record_video(stream_key)     # new part, SAME entry/index
+                    self._record_video(stream_key)
                 return
-            logger.info(f"Part {part_num:02d} complete (rc=0): {title}")
-            self._handle_completion(stream_key)
-            return
 
         # Non-zero: restart within the same recording session if budget allows
         restart_count = stream.get("_restart_count", 0)
