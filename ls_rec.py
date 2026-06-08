@@ -180,6 +180,7 @@ class LivestreamRecorder:
         self.config = ls_common.load_config()
         self.active_streams: dict[str, dict] = {}
         self.watch_list: dict[str, dict] = {}       # ephemeral
+        self.recorded_keys: set[str] = set()
 
         # State
         self.was_streaming = False
@@ -581,7 +582,7 @@ class LivestreamRecorder:
             return
         for platform in ("youtube", "twitch"):
             result = self._probe_platform(platform)
-            if result and result["stream_key"] not in self.active_streams:
+            if (result and result["stream_key"] not in self.active_streams and result["stream_key"] not in self.recorded_keys):
                 logger.info(f"Live: {result['stream_title']}")
                 idx, dual = self._get_stream_index(
                     platform, datetime.datetime.now(),
@@ -680,6 +681,7 @@ class LivestreamRecorder:
 
         stream_title = f"{obsidian_index:03d}_{info['stream_title']}"
         stream_key   = f"{platform}_{video_id}"
+        self.recorded_keys.add(stream_key)
 
         self.active_streams[stream_key] = {
             "url":             info["stream_url"],
@@ -740,7 +742,8 @@ class LivestreamRecorder:
 
         try:
             cmd = ls_common.ytdlp_live_cmd(
-                self.config, url, platform, output_template,
+                self.config, url, platform, output_template, 
+                from_start=stream["_from_start"]
             )
             log_fh = open(log_path, "ab", buffering=0)
             process = subprocess.Popen(
@@ -881,13 +884,17 @@ class LivestreamRecorder:
                 else:
                     # Healthy-length part that ended while still live: genuine
                     # resume, reset the budget.
+                    stream["_from_start"] = False
                     stream["_restart_count"] = 0
-                    logger.warning(f"Part {part_num:02d} exited rc=0 but {title} still live; resuming")
+                    logger.warning(f"Part {part_num:02d} ended rc=0 but {title} still live; rotating to live-edge")
                     time.sleep(3)
                 if stream_key in self.active_streams and not self.manual_termination_in_progress:
                     self._record_video(stream_key)
                 return
-
+            logger.info(f"Part {part_num:02d} complete (rc=0): {title}")
+            self._handle_completion(stream_key)
+            return
+        
         # Non-zero: restart within the same recording session if budget allows
         restart_count = stream.get("_restart_count", 0)
         if restart_count >= RESTART_MAX:

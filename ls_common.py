@@ -107,7 +107,8 @@ def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
             continue
     return entries
 
-def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) -> list[str]:
+def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str,
+                   from_start: bool = True) -> list[str]:
     common = [
         "--retries",          "10",
         "--retry-sleep",      "exp=1::10",
@@ -118,13 +119,15 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str) 
     if platform == "youtube":
         fmt = "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
         extra = [
-            "--live-from-start",       # ensure we get the whole stream, not just from now
             "--format",                fmt,
             "-o",                      output_template,
             "--concurrent-fragments",  "4",
             "--fragment-retries",      "10",
             "--merge-output-format",   "mp4"
         ]
+        if from_start:
+            extra = ["--live-from-start"] + extra
+    
     else:  # twitch
         fmt = "best"
         extra = [
