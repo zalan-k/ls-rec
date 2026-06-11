@@ -303,26 +303,30 @@ def resolve_id(config: dict, cache: list[dict], platform: str,
 
     # 5. Cache by date (auto-refresh if stale)
     if entry["date_obj"]:
-        newest_dates = [
-            v.get("start_time", "")[:10]
-            for v in cache if v.get("platform") == platform
-        ]
-        newest = max(newest_dates) if newest_dates else None
-        target_date = entry["date_obj"].strftime("%Y-%m-%d")
+        target_index = entry.get("_index")
 
-        if newest is None or target_date > newest:
-            print(f"  ⌛ Refreshing {platform} cache...")
-            if platform == "youtube":
-                ls_common.refresh_youtube_cache(
-                    config, cache, full=(newest is None),
-                )
-            else:
-                ls_common.refresh_twitch_cache(
-                    config, cache, full=(newest is None),
-                )
-            ls_common.save_cache(cache)
+        def _match():
+            return ls_common.find_vod_by_date(
+                cache, platform, entry["date_obj"], claim_index=target_index,
+            )
 
-        vod = ls_common.find_vod_by_date(cache, platform, entry["date_obj"])
+        vod = _match()
+        if vod is None:
+            newest_dates = [
+                v.get("start_time", "")[:10]
+                for v in cache if v.get("platform") == platform
+            ]
+            newest = max(newest_dates) if newest_dates else None
+            target_date = entry["date_obj"].strftime("%Y-%m-%d")
+            if newest is None or target_date > newest:
+                print(f"  ⌛ Refreshing {platform} cache...")
+                if platform == "youtube":
+                    ls_common.refresh_youtube_cache(config, cache, full=(newest is None))
+                else:
+                    ls_common.refresh_twitch_cache(config, cache, full=(newest is None))
+                ls_common.save_cache(cache)
+                vod = _match()
+
         if vod:
             label = "cache (date)"
             try:
@@ -381,16 +385,23 @@ def _get_title(config: dict, cache: list[dict], video_id: str,
 def _build_platform_line(config: dict, tag: str, video_id: str | None,
                          platform: str, title: str | None,
                          video_file: str | None,
-                         chat_file: str | None) -> str:
-    """Build one platform sub-line for the Obsidian entry."""
+                         chat_file: str | None,
+                         video_x: bool = False,
+                         chat_x: bool = False) -> str:
     if video_file:
         vid_link = f"[📁]({ls_common.build_shell_cmd(config, video_file)})"
-    elif chat_file:
+    elif video_x or chat_file:        # explicit, or implied (chat but no video)
         vid_link = "[📁.×]()"
     else:
         vid_link = "[📁]()"
-    chat_link = (f"[📄]({ls_common.build_shell_cmd(config, chat_file)})"
-                 if chat_file else "[📄]()")
+
+    if chat_file:
+        chat_link = f"[📄]({ls_common.build_shell_cmd(config, chat_file)})"
+    elif chat_x:
+        chat_link = "[📄.×]()"
+    else:
+        chat_link = "[📄]()"
+
     display = title or "untitled"
     url = ls_common.build_stream_url(config, platform, video_id) if video_id else ""
     return f"\t`{tag}` {vid_link} {chat_link} [ {display} ]({url})"
@@ -433,26 +444,26 @@ def build_entry(config: dict, cache: list[dict], index: int,
     if entry["no_yt"]:
         lines.append("\t`YT` ✗")
     else:
-        yt_title = (
-            _get_title(config, cache, yt_id, "youtube", nas["yt_video"])
-            if yt_id else None
-        )
+        yt_title = (_get_title(config, cache, yt_id, "youtube", nas["yt_video"])
+                    if yt_id else None)
         lines.append(_build_platform_line(
             config, "YT", yt_id, "youtube", yt_title,
             nas["yt_video"], nas["yt_chat"],
+            video_x=entry.get("yt_video_x", False),
+            chat_x=entry.get("yt_chat_x", False),
         ))
 
     # Twitch line
     if entry["no_tw"]:
         lines.append("\t`TW` ✗")
     else:
-        tw_title = (
-            _get_title(config, cache, tw_id, "twitch", nas["tw_video"])
-            if tw_id else None
-        )
+        tw_title = (_get_title(config, cache, tw_id, "twitch", nas["tw_video"])
+                    if tw_id else None)
         lines.append(_build_platform_line(
             config, "TW", tw_id, "twitch", tw_title,
             nas["tw_video"], nas["tw_chat"],
+            video_x=entry.get("tw_video_x", False),
+            chat_x=entry.get("tw_chat_x", False),
         ))
 
     # User notes (preserved verbatim)
@@ -467,23 +478,25 @@ def build_entry(config: dict, cache: list[dict], index: int,
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _identify_missing(config: dict, nas: dict,
-                      yt_id: str | None, tw_id: str | None) -> list[dict]:
-    """List files that should exist but don't."""
+                      yt_id: str | None, tw_id: str | None,
+                      absent: dict | None = None) -> list[dict]:
+    """List files that should exist but don't, skipping known-absent (.×) ones."""
+    absent = absent or {}
     missing = []
     if yt_id:
         url = ls_common.build_stream_url(config, "youtube", yt_id)
-        if not nas["yt_video"]:
+        if not nas["yt_video"] and not absent.get("yt_video"):
             missing.append({"platform": "youtube", "type": "video",
                             "url": url, "label": "YT video"})
-        if not nas["yt_chat"]:
+        if not nas["yt_chat"] and not absent.get("yt_chat"):
             missing.append({"platform": "youtube", "type": "chat",
                             "url": url, "label": "YT chat"})
     if tw_id:
         url = ls_common.build_stream_url(config, "twitch", tw_id)
-        if not nas["tw_video"]:
+        if not nas["tw_video"] and not absent.get("tw_video"):
             missing.append({"platform": "twitch", "type": "video",
                             "url": url, "label": "TW video"})
-        if not nas["tw_chat"]:
+        if not nas["tw_chat"] and not absent.get("tw_chat"):
             missing.append({"platform": "twitch", "type": "chat",
                             "url": url, "label": "TW chat"})
     return missing
@@ -783,7 +796,14 @@ def audit(config: dict, index: int,
     print()
 
     # 6. Missing files → download
-    missing = _identify_missing(config, nas, yt_id, tw_id)
+    absent = {
+        "yt_video": entry.get("yt_video_x", False),
+        "yt_chat":  entry.get("yt_chat_x", False),
+        "tw_video": entry.get("tw_video_x", False),
+        "tw_chat":  entry.get("tw_chat_x", False),
+    }
+
+    missing = _identify_missing(config, nas, yt_id, tw_id, absent)
     if not missing:
         print("  ✔ All files present.\n")
         # Save cache (may have been updated by title lookups)

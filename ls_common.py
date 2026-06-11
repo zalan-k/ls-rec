@@ -306,12 +306,15 @@ def find_vod(cache: list[dict], video_id: str,
 
 def find_vod_by_date(cache: list[dict], platform: str,
                      target_date: datetime.datetime,
-                     window_hours: float = 1) -> dict | None:
-    """Find the entry closest to target_date within window."""
+                     window_hours: float = 1,
+                     claim_index: int | None = None) -> dict | None:
     window = datetime.timedelta(hours=window_hours)
     best, best_delta = None, None
     for v in cache:
         if v.get("platform") != platform:
+            continue
+        idx = v.get("obsidian_index")
+        if claim_index is not None and idx is not None and idx != claim_index:
             continue
         st = v.get("start_time", "")
         if not st:
@@ -541,6 +544,8 @@ def obsidian_parse_entry(config: dict, index: int) -> dict:
         "duration_str": None,
         "yt_id": None, "tw_id": None,
         "no_yt": False, "no_tw": False,
+        "yt_video_x": False, "yt_chat_x": False,
+        "tw_video_x": False, "tw_chat_x": False,
         "notes": [],
     }
     obs_path = config["obsidian"]
@@ -591,30 +596,29 @@ def obsidian_parse_entry(config: dict, index: int) -> dict:
         stripped = line.strip()
         if stripped == "---" or re.match(r"^-\s*\[.\]\s*\*\*\d+\*\*", line):
             break
-        if re.match(r"^\t`YT`", line):
-            if re.search(r"[✗✘]", line):
-                result["no_yt"] = True
+
+        m_tag = re.match(r"^\t`(YT|TW)`\s*(.*)$", line)
+        if m_tag:
+            pfx  = "yt" if m_tag.group(1) == "YT" else "tw"
+            rest = m_tag.group(2).strip()
+            if re.fullmatch(r"[×✗✘]", rest):
+                result[f"no_{pfx}"] = True
             else:
-                for u in re.findall(r"\]\(([^)]+)\)", line):
+                if "📁.×" in rest:
+                    result[f"{pfx}_video_x"] = True
+                if "📄.×" in rest:
+                    result[f"{pfx}_chat_x"] = True
+                for u in re.findall(r"\]\(([^)]+)\)", rest):
                     vid, plat = extract_video_id_from_url(u)
-                    if vid and plat == "youtube":
-                        result["yt_id"] = vid
-                        break
-        elif re.match(r"^\t`TW`", line):
-            if re.search(r"[✗✘]", line):
-                result["no_tw"] = True
-            else:
-                for u in re.findall(r"\]\(([^)]+)\)", line):
-                    vid, plat = extract_video_id_from_url(u)
-                    if vid and plat == "twitch":
-                        result["tw_id"] = vid
+                    if vid and ((plat == "youtube" and pfx == "yt")
+                                or (plat == "twitch" and pfx == "tw")):
+                        result[f"{pfx}_id"] = vid
                         break
         else:
             result["notes"].append(line)
         i += 1
 
     return result
-
 
 def obsidian_write_entry(config: dict, index: int,
                          new_lines: list[str]) -> bool:
