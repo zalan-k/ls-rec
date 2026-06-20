@@ -71,7 +71,7 @@ def ytdlp_probe(config: dict, url: str, *,
                 playlist_items: str | None = None,
                 timeout: int = 30) -> dict | None:
     """Probe URL for metadata. Returns parsed JSON dict or None."""
-    cmd = _ytdlp_base(config) + ["--dump-json", "--ignore-no-formats-error"]
+    cmd = _ytdlp_base(config, cookies=False) + ["--dump-json", "--ignore-no-formats-error"]
     if playlist_items:
         cmd += ["--playlist-items", playlist_items]
     cmd.append(url)
