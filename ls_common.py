@@ -61,7 +61,7 @@ def load_config(path: str | None = None) -> dict[str, Any]:
 def _ytdlp_base(config: dict, cookies: bool = True) -> list[str]:
     venv = config.get("venv")
     binary = os.path.join(venv, "bin", "yt-dlp") if venv else "yt-dlp"
-    base = binary
+    base = [binary]
     if cookies:
         base += ["--cookies-from-browser", config.get("cookies_browser", "firefox")]
     return base
