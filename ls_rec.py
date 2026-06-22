@@ -1278,6 +1278,57 @@ class LivestreamRecorder:
         logger.info("Shutdown complete.")
 
 
+def _count_chat_lines(path: str) -> int:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return sum(1 for ln in f if ln.strip())
+
+
+def _find_live_chat(nas_path: str, video_id: str,
+                    exclude: str | None = None) -> str | None:
+    """Existing non-posthoc chat json on NAS for this video_id."""
+    ex = os.path.abspath(exclude) if exclude else None
+    for path in sorted(glob.glob(os.path.join(nas_path, "*.json"))):
+        if path.endswith(".posthoc.json"):
+            continue
+        if ex and os.path.abspath(path) == ex:
+            continue
+        if ls_common.extract_video_id_from_filename(os.path.basename(path)) == video_id:
+            return path
+    return None
+
+def _merge_posthoc_chat(nas_path: str, video_id: str, posthoc: str):
+    """Merge posthoc YT chat into the live capture in place.
+
+    Live's pre-stream chat + any dropped middle ← backfilled by posthoc.
+    Output replaces the live file under its existing name, so obsidian /
+    audit links stay valid. No live capture → posthoc becomes canonical.
+    """
+    if not os.path.exists(posthoc):
+        print("  ⚠ Posthoc chat not produced.")
+        return
+
+    live = _find_live_chat(nas_path, video_id, exclude=posthoc)
+    if not live:
+        canonical = posthoc[: -len(".posthoc.json")] + ".json"
+        os.replace(posthoc, canonical)
+        print(f"  ✔ Chat (posthoc only): {os.path.basename(canonical)}")
+        return
+
+    merge_script = os.path.join(ls_common.SCRIPT_DIR, "merge_yt_chats.py")
+    tmp = live + ".merging"
+    r = subprocess.run([sys.executable, merge_script, live, posthoc, "-o", tmp])
+
+    # Safety: never let a bad merge shrink the live capture.
+    if (r.returncode == 0 and os.path.exists(tmp)
+            and _count_chat_lines(tmp) >= _count_chat_lines(live)):
+        os.replace(tmp, live)
+        os.remove(posthoc)
+        print(f"  ✔ Chat merged → {os.path.basename(live)}")
+    else:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        print("  ⚠ Merge failed/suspect; live + posthoc both kept for manual merge.")
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  MANDO  (direct VOD download — runs in your terminal, no daemon)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1337,14 +1388,20 @@ def cmd_mando(args):
             chat_out = os.path.join(nas_path, f"{safe_title}.json")
             subprocess.run([tdl, "chatdownload", "--id", vod_id, "-o", chat_out])
         else:
+            # Pull posthoc to a distinct name so it can't clobber a live capture.
             cmd = ls_common.ytdlp_chat_cmd(
-                config, url, f"{safe_title}.%(ext)s",
+                config, url, f"{safe_title}.posthoc.%(ext)s",
             )
             subprocess.run(cmd, cwd=nas_path)
-            lc = os.path.join(nas_path, f"{safe_title}.live_chat.json")
-            final = os.path.join(nas_path, f"{safe_title}.json")
+            lc = os.path.join(nas_path, f"{safe_title}.posthoc.live_chat.json")
+            posthoc = os.path.join(nas_path, f"{safe_title}.posthoc.json")
             if os.path.exists(lc):
-                os.rename(lc, final)
+                os.rename(lc, posthoc)
+
+            if platform == "youtube":
+                _merge_posthoc_chat(nas_path, video_id, posthoc)
+            elif os.path.exists(posthoc):
+                os.replace(posthoc, os.path.join(nas_path, f"{safe_title}.json"))
 
     # Update cache
     cache = ls_common.load_cache()
