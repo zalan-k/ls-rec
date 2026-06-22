@@ -61,7 +61,7 @@ def load_config(path: str | None = None) -> dict[str, Any]:
 def _ytdlp_base(config: dict, cookies: bool = True) -> list[str]:
     venv = config.get("venv")
     binary = os.path.join(venv, "bin", "yt-dlp") if venv else "yt-dlp"
-    base = [binary, "--force-ipv4"]
+    base = binary
     if cookies:
         base += ["--cookies-from-browser", config.get("cookies_browser", "firefox")]
     return base
@@ -110,7 +110,7 @@ def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
 def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str,
                    from_start: bool = True) -> list[str]:
     common = [
-        "--retries",          "10",
+        "--no-progress",
         "--retry-sleep",      "exp=1::10",
         "--retry-sleep",      "fragment:exp=2::15",
         "--socket-timeout",   "15",
@@ -121,8 +121,7 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str,
         extra = [
             "--format",                fmt,
             "-o",                      output_template,
-            "--concurrent-fragments",  "4",
-            "--fragment-retries",      "10",
+            #"--concurrent-fragments",  "4",
             "--merge-output-format",   "mp4"
         ]
         if from_start:
