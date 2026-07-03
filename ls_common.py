@@ -157,9 +157,8 @@ def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
 
 def ytdlp_chat_cmd(config: dict, url: str, output_template: str) -> list[str]:
     return _ytdlp_base(config) + [
-        "--live-from-start",
-        "--skip-download", "--write-subs",
-        "--sub-langs", "live_chat",
+        "--skip-download", "--ignore-no-formats-error",
+        "--write-subs", "--sub-langs", "live_chat",
         "-o", output_template, url,
     ]
 
