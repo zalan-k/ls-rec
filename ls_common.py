@@ -111,8 +111,8 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str,
                    from_start: bool = True) -> list[str]:
     common = [
         "--no-progress",
-        "--retry-sleep",      "exp=1::10",
-        "--retry-sleep",      "fragment:exp=2::15",
+        "--retry-sleep",      "linear=1:5",
+        "--retry-sleep",      "fragment:linear=1:10",
         "--socket-timeout",   "15",
     ]
 
@@ -121,7 +121,6 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str,
         extra = [
             "--format",                fmt,
             "-o",                      output_template,
-            #"--concurrent-fragments",  "4",
             "--merge-output-format",   "mp4"
         ]
         if from_start:

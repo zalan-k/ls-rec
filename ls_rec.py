@@ -788,47 +788,52 @@ class LivestreamRecorder:
                     channel, start_ms, output, stop_event, logger,
                 )
         else:
-            # YouTube: yt-dlp live_chat (captures pre-stream chat via replay)
             def run():
-                max_retries = 10
-                retry_delay = 30
-                attempt = 0
-                while not stop_event.is_set() and attempt < max_retries:
+                acc = os.path.join(self.config["output"], f"{title}.live_chat.json")
+
+                def fold(segbase: str) -> bool:
+                    if not ls_common.merge_chat_fragments(self.config["output"], segbase):
+                        return False
+                    segjson = os.path.join(self.config["output"], f"{segbase}.json")
+                    try:
+                        with open(acc, "a", encoding="utf-8") as o, \
+                             open(segjson, encoding="utf-8") as s:
+                            o.write(s.read())
+                        os.remove(segjson)
+                    except Exception as e:
+                        logger.error(f"Chat fold failed ({segbase}): {e}")
+                    return True
+
+                seg, idle = 0, 0
+                while not stop_event.is_set() and idle < 5:   # cap: 5 empty segs = give up
+                    seg += 1
                     try:
                         cmd = ls_common.ytdlp_chat_cmd(
-                            self.config, stream["url"], f"{title}.%(ext)s",
+                            self.config, stream["url"], f"{title}.chatseg{seg:03d}.%(ext)s",
                         )
                         proc = subprocess.Popen(
                             cmd, cwd=self.config["output"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                         )
                         while proc.poll() is None:
                             if stop_event.is_set():
                                 proc.terminate()
-                                try:
-                                    proc.wait(timeout=5)
-                                except subprocess.TimeoutExpired:
-                                    proc.kill()
+                                try: proc.wait(timeout=5)
+                                except subprocess.TimeoutExpired: proc.kill()
                                 break
                             time.sleep(0.5)
-
-                        if stop_event.is_set():
-                            break
-                        rc = proc.returncode
-                        if rc == 0:
-                            break  # clean exit — stream ended
-                        attempt += 1
-                        logger.warning(
-                            f"Chat exited rc={rc}, retry "
-                            f"{attempt}/{max_retries} in {retry_delay}s"
-                        )
-                        time.sleep(retry_delay)
                     except Exception as e:
-                        attempt += 1
-                        logger.error(f"Chat error (attempt {attempt}): {e}")
-                        if not stop_event.is_set():
-                            time.sleep(retry_delay)
+                        logger.error(f"Chat error (seg {seg:03d}): {e}")
+
+                    idle = 0 if fold(f"{title}.chatseg{seg:03d}") else idle + 1
+
+                    if stop_event.is_set():
+                        break
+                    if not self._source_still_live(stream):
+                        logger.info(f"Chat: {title} no longer live; stopping")
+                        break
+                    logger.info(f"Chat seg {seg:03d} ended; still live, relaunching")
+                    time.sleep(30)
 
                 ls_common.merge_chat_fragments(self.config["output"], title)
 
