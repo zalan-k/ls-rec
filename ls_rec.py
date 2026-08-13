@@ -472,14 +472,15 @@ class LivestreamRecorder:
             return f"Already recording: {title}"
 
         if data.get("is_live", False):
-            result = self._make_stream_info(platform, video_id, title, url)
+            result = self._make_stream_info(platform, video_id, title, url,
+                                            data=data)
             idx, dual = self._get_stream_index(platform, datetime.datetime.now())
             self._start_recording(result, idx, dual)
             return f"✔ LIVE — recording: {title} (#{idx:03d})"
 
         # Not live → add to watch list
         entry: dict = {"title": title, "last_check": time.time()}
-        release_ts = data.get("release_timestamp")
+        release_ts = ls_common.stream_start_epoch(data)
         if release_ts:
             entry["start_time"] = release_ts
             until = release_ts - time.time()
@@ -496,7 +497,7 @@ class LivestreamRecorder:
         data = ls_common.ytdlp_probe(self.config, url, playlist_items="1")
         if data:
             entry["title"] = data.get("fulltitle") or data.get("title") or "Unknown"
-            release_ts = data.get("release_timestamp")
+            release_ts = ls_common.stream_start_epoch(data)
             if release_ts:
                 entry["start_time"] = release_ts
         self.watch_list[url] = entry
@@ -556,17 +557,20 @@ class LivestreamRecorder:
             obsidian_url = f"{svc['url']}/videos/{video_id.lstrip('v')}"
 
         return self._make_stream_info(
-            platform, video_id, title, stream_url, obsidian_url,
+            platform, video_id, title, stream_url, obsidian_url, data=data,
         )
 
     def _make_stream_info(self, platform, video_id, title, stream_url,
-                          obsidian_url=None):
+                          obsidian_url=None, data=None):
         """Build the info dict consumed by _start_recording."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
         stream_title = sanitize_filename(f"{title} [{video_id}] @ {timestamp}")
         if obsidian_url is None:
             obsidian_url = (f"https://www.youtube.com/watch?v={video_id}"
                             if platform == "youtube" else stream_url)
+        # Absolute broadcast start, epoch SECONDS, off the live probe. This is
+        # the only moment it is available: the probe payload is discarded after
+        # this call, and for Twitch it cannot be recovered once the stream ends.
         return {
             "platform":       platform,
             "video_id":       video_id,
@@ -575,6 +579,7 @@ class LivestreamRecorder:
             "obsidian_title": title,
             "obsidian_url":   obsidian_url,
             "stream_key":     f"{platform}_{video_id}",
+            "stream_start_epoch": ls_common.stream_start_epoch(data) if data else None,
         }
 
     def _check_streams(self):
@@ -616,7 +621,7 @@ class LivestreamRecorder:
                 continue
 
             if not data.get("is_live", False):
-                release_ts = data.get("release_timestamp")
+                release_ts = ls_common.stream_start_epoch(data)
                 if release_ts:
                     entry["start_time"] = release_ts
                 continue
@@ -628,7 +633,8 @@ class LivestreamRecorder:
             if f"{platform}_{video_id}" in self.active_streams:
                 continue
 
-            result = self._make_stream_info(platform, video_id, title, url)
+            result = self._make_stream_info(platform, video_id, title, url,
+                                            data=data)
             idx, dual = self._get_stream_index(platform, datetime.datetime.now())
             logger.info(f"Watched stream live: {title}")
             self._start_recording(result, idx, dual)
@@ -666,6 +672,12 @@ class LivestreamRecorder:
                 obsidian_title, obsidian_url,
             )
 
+        # One now() shared by the cache entry and the chat recorder's zero,
+        # so record_start_epoch_ms is exactly the chat zero and not a second
+        # reading taken a few lines later.
+        record_start = datetime.datetime.now()
+        stream_start = info.get("stream_start_epoch")
+
         cache = ls_common.load_cache()
         channel = (self.config["youtube_handle"] if platform == "youtube"
                 else self.config["twitch_user"])
@@ -673,9 +685,17 @@ class LivestreamRecorder:
             "id":             video_id,
             "platform":       platform,
             "title":          obsidian_title,
-            "start_time":     datetime.datetime.now().isoformat(),
+            "start_time":     record_start.isoformat(),
             "channel":        channel,
             "obsidian_index": obsidian_index,
+            # ── chat sync ────────────────────────────────────────────────
+            # start_time is NOT usable for this: it holds the record start
+            # here, but --refresh later overwrites it with the broadcast
+            # start derived from release_timestamp. These two are unambiguous
+            # and upsert_vod skips None, so a failed probe leaves no key
+            # rather than a misleading zero.
+            "record_start_epoch_ms": int(record_start.timestamp() * 1000),
+            "stream_start_epoch_ms": stream_start * 1000 if stream_start else None,
         })
         ls_common.save_cache(cache)
 
@@ -689,7 +709,7 @@ class LivestreamRecorder:
             "identifier":      video_id,
             "stream_title":    stream_title,
             "obsidian_title":  obsidian_title,
-            "start_time":      datetime.datetime.now(),
+            "start_time":      record_start,
             "video_process":   None,
             "chat_thread":     None,
             "chat_stop_event": None,
@@ -1354,7 +1374,7 @@ def cmd_mando(args):
     video_id = data.get("id", "unknown")
     platform = "twitch" if "twitch.tv" in url else "youtube"
 
-    release_ts = data.get("release_timestamp")
+    release_ts = ls_common.stream_start_epoch(data)
     upload_date = data.get("upload_date", "")
     if release_ts:
         ts_str = datetime.datetime.fromtimestamp(release_ts).strftime("%Y-%m-%d_%H-%M")

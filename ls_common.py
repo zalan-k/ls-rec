@@ -161,6 +161,13 @@ def ytdlp_chat_cmd(config: dict, url: str, output_template: str) -> list[str]:
         "-o", output_template, url,
     ]
 
+def stream_start_epoch(data: dict) -> int | None:
+    for key in ("release_timestamp", "timestamp"):
+        v = data.get(key)
+        if isinstance(v, (int, float)) and v > 0:
+            return int(v)
+    return None
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  TWITCH HELIX API
 # ═══════════════════════════════════════════════════════════════════════════
@@ -289,6 +296,10 @@ def upsert_vod(cache: list[dict], vod: dict) -> dict:
         if existing["id"] == vid and existing.get("platform") == plat:
             existing.update({k: v for k, v in vod.items() if v is not None})
             return existing
+    # Filter on insert too, not just update. Without this a first-write entry
+    # keeps its None keys, so `"key" in vod` is a false positive for callers
+    # probing whether a value was ever captured.
+    vod = {k: v for k, v in vod.items() if v is not None}
     cache.append(vod)
     return vod
 
@@ -736,10 +747,9 @@ def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
     cmd = match.group("cmd")
     username = match.group("user")
     message = match.group("msg") or ""
-    ts = int(
-        (int(tags.get("tmi-sent-ts", time.time() * 1000)) - stream_start_ms)
-        * 1000
-    )
+    # Absolute & relative timestamps (ms)
+    sent_ms = int(tags.get("tmi-sent-ts", time.time() * 1000))
+    ts = int((sent_ms - stream_start_ms) * 1000)
 
     # Badges
     badges = []
@@ -782,7 +792,7 @@ def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
     # ── PRIVMSG ───────────────────────────────────────────────────────
     if cmd == "PRIVMSG":
         msg = {
-            "message_type": "text_message", "timestamp": ts,
+            "message_type": "text_message", "timestamp": ts, "tmi_sent_ts": sent_ms,
             "message_id": tags.get("id", ""), "author": author,
             "colour": tags.get("color", ""), "message": message,
             "emotes": emotes,
@@ -795,7 +805,8 @@ def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
     if cmd == "USERNOTICE":
         msg_id = tags.get("msg-id", "")
         base = {
-            "timestamp": ts, "message_id": tags.get("id", ""),
+            "timestamp": ts, "tmi_sent_ts": sent_ms, 
+            "message_id": tags.get("id", ""),
             "author": author, "colour": tags.get("color", ""),
             "message": message or None, "emotes": emotes,
         }
@@ -825,13 +836,13 @@ def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
     # ── CLEARCHAT / CLEARMSG ──────────────────────────────────────────
     if cmd == "CLEARCHAT" and message:
         return {
-            "message_type": "ban_user", "timestamp": ts,
+            "message_type": "ban_user", "timestamp": ts, "tmi_sent_ts": sent_ms,
             "author": {"target_id": tags.get("target-user-id", ""), "name": message},
             "ban_duration": int(tags["ban-duration"]) if tags.get("ban-duration") else None,
         }
     if cmd == "CLEARMSG" and tags.get("target-msg-id"):
         return {
-            "message_type": "delete_message", "timestamp": ts,
+            "message_type": "delete_message", "timestamp": ts, "tmi_sent_ts": sent_ms,
             "target_message_id": tags["target-msg-id"],
         }
 
