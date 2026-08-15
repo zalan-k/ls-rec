@@ -31,7 +31,8 @@ ZERO_SAMPLES = 200
 
 # Derived artifacts, not captures. ls_audit.scan_nas should skip these.
 DERIVED_SUFFIXES = (".chat.json", ".posthoc.json", ".unified.json",
-                    ".live.json", ".merged.json", ".merging", ".archive")
+                    ".live.json", ".merged.json", ".merging", ".archive",
+                    ".timings.json")
 
 
 def is_derived(filename: str) -> bool:
@@ -192,6 +193,73 @@ def detect_format(path: str) -> str:
     if '"message_type"' in probe or '"action_type"' in probe:
         return IRC
     return UNKNOWN
+
+
+def peek_zero(path: str, max_lines: int = 400) -> tuple[Optional[int], str]:
+    """
+    Derive a capture's zero from the head of the file, without parsing it all.
+
+    Returns (epoch_ms, source). The source says what the zero *means*:
+        yt:timestampUsec   broadcast start (videoOffsetTimeMsec is video-relative)
+        tdc:created_at     broadcast start (VOD start)
+        irc:tmi_sent_ts    record start (offsets are relative to the recorder)
+    """
+    fmt = detect_format(path)
+
+    if fmt == TDC:
+        # created_at sits in the header, ahead of the comments array
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                head = f.read(PROBE_BYTES * 4)
+        except OSError:
+            return None, "none"
+        m = re.search(r'"created_at"\s*:\s*"([^"]+)"', head)
+        if m:
+            try:
+                dt = datetime.datetime.fromisoformat(
+                    m.group(1).replace("Z", "+00:00"))
+                return int(dt.timestamp() * 1000), "tdc:created_at"
+            except ValueError:
+                pass
+        return None, "none"
+
+    if fmt not in (IRC, YTDLP):
+        return None, "none"
+
+    deltas: list[int] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines or len(deltas) >= ZERO_SAMPLES:
+                    break
+                line = line.strip().rstrip(",")
+                if not line or line in ("[", "]"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if fmt == IRC:
+                    a = _irc_abs(obj)
+                    if a is not None:
+                        deltas.append(a - _irc_ts(obj))
+                else:
+                    ts = YtdlpConverter._ts(obj)
+                    for act in (obj.get("replayChatItemAction") or {}).get("actions") or []:
+                        item = (act.get("addChatItemAction") or {}).get("item") or {}
+                        for r in item.values():
+                            if isinstance(r, dict) and r.get("timestampUsec"):
+                                try:
+                                    deltas.append(int(r["timestampUsec"]) // 1000 - ts)
+                                except (TypeError, ValueError):
+                                    pass
+    except OSError:
+        return None, "none"
+
+    if not deltas:
+        return None, "none"
+    return (int(statistics.median(deltas)),
+            "irc:tmi_sent_ts" if fmt == IRC else "yt:timestampUsec")
 
 
 # ── base ──────────────────────────────────────────────────────────────────

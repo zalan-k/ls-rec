@@ -712,6 +712,188 @@ def _print_vod(vod: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  TIMINGS SIDECAR
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Two instants per platform: when the broadcast started, and when we started
+#  recording it. New recordings have both in the cache. Older ones are
+#  reconstructed, best source first, and every value carries where it came
+#  from and how accurate it is -- an unattributed timestamp is worse than a
+#  missing one.
+
+FILENAME_TS_RE = re.compile(r"@\s*(\d{4}-\d{2}-\d{2}_\d{2}-\d{2})")
+
+
+def _filename_epoch_ms(filename: str) -> int | None:
+    """The `@ YYYY-MM-DD_HH-MM` stamp, to the minute."""
+    m = FILENAME_TS_RE.search(filename or "")
+    if not m:
+        return None
+    try:
+        return int(datetime.datetime.strptime(
+            m.group(1), "%Y-%m-%d_%H-%M").timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _log_record_start(config: dict, nas_file: str) -> int | None:
+    """
+    Scan the recorder log for this stream's first part.
+
+    The log is written to the daemon's working directory, so it is only found
+    if ls-audit runs from the same place. It also rolls over, covering the
+    last few dozen recordings at most.
+    """
+    stem = re.sub(r"^\d+_", "", os.path.splitext(nas_file)[0])
+    for cand in (config.get("log_file"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "livestream_recorder.log"),
+                 "livestream_recorder.log"):
+        if not cand or not os.path.exists(cand):
+            continue
+        pat = re.compile(r"^([\d\-]{10} [\d:]{8}),\d+ .*Part 01 started: "
+                         + re.escape(stem))
+        try:
+            with open(cand, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = pat.match(line)
+                    if m:
+                        return int(datetime.datetime.strptime(
+                            m.group(1), "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+        except OSError:
+            continue
+    return None
+
+
+def _iso(ms: int | None) -> str | None:
+    if ms is None:
+        return None
+    return datetime.datetime.fromtimestamp(ms / 1000).isoformat(timespec="seconds")
+
+
+def _platform_timings(config: dict, cache: list[dict], nas: dict,
+                      prefix: str, platform: str) -> dict | None:
+    """Best-effort timings for one platform, with provenance on every value."""
+    nas_root = config.get("nas_path", "")
+    chat_file = nas.get(f"{prefix}_chat")
+    video_file = nas.get(f"{prefix}_video")
+    if not (chat_file or video_file):
+        return None
+
+    vid = ls_common.extract_video_id_from_filename(chat_file or video_file)
+    vod = (ls_common.find_vod(cache, vid, platform) or {}) if vid else {}
+
+    stream_ms = stream_src = None
+    record_ms = record_src = None
+
+    # 1. cache — written at record time, exact
+    if vod.get("stream_start_epoch_ms"):
+        stream_ms, stream_src = vod["stream_start_epoch_ms"], "cache"
+    if vod.get("record_start_epoch_ms"):
+        record_ms, record_src = vod["record_start_epoch_ms"], "cache"
+
+    # 2. the chat file itself — exact, and works for the whole back catalogue.
+    #    What the zero means depends on the format, so trust the source label.
+    if chat_file and (stream_ms is None or record_ms is None):
+        zero, zsrc = ls_chat.peek_zero(os.path.join(nas_root, chat_file))
+        if zero is not None:
+            if zsrc in ("yt:timestampUsec", "tdc:created_at") and stream_ms is None:
+                stream_ms, stream_src = zero, f"chat ({zsrc})"
+            elif zsrc == "irc:tmi_sent_ts" and record_ms is None:
+                record_ms, record_src = zero, f"chat ({zsrc})"
+
+    # 3. recorder log — second accurate, but only the recent past
+    if record_ms is None and (video_file or chat_file):
+        hit = _log_record_start(config, video_file or chat_file)
+        if hit:
+            record_ms, record_src = hit, "log"
+
+    # 4. filename — minute only, and ambiguous: the recorder stamps the
+    #    detection time, an ls-audit re-download stamps the broadcast start.
+    #    Only usable as a record start once it is clearly not the latter.
+    fname_ms = _filename_epoch_ms(chat_file or video_file)
+    if record_ms is None and fname_ms is not None:
+        if stream_ms is None or abs(fname_ms - stream_ms) > 60_000:
+            record_ms, record_src = fname_ms, "filename (minute)"
+
+    duration = vod.get("duration")
+    if video_file:
+        vp = os.path.join(nas_root, video_file)
+        if os.path.exists(vp):
+            duration = analyze_video_file(vp).get("duration_secs") or duration
+
+    def acc(src):
+        if src is None:
+            return None
+        return "minute" if "filename" in src else "exact"
+
+    return {
+        "video_id": vid,
+        "stream_start_epoch_ms": stream_ms,
+        "stream_start_iso": _iso(stream_ms),
+        "stream_start_source": stream_src,
+        "stream_start_accuracy": acc(stream_src),
+        "record_start_epoch_ms": record_ms,
+        "record_start_iso": _iso(record_ms),
+        "record_start_source": record_src,
+        "record_start_accuracy": acc(record_src),
+        "duration_secs": duration,
+        "filename_epoch_ms": fname_ms,
+        "files": {"video": video_file, "chat": chat_file},
+    }
+
+
+def cmd_timings(config: dict, index: int, output: str | None = None,
+                dry_run: bool = False):
+    """Write a timings sidecar for one entry."""
+    print(f"\n{'=' * 60}")
+    print(f"  Timings for entry #{index}")
+    print(f"{'=' * 60}")
+
+    nas = scan_nas(config, index)
+    cache = ls_common.load_cache()
+
+    doc = {"schema": 1, "index": int(index),
+           "generated_at": datetime.datetime.now().isoformat(timespec="seconds")}
+    any_found = False
+
+    for prefix, platform in (("yt", "youtube"), ("tw", "twitch")):
+        t = _platform_timings(config, cache, nas, prefix, platform)
+        if not t:
+            print(f"  {platform:<8} no files")
+            continue
+        any_found = True
+        doc[platform] = t
+        print(f"  {platform}")
+        for label, key in (("stream start", "stream_start"),
+                           ("record start", "record_start")):
+            iso, src = t[f"{key}_iso"], t[f"{key}_source"]
+            if iso:
+                print(f"    {label}  {iso}  [{src}]")
+            else:
+                print(f"    {label}  UNKNOWN")
+        if t["duration_secs"]:
+            print(f"    duration      {_seconds_to_hhmmss(t['duration_secs'])}")
+
+    if not any_found:
+        print("\n  Nothing to record.\n")
+        return
+
+    if dry_run:
+        print("\n  --dry-run: nothing written.\n")
+        return
+
+    if not output:
+        src_name = (doc.get("youtube") or doc.get("twitch"))["files"]
+        stem = _title_from_filename(src_name["chat"] or src_name["video"])
+        output = os.path.join(config.get("nas_path", ""),
+                              f"{int(index):03d}_{stem}.timings.json")
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+    print(f"\n  ✔ {output}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  YOUTUBE CHAT COVERAGE
 # ═══════════════════════════════════════════════════════════════════════════
 #
@@ -1106,6 +1288,8 @@ examples:
                         help="Use manual input for --inject")
     parser.add_argument("--cache-info", metavar="ID",
                         help="Look up a video ID in the cache")
+    parser.add_argument("--timings", action="store_true",
+                        help="Write a timings sidecar for this entry")
     parser.add_argument("--merge-chat", action="store_true",
                         help="Merge this entry's chats into one tagged file")
     parser.add_argument("--ref", default="youtube",
@@ -1134,6 +1318,11 @@ examples:
         return
     if args.index is None:
         parser.print_help()
+        return
+
+    if args.timings:
+        cmd_timings(config, args.index, output=args.output,
+                    dry_run=args.dry_run)
         return
 
     if args.merge_chat:
