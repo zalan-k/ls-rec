@@ -66,6 +66,20 @@ def detect_format(path: str) -> str:
 #  FIELD EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Renderers that represent an actual chat event. Everything else -- notably
+# liveChatViewerEngagementMessageRenderer, the "Live chat replay is on" notice
+# YouTube injects as the first line of a post-hoc download -- is stamped with
+# the DOWNLOAD time, not a stream time, and must never anchor anything.
+MESSAGE_RENDERERS = (
+    "liveChatTextMessageRenderer",
+    "liveChatPaidMessageRenderer",
+    "liveChatPaidStickerRenderer",
+    "liveChatMembershipItemRenderer",
+    "liveChatSponsorshipsGiftPurchaseAnnouncementRenderer",
+    "liveChatSponsorshipsGiftRedemptionAnnouncementRenderer",
+)
+
+
 def first_msg_usec(entry: dict) -> int | None:
     """Pull timestampUsec from inside replayChatItemAction.actions."""
     actions = entry.get("replayChatItemAction", {}).get("actions", [])
@@ -74,14 +88,15 @@ def first_msg_usec(entry: dict) -> int | None:
             if not isinstance(renderer, dict):
                 continue
             item = renderer.get("item", {})
-            for r in item.values():
-                if isinstance(r, dict):
-                    ts = r.get("timestampUsec")
-                    if ts:
-                        try:
-                            return int(ts)
-                        except (ValueError, TypeError):
-                            pass
+            for key, r in item.items():
+                if key not in MESSAGE_RENDERERS or not isinstance(r, dict):
+                    continue
+                ts = r.get("timestampUsec")
+                if ts:
+                    try:
+                        return int(ts)
+                    except (ValueError, TypeError):
+                        pass
     return None
 
 
@@ -121,29 +136,52 @@ def get_msg_id(entry: dict) -> str | None:
 #  ZERO POINT DERIVATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def derive_zero_usec(path: str, max_scan: int = 500) -> int | None:
+def derive_zero_usec(path: str, max_scan: int = 20000,
+                     want: int = 200) -> int | None:
     """
     Derive wall-clock zero (usec): timestampUsec - videoOffsetTimeMsec * 1000.
-    Scans up to max_scan lines to find a usable entry.
+
+    Only entries with a NON-ZERO offset are sampled. Post-hoc downloads clamp
+    videoOffsetTimeMsec to "0" for everything before the stream started, so a
+    pre-stream message yields its own send time as the zero -- hours out. A
+    long waiting room can push the first real offset thousands of lines in,
+    hence the generous scan cap.
+
+    The median of many samples is used rather than the first hit, so one odd
+    entry cannot skew the result.
     """
+    samples: list[int] = []
+    fallback: int | None = None
     scanned = 0
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line or scanned >= max_scan:
+            if not line:
+                continue
+            if scanned >= max_scan or len(samples) >= want:
                 break
             scanned += 1
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            offset_ms = get_offset_ms(d)
-            if offset_ms is None:
+            if not isinstance(d, dict):
                 continue
+            offset_ms = get_offset_ms(d)
             ts_usec = first_msg_usec(d)
-            if ts_usec is not None:
-                return ts_usec - offset_ms * 1000
-    return None
+            if offset_ms is None or ts_usec is None:
+                continue
+            zero = ts_usec - offset_ms * 1000
+            if offset_ms == 0:
+                if fallback is None:
+                    fallback = zero
+                continue
+            samples.append(zero)
+
+    if samples:
+        samples.sort()
+        return samples[len(samples) // 2]
+    return fallback
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -166,6 +204,11 @@ def load_file(path: str) -> tuple[list[dict], int]:
             try:
                 d = json.loads(stripped)
             except json.JSONDecodeError:
+                skipped += 1
+                continue
+            # One object per line is the norm, but a stray bare string or
+            # list would crash the accessors below.
+            if not isinstance(d, dict):
                 skipped += 1
                 continue
             offset_ms = get_offset_ms(d)
