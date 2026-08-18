@@ -344,8 +344,10 @@ class LivestreamRecorder:
         lines.append(" ─── Monitored ─────────────────────────────────────────────────────")
         t_w = 30
         defaults = [
-            ("YT", self.config["youtube_handle"], f"{self.config['check_interval']}s"),
-            ("TW", self.config["twitch_user"],    f"{self.config['check_interval']}s"),
+            ("YT", self.config["youtube_handle"],
+             f"{self._platform_interval('youtube')}s"
+             + (" +cookies" if ls_common.youtube_anon_blocked() else "")),
+            ("TW", self.config["twitch_user"], f"{self._platform_interval('twitch')}s"),
         ]
         watched = []
         for url, info in self.watch_list.items():
@@ -585,7 +587,11 @@ class LivestreamRecorder:
     def _check_streams(self):
         if not self._is_monitoring_allowed():
             return
+        now = datetime.datetime.now()
         for platform in ("youtube", "twitch"):
+            last = self.last_check_time.get(platform)
+            if last and (now - last).total_seconds() < self._platform_interval(platform):
+                continue
             result = self._probe_platform(platform)
             if (result and result["stream_key"] not in self.active_streams and result["stream_key"] not in self.recorded_keys):
                 logger.info(f"Live: {result['stream_title']}")
@@ -642,10 +648,22 @@ class LivestreamRecorder:
 
     # ── recording ─────────────────────────────────────────────────────────
 
+    def _platform_interval(self, platform: str) -> int:
+        return int(self.config.get(f"check_interval_{platform}")
+                   or self.config.get("check_interval", 60))
+
+    def _dual_window(self) -> int:
+        """Must exceed the slowest poll interval, or a lenient YouTube check
+        misses the pairing and allocates a second obsidian index."""
+        if self.config.get("dual_stream_window"):
+            return int(self.config["dual_stream_window"])
+        return (self.config["dual_stream_cycle"] * self.config["check_interval"]
+                + max(self._platform_interval(p) for p in ("youtube", "twitch")))
+
     def _get_stream_index(self, platform: str,
                           start_time: datetime.datetime) -> tuple[int, bool]:
         """Get obsidian index, detecting dual-stream to share an index."""
-        window = self.config["dual_stream_cycle"] * self.config["check_interval"]
+        window = self._dual_window()
         other = "twitch" if platform == "youtube" else "youtube"
         for s in self.active_streams.values():
             if s["platform"] == other:
@@ -864,9 +882,25 @@ class LivestreamRecorder:
 
     # ── monitor / watchdog ────────────────────────────────────────────────
 
-    def _source_still_live(self, stream: dict) -> bool:
-        data = ls_common.ytdlp_probe(self.config, stream["url"], playlist_items="1")
-        return bool(data and data.get("is_live") and data.get("id") == stream["identifier"])
+    def _source_still_live(self, stream: dict, attempts: int = 3) -> bool:
+        """
+        Only believe "ended" when a probe actually says so.
+
+        A stub, timeout or blip returns None, and treating that as "ended"
+        permanently kills the chat capture mid-stream. Inconclusive fails
+        toward still-live: the cost is a few wasted segments at stream end,
+        against losing hours of chat.
+        """
+        for i in range(attempts):
+            data = ls_common.ytdlp_probe(self.config, stream["url"],
+                                         playlist_items="1")
+            if data and data.get("id") == stream["identifier"]:
+                return bool(data.get("is_live"))      # a real answer
+            if i < attempts - 1:
+                time.sleep(20)
+        logger.warning(f"Liveness probe inconclusive x{attempts} for "
+                       f"{stream['stream_title']}; assuming still live")
+        return True
 
     def _video_monitor(self, stream_key, process, log_fh, title, part_num):
         """Wait for yt-dlp exit, then classify: superseded / natural-end / failure."""
@@ -1228,7 +1262,8 @@ class LivestreamRecorder:
         logger.info("=" * 60)
         logger.info("ls-rec starting")
         logger.info("=" * 60)
-        logger.info(f"  > Check interval: {self.config['check_interval']}s")
+        logger.info(f"  > Check interval: YT {self._platform_interval('youtube')}s / "
+                    f"TW {self._platform_interval('twitch')}s")
         logger.info(f"  > Cooldown: {self.config['cooldown_duration']}s")
         logger.info(f"  > Watchdog stall threshold: {WATCHDOG_STALL_S}s")
         self.command_server.start()

@@ -5,7 +5,7 @@ Config loading, yt-dlp command building, Twitch Helix API, VOD cache,
 Obsidian entry helpers, Twitch IRC chat recorder, and utilities.
 """
 
-import datetime, glob, json, os, re, socket, subprocess, time
+import datetime, glob, json, logging, os, re, socket, subprocess, time
 import urllib.parse, urllib.request
 from typing import Any
 
@@ -21,6 +21,9 @@ VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".ts", ".flv", ".mov")
 
 _DEFAULTS: dict[str, Any] = {
     "check_interval":    60,
+    "check_interval_youtube": 600,   # from-start recovers the detection gap
+    "check_interval_twitch":  60,    # no from-start; every minute matters
+    "yt_anon_retry_after": 86400,    # bot flags last ~24h
     "cooldown_duration": 30,
     "dual_stream_cycle": 10,
     "cookies_browser":   "firefox",
@@ -67,24 +70,101 @@ def _ytdlp_base(config: dict, cookies: bool = True) -> list[str]:
     return base
 
 
-def ytdlp_probe(config: dict, url: str, *,
-                playlist_items: str | None = None,
-                timeout: int = 30) -> dict | None:
-    """Probe URL for metadata. Returns parsed JSON dict or None."""
-    cmd = _ytdlp_base(config, cookies=False) + ["--dump-json", "--ignore-no-formats-error"]
+_log = logging.getLogger("ls-rec")
+
+# ── YouTube anonymous access ──────────────────────────────────────────────
+#
+# Anonymous is the preferred mode: cookies + --live-from-start is the config
+# associated with mid-recording segment breakage. Cookies are a fallback for
+# when YouTube bot-checks, time-boxed so it cannot become permanent. State is
+# in-memory only -- a restart just costs one probe.
+
+_yt_anon_blocked_until = 0.0
+
+
+def _is_bot_check(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in
+               ("sign in to confirm", "not a bot", "login_required"))
+
+
+def _is_youtube(url: str) -> bool:
+    return "youtube.com" in url or "youtu.be" in url
+
+
+def youtube_anon_blocked() -> bool:
+    return time.time() < _yt_anon_blocked_until
+
+
+def _mark_anon_blocked(config: dict, reason: str = ""):
+    global _yt_anon_blocked_until
+    first = not youtube_anon_blocked()
+    retry = int(config.get("yt_anon_retry_after", 86400))
+    _yt_anon_blocked_until = time.time() + retry
+    if first:
+        _log.warning("YouTube bot-checked; using cookies for %.0fh. Expect "
+                     "segment restarts until this clears. %s",
+                     retry / 3600, (reason or "").strip()[-200:])
+
+
+def _mark_anon_ok():
+    global _yt_anon_blocked_until
+    if youtube_anon_blocked():
+        _log.info("YouTube anonymous access restored")
+    _yt_anon_blocked_until = 0.0
+
+
+def _probe_once(config: dict, url: str, cookies: bool,
+                playlist_items: str | None, timeout: int) -> tuple[dict | None, str]:
+    cmd = _ytdlp_base(config, cookies=cookies) + ["--dump-json",
+                                                  "--ignore-no-formats-error"]
     if playlist_items:
         cmd += ["--playlist-items", playlist_items]
     cmd.append(url)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
+    except subprocess.TimeoutExpired:
+        return None, "probe timed out"
+    except FileNotFoundError:
+        return None, "yt-dlp not found"
     if r.returncode != 0 or not r.stdout.strip():
-        return None
+        return None, r.stderr or "no output"
     try:
-        return json.loads(r.stdout.strip().split("\n", 1)[0])
+        data = json.loads(r.stdout.strip().split("\n", 1)[0])
     except json.JSONDecodeError:
-        return None
+        return None, "unparseable json"
+    # --ignore-no-formats-error exits 0 with a stub when extraction is
+    # blocked, making a bot-checked extractor look like an offline channel.
+    if data.get("title") is None and data.get("live_status") is None:
+        return None, r.stderr or "stub response"
+    return data, ""
+
+
+def ytdlp_probe(config: dict, url: str, *,
+                playlist_items: str | None = None,
+                timeout: int = 30) -> dict | None:
+    """
+    Probe URL for metadata. Twitch always cookied (ad-free); YouTube tries
+    anonymous first and only falls back to cookies on a bot check.
+    """
+    if not _is_youtube(url):
+        return _probe_once(config, url, True, playlist_items, timeout)[0]
+
+    if not youtube_anon_blocked():
+        data, err = _probe_once(config, url, False, playlist_items, timeout)
+        if data is not None:
+            _mark_anon_ok()
+            return data
+        if not _is_bot_check(err):
+            _log.warning("YouTube probe failed: %s", err.strip()[-200:])
+            return None            # transient; do not switch modes over it
+        _mark_anon_blocked(config, err)
+
+    data, err = _probe_once(config, url, True, playlist_items, timeout)
+    if data is None:
+        _log.warning("YouTube probe failed with cookies too: %s",
+                     err.strip()[-200:])
+    return data
 
 
 def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
@@ -136,7 +216,9 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str,
             "--fragment-retries",      "3",
         ]
 
-    return _ytdlp_base(config, cookies=(platform != "youtube")) + extra + common + [url]
+    # Twitch: cookies (ad-free). YouTube: anonymous unless bot-checked.
+    cookies = (platform != "youtube") or youtube_anon_blocked()
+    return _ytdlp_base(config, cookies=cookies) + extra + common + [url]
 
 
 def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
@@ -155,7 +237,9 @@ def ytdlp_vod_cmd(config: dict, url: str, output_template: str) -> list[str]:
 
 
 def ytdlp_chat_cmd(config: dict, url: str, output_template: str) -> list[str]:
-    return _ytdlp_base(config) + [
+    # Same rule as video; chat stayed cookied while video went anonymous.
+    cookies = (not _is_youtube(url)) or youtube_anon_blocked()
+    return _ytdlp_base(config, cookies=cookies) + [
         "--skip-download", "--ignore-no-formats-error",
         "--write-subs", "--sub-langs", "live_chat",
         "-o", output_template, url,

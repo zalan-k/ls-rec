@@ -29,10 +29,22 @@ from typing import Optional
 PROBE_BYTES = 16384
 ZERO_SAMPLES = 200
 
+# Renderers that are actual chat events. liveChatViewerEngagementMessageRenderer
+# ("Live chat replay is on") heads every post-hoc download and is stamped with
+# the DOWNLOAD time, so it must never contribute to a zero.
+YT_MESSAGE_RENDERERS = (
+    "liveChatTextMessageRenderer",
+    "liveChatPaidMessageRenderer",
+    "liveChatPaidStickerRenderer",
+    "liveChatMembershipItemRenderer",
+    "liveChatSponsorshipsGiftPurchaseAnnouncementRenderer",
+    "liveChatSponsorshipsGiftRedemptionAnnouncementRenderer",
+)
+
 # Derived artifacts, not captures. ls_audit.scan_nas should skip these.
 DERIVED_SUFFIXES = (".chat.json", ".posthoc.json", ".unified.json",
                     ".live.json", ".merged.json", ".merging", ".archive",
-                    ".timings.json")
+                    ".timings.json", "merged-chat.json")
 
 
 def is_derived(filename: str) -> bool:
@@ -195,7 +207,7 @@ def detect_format(path: str) -> str:
     return UNKNOWN
 
 
-def peek_zero(path: str, max_lines: int = 400) -> tuple[Optional[int], str]:
+def peek_zero(path: str, max_lines: int = 20000) -> tuple[Optional[int], str]:
     """
     Derive a capture's zero from the head of the file, without parsing it all.
 
@@ -245,10 +257,17 @@ def peek_zero(path: str, max_lines: int = 400) -> tuple[Optional[int], str]:
                         deltas.append(a - _irc_ts(obj))
                 else:
                     ts = YtdlpConverter._ts(obj)
+                    # Post-hoc clamps videoOffsetTimeMsec to 0 for everything
+                    # before the stream started, so an offset of 0 yields the
+                    # message's own send time as the zero -- hours out.
+                    if ts == 0:
+                        continue
                     for act in (obj.get("replayChatItemAction") or {}).get("actions") or []:
                         item = (act.get("addChatItemAction") or {}).get("item") or {}
-                        for r in item.values():
-                            if isinstance(r, dict) and r.get("timestampUsec"):
+                        for key, r in item.items():
+                            if key not in YT_MESSAGE_RENDERERS or not isinstance(r, dict):
+                                continue
+                            if r.get("timestampUsec"):
                                 try:
                                     deltas.append(int(r["timestampUsec"]) // 1000 - ts)
                                 except (TypeError, ValueError):
@@ -564,7 +583,10 @@ class YtdlpConverter(Converter):
                     m = self._action(act, ts)
                     if m:
                         self.messages.append(m)
-                        if m.abs_ms is not None and len(zeros) < ZERO_SAMPLES:
+                        # ts == 0 is the post-hoc clamp for pre-stream chat;
+                        # abs_ms stays correct, the offset does not.
+                        if (m.abs_ms is not None and ts != 0
+                                and len(zeros) < ZERO_SAMPLES):
                             zeros.append(m.abs_ms - ts)
         if zeros:
             self.zero_ms = int(statistics.median(zeros))
@@ -594,17 +616,28 @@ class YtdlpConverter(Converter):
                             ("liveChatPaidMessageRenderer", self._superchat),
                             ("liveChatMembershipItemRenderer", self._member),
                             ("liveChatSponsorshipsGiftPurchaseAnnouncementRenderer",
-                             self._gift)):
+                             self._gift),
+                            ("liveChatSponsorshipsGiftRedemptionAnnouncementRenderer",
+                             self._gift_redeem)):
                 if key in item:
                     return fn(item[key], ts)
         elif "addBannerToLiveChatCommand" in act:
             return self._banner(act["addBannerToLiveChatCommand"] or {}, ts)
-        elif "removeChatItemAction" in act:
-            t = (act["removeChatItemAction"] or {}).get("targetItemId")
+        # remove* is the live form, mark*AsDeleted the replay form. A
+        # post-hoc download only ever carries the latter, so handling just
+        # the live pair meant post-hoc conversions flagged zero deletions.
+        elif "removeChatItemAction" in act or "markChatItemAsDeletedAction" in act:
+            key = ("removeChatItemAction" if "removeChatItemAction" in act
+                   else "markChatItemAsDeletedAction")
+            t = (act[key] or {}).get("targetItemId")
             if t:
                 self.deletions[t] = ts
-        elif "removeChatItemByAuthorAction" in act:
-            c = (act["removeChatItemByAuthorAction"] or {}).get("externalChannelId")
+        elif ("removeChatItemByAuthorAction" in act
+                or "markChatItemsByAuthorAsDeletedAction" in act):
+            key = ("removeChatItemByAuthorAction"
+                   if "removeChatItemByAuthorAction" in act
+                   else "markChatItemsByAuthorAsDeletedAction")
+            c = (act[key] or {}).get("externalChannelId")
             if c:
                 self.bans[c] = ts
         return None
@@ -678,6 +711,26 @@ class YtdlpConverter(Converter):
                    author={"id": r.get("authorExternalChannelId", ""),
                            "name": name[1:] if name.startswith("@") else name},
                    tier=1, count=int(m.group(1)) if m else 1)
+
+    def _gift_redeem(self, r, ts) -> Msg:
+        """
+        The recipient side of a gifted membership. The renderer's author IS
+        the recipient; the gifter is only a name inside the message runs, so
+        it carries no id. Shaped like Twitch's subscription_gift for
+        consistency: author = gifter, recipient = who received it.
+        """
+        runs = (r.get("message") or {}).get("runs") or []
+        gifter = ""
+        for run in reversed(runs):
+            t = (run.get("text") or "").strip()
+            if t and not t.lower().endswith("by") and "gifted" not in t.lower():
+                gifter = t.lstrip("@")
+                break
+        return Msg(type="gift", ts=ts, abs_ms=self._abs(r), id=r.get("id"),
+                   author={"id": "", "name": gifter} if gifter else None,
+                   badges=self._badges(r) or None, tier=1, count=1,
+                   recipient={"id": r.get("authorExternalChannelId", ""),
+                              "name": self._author(r)["name"]})
 
     def _banner(self, cmd, ts) -> Optional[Msg]:
         banner = (cmd.get("bannerRenderer") or {}).get("liveChatBannerRenderer") or {}

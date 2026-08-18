@@ -887,7 +887,7 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
         src_name = (doc.get("youtube") or doc.get("twitch"))["files"]
         stem = _title_from_filename(src_name["chat"] or src_name["video"])
         output = os.path.join(config.get("nas_path", ""),
-                              f"{int(index):03d}_{stem}.timings.json")
+                              f"{int(index):03d}_{stem}.meta.json")
     with open(output, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=1)
     print(f"\n  ✔ {output}\n")
