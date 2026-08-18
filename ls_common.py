@@ -115,7 +115,10 @@ def _mark_anon_ok():
 
 
 def _probe_once(config: dict, url: str, cookies: bool,
-                playlist_items: str | None, timeout: int) -> tuple[dict | None, str]:
+                playlist_items: str | None,
+                timeout: int) -> tuple[dict | None, str, bool]:
+    """Returns (data, error, blocked). `blocked` means extraction was denied
+    rather than merely failing, so the caller should try cookies."""
     cmd = _ytdlp_base(config, cookies=cookies) + ["--dump-json",
                                                   "--ignore-no-formats-error"]
     if playlist_items:
@@ -124,20 +127,29 @@ def _probe_once(config: dict, url: str, cookies: bool,
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, "probe timed out"
+        return None, "probe timed out", False
     except FileNotFoundError:
-        return None, "yt-dlp not found"
+        return None, "yt-dlp not found", False
     if r.returncode != 0 or not r.stdout.strip():
-        return None, r.stderr or "no output"
+        return None, r.stderr or "no output", _is_bot_check(r.stderr)
     try:
         data = json.loads(r.stdout.strip().split("\n", 1)[0])
     except json.JSONDecodeError:
-        return None, "unparseable json"
+        return None, "unparseable json", False
     # --ignore-no-formats-error exits 0 with a stub when extraction is
     # blocked, making a bot-checked extractor look like an offline channel.
-    if data.get("title") is None and data.get("live_status") is None:
-        return None, r.stderr or "stub response"
-    return data, ""
+    # Do NOT also require a missing title: on a bot check yt-dlp still
+    # recovers one from the page ("falling back to title from initial
+    # data"), which let the stub through as a valid "not live" answer.
+    # A liveness probe that cannot report liveness is a failure.
+    # On a channel /live URL with --playlist-items, yt-dlp suppresses the
+    # error entirely: exit 0, empty stderr, and a stub carrying a real title
+    # scraped from the page. The missing live_status is the ONLY signal, so
+    # it counts as blocked in its own right -- there is no message to match.
+    if data.get("live_status") is None and data.get("is_live") is None:
+        return None, (r.stderr.strip() or
+                      "stub: title but no live_status (extraction denied)"), True
+    return data, "", False
 
 
 def ytdlp_probe(config: dict, url: str, *,
@@ -151,16 +163,17 @@ def ytdlp_probe(config: dict, url: str, *,
         return _probe_once(config, url, True, playlist_items, timeout)[0]
 
     if not youtube_anon_blocked():
-        data, err = _probe_once(config, url, False, playlist_items, timeout)
+        data, err, blocked = _probe_once(config, url, False,
+                                         playlist_items, timeout)
         if data is not None:
             _mark_anon_ok()
             return data
-        if not _is_bot_check(err):
+        if not blocked:
             _log.warning("YouTube probe failed: %s", err.strip()[-200:])
             return None            # transient; do not switch modes over it
         _mark_anon_blocked(config, err)
 
-    data, err = _probe_once(config, url, True, playlist_items, timeout)
+    data, err, _ = _probe_once(config, url, True, playlist_items, timeout)
     if data is None:
         _log.warning("YouTube probe failed with cookies too: %s",
                      err.strip()[-200:])
