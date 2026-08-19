@@ -88,11 +88,11 @@ _log = logging.getLogger("ls-rec")
 _yt_anon_blocked_until = 0.0
 
 
-def _is_bot_check(text: str) -> bool:
-    low = (text or "").lower()
-    return any(m in low for m in
-               ("sign in to confirm", "not a bot", "login_required"))
+def _is_offline(text: str) -> bool:
+    return any(m in (text or "").lower() for m in ("not currently live", "this live event will begin", "premieres in", "is offline"))
 
+def _is_bot_check(text: str) -> bool:
+    return any(m in (text or "").lower() for m in ("sign in to confirm", "not a bot", "login_required"))
 
 def _is_youtube(url: str) -> bool:
     return "youtube.com" in url or "youtu.be" in url
@@ -175,12 +175,13 @@ def ytdlp_probe(config: dict, url: str, *,
             _mark_anon_ok()
             return data
         if not blocked:
-            _log.warning("YouTube probe failed: %s", err.strip()[-200:])
-            return None            # transient; do not switch modes over it
+            if not _is_offline(err):
+                _log.warning("YouTube probe failed: %s", err.strip()[-200:])
+            return None
         _mark_anon_blocked(config, err)
 
     data, err, _ = _probe_once(config, url, True, playlist_items, timeout)
-    if data is None:
+    if data is None and not _is_offline(err):
         _log.warning("YouTube probe failed with cookies too: %s",
                      err.strip()[-200:])
     return data
