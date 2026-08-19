@@ -254,6 +254,7 @@ def ytdlp_chat_cmd(config: dict, url: str, output_template: str) -> list[str]:
     cookies = (not _is_youtube(url)) or youtube_anon_blocked()
     return _ytdlp_base(config, cookies=cookies) + [
         "--skip-download", "--ignore-no-formats-error",
+        "--no-progress",
         "--write-subs", "--sub-langs", "live_chat",
         "-o", output_template, url,
     ]

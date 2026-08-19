@@ -843,15 +843,25 @@ class LivestreamRecorder:
                     return True
 
                 seg, idle = 0, 0
-                while not stop_event.is_set() and idle < 5:   # cap: 5 empty segs = give up
+                IDLE_CAP = 5
+                while not stop_event.is_set() and idle < IDLE_CAP:
                     seg += 1
+                    log_path = os.path.join(
+                        self.config["output"], f"{title}.chatseg{seg:03d}.log")
+                    log_fh = None
+                    started = time.time()
                     try:
                         cmd = ls_common.ytdlp_chat_cmd(
                             self.config, stream["url"], f"{title}.chatseg{seg:03d}.%(ext)s",
                         )
+                        # A log file, NOT subprocess.PIPE: nothing drains the
+                        # pipes, so once the 64KB buffer fills yt-dlp blocks
+                        # mid-write. It also threw away the only evidence of
+                        # why a segment came back empty.
+                        log_fh = open(log_path, "ab", buffering=0)
                         proc = subprocess.Popen(
                             cmd, cwd=self.config["output"],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            stdout=log_fh, stderr=subprocess.STDOUT,
                         )
                         while proc.poll() is None:
                             if stop_event.is_set():
@@ -862,16 +872,36 @@ class LivestreamRecorder:
                             time.sleep(0.5)
                     except Exception as e:
                         logger.error(f"Chat error (seg {seg:03d}): {e}")
+                    finally:
+                        if log_fh:
+                            try: log_fh.close()
+                            except Exception: pass
 
-                    idle = 0 if fold(f"{title}.chatseg{seg:03d}") else idle + 1
+                    got = fold(f"{title}.chatseg{seg:03d}")
+                    idle = 0 if got else idle + 1
+                    logger.info(
+                        f"Chat seg {seg:03d} ran {time.time() - started:.0f}s, "
+                        f"{'produced chat' if got else f'EMPTY ({idle}/{IDLE_CAP})'}: "
+                        f"{title}")
+                    if not got:
+                        # Keep the log of an empty segment; it is the only
+                        # record of why. Successful segments' logs are noise.
+                        pass
+                    elif os.path.exists(log_path):
+                        try: os.remove(log_path)
+                        except OSError: pass
 
                     if stop_event.is_set():
                         break
                     if not self._source_still_live(stream):
                         logger.info(f"Chat: {title} no longer live; stopping")
                         break
-                    logger.info(f"Chat seg {seg:03d} ended; still live, relaunching")
                     time.sleep(30)
+
+                if idle >= IDLE_CAP:
+                    logger.warning(
+                        f"Chat gave up after {IDLE_CAP} empty segments while "
+                        f"still live: {title}. See .chatseg*.log for why.")
 
                 ls_common.merge_chat_fragments(self.config["output"], title)
 
