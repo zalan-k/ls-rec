@@ -21,7 +21,7 @@ broadcast start via DVR. One process per stream, no rotation. A watchdog
 thread samples file size every 10s and restarts yt-dlp if it stalls.
 """
 
-import os, re, glob, time, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common
+import os, re, glob, time, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common, ls_archive
 from collections import deque
 from pathlib import Path
 from yt_dlp.utils import sanitize_filename
@@ -717,6 +717,23 @@ class LivestreamRecorder:
         })
         ls_common.save_cache(cache)
 
+        # The archive gets the same two numbers, and it is the only place they
+        # are ever written down permanently. Never fatal: a failure here queues
+        # and the recording carries on.
+        try:
+            ls_archive.post_start(
+                self.config,
+                platform=platform,
+                video_id=video_id,
+                title=obsidian_title,
+                url=obsidian_url,
+                obsidian_index=obsidian_index,
+                broadcast_started_at=stream_start,
+                record_started_at=int(record_start.timestamp()),
+            )
+        except Exception as e:
+            logger.warning(f"archive start packet failed: {e}")
+
         stream_title = f"{obsidian_index:03d}_{info['stream_title']}"
         stream_key   = f"{platform}_{video_id}"
         self.recorded_keys.add(stream_key)
@@ -1206,6 +1223,15 @@ class LivestreamRecorder:
         obs_idx  = stream.get("obsidian_index")
         logger.info(f"Completing: {title}")
 
+        # Tracked out here because every `return` below is a real outcome the
+        # archive wants: no parts, merge failed, upload failed, upload=False.
+        # The packet fires from `finally` with whatever turned out to be true,
+        # so a broadcast that happened and produced no file is recorded as a
+        # broadcast with no file rather than as silence.
+        _have_video = False
+        _have_chat  = False
+        _duration   = None
+
         try:
             self._stop_process(stream.get("video_process"))
 
@@ -1221,7 +1247,7 @@ class LivestreamRecorder:
             chat_file = os.path.join(self.config["output"], f"{title}.json")
             if os.path.exists(chat_file) and os.path.getsize(chat_file) > 100:
                 chat_dst = os.path.join(self.config["nas_path"], f"{title}.json")
-                self._upload(chat_file, chat_dst)
+                _have_chat = self._upload(chat_file, chat_dst)
 
             # ── Video: merge parts → .mp4 with faststart → upload ──
             parts = self._find_part_files(title)
@@ -1242,10 +1268,14 @@ class LivestreamRecorder:
             if not ok:
                 logger.error(f"Merge failed; parts left in place for: {title}")
                 return
+            # A duration measured off the merged file is true whether or not the
+            # upload then works, so it is claimed here rather than at the end.
+            _duration = duration
 
             dst = os.path.join(self.config["nas_path"], f"{title}.mp4")
             if not self._upload(merged_local, dst):
                 return
+            _have_video = True
 
             # ── Obsidian + cache ──
             if obs_idx:
@@ -1265,6 +1295,19 @@ class LivestreamRecorder:
         except Exception as e:
             logger.error(f"Completion error for {title}: {e}")
         finally:
+            try:
+                ls_archive.post_done(
+                    self.config,
+                    platform=platform,
+                    video_id=stream["identifier"],
+                    stream_title=title,
+                    duration_seconds=_duration,
+                    video_ext=".mp4",
+                    have_video=_have_video,
+                    have_chat=_have_chat,
+                )
+            except Exception as e:
+                logger.warning(f"archive completion packet failed: {e}")
             self.active_streams.pop(stream_key, None)
             logger.info(f"Cleanup done: {title}")
 
@@ -1296,11 +1339,22 @@ class LivestreamRecorder:
                     f"TW {self._platform_interval('twitch')}s")
         logger.info(f"  > Cooldown: {self.config['cooldown_duration']}s")
         logger.info(f"  > Watchdog stall threshold: {WATCHDOG_STALL_S}s")
+        logger.info("  > Archive: "
+                    + (self.config.get("archive_url") if ls_archive.enabled(self.config)
+                       else "off (archive_url/archive_token unset)"))
         self.command_server.start()
         print("-" * 80)
 
         try:
             while True:
+                # Drain anything the archive missed while it was down. Before
+                # the cooldown check on purpose: a backlog should clear whether
+                # or not we are currently allowed to record.
+                try:
+                    ls_archive.flush(self.config)
+                except Exception as e:
+                    logger.warning(f"archive flush failed: {e}")
+
                 # Cooldown after manual termination
                 if not self._is_monitoring_allowed():
                     now = datetime.datetime.now()

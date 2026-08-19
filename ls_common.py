@@ -27,6 +27,12 @@ _DEFAULTS: dict[str, Any] = {
     "cooldown_duration": 30,
     "dual_stream_cycle": 10,
     "cookies_browser":   "firefox",
+    # ── tenma archive ────────────────────────────────────────────────────
+    # Both blank disables the whole thing; nothing is posted and no outbox is
+    # written. The prefix is where nas_path sits inside TENMA_MEDIA_ROOT.
+    "archive_url":          "",
+    "archive_token":        "",
+    "archive_media_prefix": "raws/",
 }
 
 _REQUIRED = (

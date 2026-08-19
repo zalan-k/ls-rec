@@ -12,11 +12,12 @@ Usage:
     ls-audit --cache-info ID                Look up cached video by ID
 """
 
-import os, re, glob, sys, json, subprocess, datetime, argparse
+import os, re, glob, sys, json, shutil, subprocess, datetime, argparse, calendar, logging
 from yt_dlp.utils import sanitize_filename
 
 import ls_common
 import ls_chat
+import ls_archive
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1017,7 +1018,8 @@ def _backfill_yt_chat(config: dict, item: dict) -> bool:
     return False
 
 
-def _offer_chat_backfill(config: dict, item: dict) -> bool:
+def _offer_chat_backfill(config: dict, item: dict,
+                         interactive: bool = True) -> bool:
     print("\n  ⚠ YouTube chat looks truncated:")
     print(f"      {item['count']:,} messages, ending at "
           f"{_seconds_to_hhmmss(item['last_secs'])} of "
@@ -1025,6 +1027,8 @@ def _offer_chat_backfill(config: dict, item: dict) -> bool:
     print(f"      short by {_seconds_to_hhmmss(item['shortfall_secs'])} "
           f"(flags above {_seconds_to_hhmmss(item['limit_secs'])})")
 
+    if not interactive:
+        return _backfill_yt_chat(config, item)
     if input("\n  Download post-hoc chat and merge? [y/N]: ").strip().lower() \
             not in ("y", "yes"):
         print("  Skipped.")
@@ -1057,9 +1061,49 @@ def _cache_zeros(cache: list[dict], yt_id: str | None,
     return out
 
 
+def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> None:
+    """
+    Move raw captures to deep storage once the merge holds them.
+
+    A raw is only moved if its platform actually landed messages in the
+    output and the source had a real zero -- otherwise the merge dropped
+    content and the raw is the only copy of it.
+    """
+    dest = config.get("chat_archive_path")
+    if not dest:
+        print("  Raw chats left in place (set chat_archive_path to archive).")
+        return
+
+    placed: dict[str, int] = {}
+    for m in res["messages"]:
+        placed[m["origin"]] = placed.get(m["origin"], 0) + 1
+    by_name = {os.path.basename(p): p for p in sources}
+
+    os.makedirs(dest, exist_ok=True)
+    for src in res["metadata"]["sources"]:
+        path = by_name.get(src["file"])
+        if not path:
+            continue
+        if src["zero_ms"] is None:
+            print(f"  ⚠ {src['file']}: no zero, messages unplaced — keeping")
+            continue
+        if not placed.get(src["platform"]):
+            print(f"  ⚠ {src['file']}: contributed nothing — keeping")
+            continue
+        target = os.path.join(dest, src["file"])
+        if os.path.exists(target):
+            print(f"  ⚠ {src['file']}: already in archive — keeping")
+            continue
+        try:
+            shutil.move(path, target)
+            print(f"  → archived {src['file']}")
+        except OSError as e:
+            print(f"  ✗ archive failed for {src['file']}: {e}")
+
+
 def cmd_merge_chat(config: dict, index: int, ref="youtube",
                    zeros: list | None = None, output: str | None = None,
-                   dry_run: bool = False):
+                   dry_run: bool = False, keep_raw: bool = False):
     """Merge this entry's chat captures into one origin-tagged file."""
     nas_root = config.get("nas_path", "")
     print(f"\n{'=' * 60}")
@@ -1120,12 +1164,103 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
         return
 
     if not output:
-        stem = _title_from_filename(os.path.basename(sources[0]))
-        output = os.path.join(nas_root, f"{int(index):03d}_{stem}.merged.json")
+        output = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
     with open(output, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=1)
     size = os.path.getsize(output) / (1024 * 1024)
-    print(f"\n  ✔ {output}  ({size:.1f}MB)\n")
+    print(f"\n  ✔ {os.path.basename(output)}  ({size:.1f}MB)")
+
+    if keep_raw:
+        print("  Raw chats kept (--keep-raw).\n")
+    else:
+        _archive_raw_chats(config, sources, res)
+        print()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  POST-STREAM PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _recent_indices(config: dict, n: int = 5) -> list[int]:
+    """Highest n entry indices present on the NAS."""
+    nas = config.get("nas_path", "")
+    if not os.path.exists(nas):
+        return []
+    idxs = set()
+    for name in os.listdir(nas):
+        m = re.match(r"^(\d+)_", name)
+        if m:
+            idxs.add(int(m.group(1)))
+    return sorted(idxs)[-n:]
+
+
+def _pipeline(config: dict, cache: list[dict], index: int,
+              interactive: bool = True) -> bool:
+    """
+    Bring one entry to its finished shape: meta sidecar, merged chat, raws
+    archived.
+
+    Order is not negotiable: the meta sidecar derives exact zeros by reading
+    the raw captures, so it must be written while they are still in place.
+
+    Anything not ready yet is left alone and picked up by a later run, so
+    this is safe to call repeatedly.
+    """
+    nas_root = config.get("nas_path", "")
+    nas = scan_nas(config, index)
+    merged = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
+    changed = False
+
+    # 1. Meta sidecar, ensured first and independently of the merge: it reads
+    #    the raw captures for exact zeros, and an entry merged before this
+    #    step existed would otherwise never get one.
+    meta_glob = os.path.join(nas_root, f"{int(index):03d}_*.meta.json")
+    if not glob.glob(meta_glob):
+        cmd_timings(config, index)
+        # Only count it if a file actually appeared. An entry with nothing
+        # left to describe writes none, and claiming otherwise would make
+        # every sweep report work it did not do.
+        changed = bool(glob.glob(meta_glob))
+
+    if os.path.exists(merged):
+        return changed                     # chat side already finished
+
+    chats = [k for k in ("yt_chat", "tw_chat") if nas.get(k)]
+    if not chats:
+        print("    no chats present — nothing to merge")
+        return changed
+
+    # A truncated YouTube chat blocks the merge: merging now would archive
+    # the raws with hours of chat still missing.
+    yt_id = (ls_common.extract_video_id_from_filename(nas["yt_chat"])
+             if nas.get("yt_chat") else None)
+    short = _yt_chat_shortfall(config, cache, nas, yt_id)
+    if short:
+        if not _offer_chat_backfill(config, short, interactive=interactive):
+            print("    repair unavailable (replay chat not ready?) — will retry")
+            return changed
+        nas = scan_nas(config, index)
+        if _yt_chat_shortfall(config, cache, nas, yt_id):
+            print("    still short after repair — will retry")
+            return changed
+
+    cmd_merge_chat(config, index)          # merges, then archives the raws
+    return True
+
+
+def cmd_sweep(config: dict, count: int = 5, interactive: bool = False):
+    """Run the full audit over the most recent entries. Safe to run hourly."""
+    idxs = _recent_indices(config, count)
+    print(f"\n{'=' * 60}")
+    print(f"  Sweep: {len(idxs)} most recent entries — "
+          f"{', '.join(str(i) for i in idxs) or 'none'}")
+    print(f"{'=' * 60}")
+    for idx in idxs:
+        try:
+            audit(config, idx, interactive=interactive)
+        except Exception as e:
+            print(f"  ✗ #{idx:03d} {type(e).__name__}: {e}")
+    print()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1134,7 +1269,9 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
 
 def audit(config: dict, index: int,
           yt_override: str | None = None,
-          tw_override: str | None = None):
+          tw_override: str | None = None,
+          push_archive: bool = True,
+          interactive: bool = True):
     """
     Reconstruct entry #index.
 
@@ -1227,20 +1364,27 @@ def audit(config: dict, index: int,
     changed = False
 
     if missing:
-        if _download_files(config, missing, index):
+        if not interactive:
+            # A missing VOD can be many GB; never pull one unattended.
+            for m in missing:
+                print(f"  ✗ missing: {m['label']}")
+        elif _download_files(config, missing, index):
             changed = True
             nas = scan_nas(config, index)   # coverage needs the new files
     else:
         print("  ✔ All files present.\n")
 
-    # 7. YouTube chat present but truncated
-    short = _yt_chat_shortfall(config, cache, nas, yt_id)
-    if short and _offer_chat_backfill(config, short):
+    # 7. meta sidecar, merged chat, archive raws
+    if _pipeline(config, cache, index, interactive=interactive):
         changed = True
+        nas = scan_nas(config, index)
 
     if not changed:
         # Save cache (may have been updated by title lookups)
         ls_common.save_cache(cache)
+        if push_archive:
+            cmd_archive(config, index, entry=entry, nas=nas, cache=cache,
+                        yt_id=yt_id, tw_id=tw_id)
         return
 
     # Re-scan and rebuild after download
@@ -1267,7 +1411,155 @@ def audit(config: dict, index: int,
             print("  ✗ Write failed.")
 
     ls_common.save_cache(cache)
+
+    # Last, and only after the vault write: the archive learns what this run
+    # settled, not what it was still deciding.
+    if push_archive:
+        cmd_archive(config, index, entry=entry, nas=nas, cache=cache,
+                    yt_id=yt_id, tw_id=tw_id)
     print()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ARCHIVE
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Push what this audit reconstructed to the tenma archive: create the stream
+#  if it has never seen this broadcast, otherwise fill in blanks and ask about
+#  anything that collides. One direction only. Nothing in the archive is ever
+#  read back into the vault, because two systems writing to each other is how
+#  both end up wrong.
+
+TZ_RE = re.compile(r"GMT\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", re.I)
+
+
+def _tz_offset_min(tz_str: str | None) -> int | None:
+    """`(GMT-6)` → -360. Bare `(GMT)` → 0. Anything else → None."""
+    if not tz_str:
+        return None
+    m = TZ_RE.search(tz_str)
+    if not m:
+        return 0 if "gmt" in tz_str.lower() else None
+    sign = -1 if m.group(1) == "-" else 1
+    return sign * (int(m.group(2)) * 60 + int(m.group(3) or 0))
+
+
+def _vault_epoch(date_obj, tz_min: int | None) -> int | None:
+    """The vault writes a wall-clock reading; the offset says where."""
+    if not date_obj:
+        return None
+    return int(calendar.timegm(date_obj.timetuple()) - (tz_min or 0) * 60)
+
+
+def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
+                    index: int, yt_id: str | None, tw_id: str | None):
+    """Everything the archive could learn from this audit."""
+    caps, timings = [], {}
+    for prefix, platform, vid, no_it in (
+            ("yt", "youtube", yt_id, entry.get("no_yt")),
+            ("tw", "twitch",  tw_id, entry.get("no_tw"))):
+        # A platform the vault says had no stream gets no capture. Absence is
+        # how the archive already spells "there was nothing here".
+        if no_it or not vid:
+            continue
+        t = _platform_timings(config, cache, nas, prefix, platform) or {}
+        timings[platform] = t
+        cap = {
+            "platform": platform,
+            "remote_id": vid,
+            "url": ls_common.build_stream_url(config, platform, vid),
+            "title": _get_title(config, cache, vid, platform, nas[f"{prefix}_video"]),
+            "video_path": ls_archive.archive_path(config, nas[f"{prefix}_video"]),
+            "chat_path": ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
+        }
+        if t.get("duration_secs"):
+            cap["duration_s"] = int(t["duration_secs"])
+        if t.get("stream_start_epoch_ms"):
+            cap["broadcast_started_at"] = t["stream_start_epoch_ms"] // 1000
+        if t.get("record_start_epoch_ms"):
+            cap["record_started_at"] = t["record_start_epoch_ms"] // 1000
+            # ls-audit's own word for how well it knows this, carried through
+            # so the archive can refuse to let a filename guess overwrite a
+            # measurement — and so the theater can draw the difference.
+            cap["local_start_precision_s"] = (
+                60 if t.get("record_start_accuracy") == "minute" else 1)
+        caps.append(cap)
+
+    tz_min = _tz_offset_min(entry.get("tz_str"))
+    # The broadcast start, when something measured it, beats the vault's
+    # hand-typed minute. Both are offered; the archive decides nothing, the
+    # human answering the prompt does.
+    measured = [t["stream_start_epoch_ms"] // 1000 for t in timings.values()
+                if t.get("stream_start_epoch_ms")]
+    started = min(measured) if measured else _vault_epoch(entry.get("date_obj"), tz_min)
+
+    stream_fields = {}
+    title = next((c["title"] for c in caps if c.get("title")), None)
+    if title:
+        stream_fields["title"] = title
+    if started:
+        stream_fields["started_at"] = started
+    if tz_min is not None:
+        stream_fields["tz_offset_min"] = tz_min
+    return stream_fields, caps
+
+
+def cmd_archive(config: dict, index: int, *, entry: dict | None = None,
+                nas: dict | None = None, cache: list[dict] | None = None,
+                yt_id: str | None = None, tw_id: str | None = None,
+                interactive: bool = True) -> bool:
+    """Reconcile entry #index with the archive. Returns True if anything was
+    sent. Never raises: the audit is the point, this is a courtesy."""
+    if not ls_archive.enabled(config):
+        return False
+    try:
+        if entry is None:
+            entry = ls_common.obsidian_parse_entry(config, index)
+            if not entry["found"]:
+                print(f"  ✗ Entry #{index} not found.")
+                return False
+            entry["_index"] = index
+        if nas is None:
+            nas = scan_nas(config, index)
+        if cache is None:
+            cache = ls_common.load_cache()
+        if yt_id is None and not entry.get("no_yt"):
+            yt_id, _ = resolve_id(config, cache, "youtube", entry, nas, None)
+        if tw_id is None and not entry.get("no_tw"):
+            tw_id, _ = resolve_id(config, cache, "twitch", entry, nas, None)
+
+        stream_fields, caps = _archive_inputs(
+            config, cache, entry, nas, index, yt_id, tw_id)
+        if not caps and not stream_fields:
+            return False
+
+        print("\n  ┌─ Archive ──────────────────────────────────────────")
+        plan = ls_archive.build_plan(config, idx=index,
+                                     stream_fields=stream_fields, captures=caps)
+        print(ls_archive.render_plan(plan))
+        print("  └────────────────────────────────────────────────────")
+        if not plan.get("ok") or not plan["items"]:
+            return False
+
+        plan = ls_archive.confirm_plan(plan, interactive=interactive)
+        if not any(i.get("accepted") for i in plan["items"]):
+            print("  Nothing sent.\n")
+            return False
+        if interactive and input("\n  Send to archive? (y/n): ").strip().lower() != "y":
+            print("  Skipped.\n")
+            return False
+
+        results = ls_archive.push_plan(config, plan)
+        for r in results:
+            print(f"  ✔ #{r.get('index')} "
+                  f"vod={r.get('vod_state')} chat={r.get('chat_state')}"
+                  + ("  (created)" if r.get("created") else ""))
+        print()
+        return bool(results)
+    except Exception as e:
+        print(f"  ✗ Archive step failed: {e}")
+        logging.getLogger(__name__).warning(f"archive reconcile failed: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1288,6 +1580,10 @@ examples:
   ls-audit --inject URL               Inject video from URL
   ls-audit --inject --manual          Manual cache injection
   ls-audit --cache-info dQw4w9WgXcQ   Look up cached video
+  ls-audit 515 --no-archive           Audit without touching the archive
+  ls-audit --sweep [N]                Audit N recent entries (hourly timer)
+  ls-audit 515 --archive              Reconcile with the archive only
+  ls-audit 515 --archive --yes        ...filling blanks, asking nothing
         """,
     )
     parser.add_argument("index", nargs="?", type=int,
@@ -1318,10 +1614,23 @@ examples:
                         help="--merge-chat: output path")
     parser.add_argument("--dry-run", action="store_true",
                         help="--merge-chat: report without writing")
+    parser.add_argument("--archive", action="store_true",
+                        help="Reconcile with the archive and do nothing else")
+    parser.add_argument("--no-archive", action="store_true",
+                        help="Audit without touching the archive")
+    parser.add_argument("--sweep", nargs="?", const=5, type=int, metavar="N",
+                        help="Audit the N most recent entries (default 5), "
+                             "non-interactive. Intended for an hourly timer.")
+    parser.add_argument("--yes", action="store_true",
+                        help="--archive: accept new values, leave collisions "
+                             "alone, ask nothing")
 
     args = parser.parse_args()
     config = ls_common.load_config()
 
+    if args.sweep is not None:
+        cmd_sweep(config, args.sweep)
+        return
     if args.refresh is not None:
         cmd_refresh(config, args.refresh)
         return
@@ -1347,7 +1656,16 @@ examples:
                        output=args.output, dry_run=args.dry_run)
         return
 
-    audit(config, args.index, yt_override=args.yt_id, tw_override=args.tw_id)
+    if args.archive:
+        if not ls_archive.enabled(config):
+            print("  Archive is off — set archive_url and archive_token.")
+            return
+        cmd_archive(config, args.index, yt_id=args.yt_id, tw_id=args.tw_id,
+                    interactive=not args.yes)
+        return
+
+    audit(config, args.index, yt_override=args.yt_id, tw_override=args.tw_id,
+          push_archive=not args.no_archive, interactive=not args.yes)
 
 
 if __name__ == "__main__":
