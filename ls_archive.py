@@ -397,6 +397,19 @@ def build_plan(config: dict, *, idx: int, stream_fields: dict,
                 "audit_remote_id": remote,
             })
             continue
+        # Fields the audit says are no longer true. Emitted as their own kind
+        # so the diff shows a removal rather than a silent absence, and so a
+        # headless run still honours a path somebody set by hand.
+        for field in cap.get("clear", []):
+            col = _CAP_COLUMN.get(field, field)
+            if cur.get(col) in (None, ""):
+                continue
+            plan["items"].append({
+                "scope": plat, "field": field, "column": col,
+                "before": cur.get(col), "after": None, "kind": "clear",
+                "human": col in (cur.get("human_fields") or []),
+                "accepted": True, "precision": None,
+            })
         for field, after in cap.items():
             col = _CAP_COLUMN.get(field)
             if not col:
@@ -436,7 +449,7 @@ def _fmt(field: str, v) -> str:
     return s if len(s) <= 46 else s[:43] + "..."
 
 
-_MARK = {"new": "+", "refine": "↑", "collision": "!"}
+_MARK = {"new": "+", "refine": "↑", "collision": "!", "clear": "−"}
 
 
 def _line(it: dict) -> str:
@@ -444,6 +457,9 @@ def _line(it: dict) -> str:
     body = f"  {_MARK.get(it['kind'], ' ')} {scope} {it['field']:<20}"
     if it["kind"] == "new":
         return f"{body} {_fmt(it['field'], it['after'])}"
+    if it["kind"] == "clear":
+        return (f"{body} {_fmt(it['field'], it['before'])}  →  "
+                f"(forgotten — the merged chat holds it now)")
     extra = ""
     if it.get("precision") and it["precision"][0] and it["precision"][1]:
         old, new = it["precision"]
@@ -482,14 +498,27 @@ def render_plan(plan: dict) -> str:
 
 def confirm_plan(plan: dict, *, interactive: bool = True) -> dict:
     """Ask about collisions only. Everything else was already decided."""
-    clashes = [i for i in plan.get("items", []) if i["kind"] == "collision"]
-    if not clashes:
-        return plan
+    items = plan.get("items", [])
+    clashes = [i for i in items if i["kind"] == "collision"]
+
     if not interactive:
-        for it in clashes:
-            it["accepted"] = False
-        logger.info(f"archive: {len(clashes)} collision(s) left alone "
-                    f"(non-interactive)")
+        # A headless sweep may only fill in blanks. Collisions are left alone
+        # because there is nobody to ask, and anything a person has already
+        # decided is left alone even when the archive currently holds nothing
+        # — a field somebody deliberately emptied is still their answer, and a
+        # timer running at 3am is the last thing that should overrule it.
+        held = 0
+        for it in items:
+            if it["kind"] == "collision" or it.get("human"):
+                it["accepted"] = False
+                held += 1
+        if held:
+            logger.info(f"archive: {held} field(s) left alone (headless: "
+                        f"{len(clashes)} collision(s), "
+                        f"{held - len(clashes)} decided by hand)")
+        return plan
+
+    if not clashes:
         return plan
     print("\n  Collisions — the archive already holds a different value:\n")
     for it in clashes:
@@ -529,9 +558,13 @@ def push_plan(config: dict, plan: dict) -> list[dict]:
         elif plan["idx"]:
             body["index"] = plan["idx"]
         for i in fields:
-            body[i["field"]] = i["after"]
+            if i["kind"] == "clear":
+                body.setdefault("clear", []).append(i["field"])
+            else:
+                body[i["field"]] = i["after"]
         # Precision rides along with the clock it describes, and only then.
-        if any(i["field"] == "record_started_at" for i in fields):
+        if any(i["field"] == "record_started_at" and i["kind"] != "clear"
+               for i in fields):
             if cap.get("local_start_precision_s"):
                 body["local_start_precision_s"] = int(cap["local_start_precision_s"])
         # Stream-level fields go with the first packet; the rest would only

@@ -1061,18 +1061,22 @@ def _cache_zeros(cache: list[dict], yt_id: str | None,
     return out
 
 
-def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> None:
+def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
     """
     Move raw captures to deep storage once the merge holds them.
 
     A raw is only moved if its platform actually landed messages in the
     output and the source had a real zero -- otherwise the merge dropped
     content and the raw is the only copy of it.
+
+    Returns the platforms whose raw left, so the caller can tell the archive
+    to stop pointing at a file that is no longer where it says.
     """
+    moved: set[str] = set()
     dest = config.get("chat_archive_path")
     if not dest:
         print("  Raw chats left in place (set chat_archive_path to archive).")
-        return
+        return moved
 
     placed: dict[str, int] = {}
     for m in res["messages"]:
@@ -1096,9 +1100,11 @@ def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> None:
             continue
         try:
             shutil.move(path, target)
+            moved.add(src["platform"])
             print(f"  → archived {src['file']}")
         except OSError as e:
             print(f"  ✗ archive failed for {src['file']}: {e}")
+    return moved
 
 
 def cmd_merge_chat(config: dict, index: int, ref="youtube",
@@ -1172,9 +1178,10 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
 
     if keep_raw:
         print("  Raw chats kept (--keep-raw).\n")
-    else:
-        _archive_raw_chats(config, sources, res)
-        print()
+        return {"merged": output, "moved": set()}
+    moved = _archive_raw_chats(config, sources, res)
+    print()
+    return {"merged": output, "moved": moved}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1343,7 +1350,10 @@ def audit(config: dict, index: int,
     print("  └────────────────────────────────────────────────────\n")
 
     # 5. Write
-    if input("  Write to Obsidian? (y/n): ").strip().lower() == "y":
+    # Headless runs write without asking. The reconstruction is deterministic
+    # and the vault is in git; a timer that stops to ask a question nobody is
+    # there to answer just never runs at all, which is what --sweep did.
+    if not interactive or input("  Write to Obsidian? (y/n): ").strip().lower() == "y":
         if ls_common.obsidian_write_entry(config, index, block):
             print("  ✓ Written.")
         else:
@@ -1384,7 +1394,7 @@ def audit(config: dict, index: int,
         ls_common.save_cache(cache)
         if push_archive:
             cmd_archive(config, index, entry=entry, nas=nas, cache=cache,
-                        yt_id=yt_id, tw_id=tw_id)
+                        yt_id=yt_id, tw_id=tw_id, interactive=interactive)
         return
 
     # Re-scan and rebuild after download
@@ -1404,7 +1414,7 @@ def audit(config: dict, index: int,
         print(f"  │ {line}")
     print("  └────────────────────────────────────────────────────\n")
 
-    if input("  Write to Obsidian? (y/n): ").strip().lower() == "y":
+    if not interactive or input("  Write to Obsidian? (y/n): ").strip().lower() == "y":
         if ls_common.obsidian_write_entry(config, index, block):
             print("  ✔ Written.")
         else:
@@ -1416,7 +1426,7 @@ def audit(config: dict, index: int,
     # settled, not what it was still deciding.
     if push_archive:
         cmd_archive(config, index, entry=entry, nas=nas, cache=cache,
-                    yt_id=yt_id, tw_id=tw_id)
+                    yt_id=yt_id, tw_id=tw_id, interactive=interactive)
     print()
 
 
@@ -1451,10 +1461,61 @@ def _vault_epoch(date_obj, tz_min: int | None) -> int | None:
     return int(calendar.timegm(date_obj.timetuple()) - (tz_min or 0) * 60)
 
 
+MERGED_CHAT_HEAD_BYTES = 8 * 1024 * 1024
+
+
+def _merged_chat_sources(path: str) -> str | None:
+    """Which platforms are inside a merged chat, without reading the messages.
+
+    ls_chat.merge() serialises `metadata` before `messages`, and cmd_merge_chat
+    writes it with indent=1, so the sources are in the first few kilobytes of a
+    file that can be hundreds of megabytes. Read up to the messages array,
+    close the object, and parse that.
+
+    Deliberately best-effort. If the format ever changes this returns None and
+    the caller simply does not send chat_sources, which is a gap rather than a
+    lie.
+    """
+    try:
+        buf, size = [], 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.rstrip("\n") == ' "messages": [':
+                    buf.append(' "messages": []}')
+                    break
+                size += len(line)
+                if size > MERGED_CHAT_HEAD_BYTES:
+                    return None
+                buf.append(line)
+            else:
+                return None
+        meta = json.loads("".join(buf))["metadata"]
+        # ls_chat names platforms 'youtube', 'twitch' and 'unknown'. Map by
+        # name, never by truncation: 'youtube'[:2] is 'YO', which silently
+        # dropped YouTube from the list and left the archive recording that a
+        # dual-platform stream had Twitch chat only.
+        plats = {ls_archive.PLATFORM.get(str(src.get("platform", "")).strip().lower())
+                 for src in meta.get("sources", [])
+                 if src.get("messages") and src.get("zero_ms") is not None}
+        # 'unknown' maps to None and is dropped: a source ls_chat could not
+        # identify is not evidence that either platform had chat.
+        return ",".join(sorted(p for p in plats if p)) or None
+    except Exception:
+        return None
+
+
 def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
                     index: int, yt_id: str | None, tw_id: str | None):
     """Everything the archive could learn from this audit."""
     caps, timings = [], {}
+
+    # The merged chat is a property of the broadcast, not of one platform, so
+    # it lives on the stream. It is also the only chat the site serves.
+    nas_root = config.get("nas_path", "")
+    merged_name = f"{int(index):03d}_merged-chat.json"
+    merged_rel = (ls_archive.archive_path(config, merged_name)
+                  if os.path.exists(os.path.join(nas_root, merged_name)) else None)
+
     for prefix, platform, vid, no_it in (
             ("yt", "youtube", yt_id, entry.get("no_yt")),
             ("tw", "twitch",  tw_id, entry.get("no_tw"))):
@@ -1472,6 +1533,13 @@ def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
             "video_path": ls_archive.archive_path(config, nas[f"{prefix}_video"]),
             "chat_path": ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
         }
+        # Once the merge holds this platform's messages the raw goes to deep
+        # storage, and the archive is told to stop pointing at it rather than
+        # left holding a path that now reads `lost`. Only when the raw is
+        # actually gone: with chat_archive_path unset the pipeline leaves them
+        # in place and there is nothing to forget.
+        if merged_rel and not nas[f"{prefix}_chat"]:
+            cap["clear"] = ["chat_path"]
         if t.get("duration_secs"):
             cap["duration_s"] = int(t["duration_secs"])
         if t.get("stream_start_epoch_ms"):
@@ -1501,6 +1569,11 @@ def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
         stream_fields["started_at"] = started
     if tz_min is not None:
         stream_fields["tz_offset_min"] = tz_min
+    if merged_rel:
+        stream_fields["chat_path"] = merged_rel
+        sources = _merged_chat_sources(os.path.join(nas_root, merged_name))
+        if sources:
+            stream_fields["chat_sources"] = sources
     return stream_fields, caps
 
 
