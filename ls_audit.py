@@ -183,6 +183,13 @@ def _print_media_analysis(config: dict, nas: dict):
         return
 
     print("  Media analysis:")
+    if nas.get("merged_chat"):
+        merged_path = os.path.join(config.get("nas_path", ""), nas["merged_chat"])
+        info = analyze_chat_file(merged_path)
+        n_arch = len(nas.get("yt_chats_archived", [])) + len(nas.get("tw_chats_archived", []))
+        print(f"    MERGED   : {nas['merged_chat']}"
+              + (f"  ({n_arch} raw{'s' if n_arch != 1 else ''} in deep storage)"
+                 if n_arch else ""))
 
     for key, label in rows:
         filename = nas.get(key)
@@ -228,6 +235,8 @@ def scan_nas(config: dict, index: int) -> dict:
     found = {
         "yt_video": None, "yt_chat": None, "yt_chats": [],
         "tw_video": None, "tw_chat": None, "tw_chats": [],
+        "yt_chats_archived": [], "tw_chats_archived": [],
+        "merged_chat": None,
     }
     nas = config["nas_path"]
     if not os.path.exists(nas):
@@ -270,6 +279,31 @@ def scan_nas(config: dict, index: int) -> dict:
                     found[f"{prefix}_video"] = filename
             elif ext == ".json" and not ls_chat.is_derived(filename):
                 found[f"{prefix}_chats"].append(filename)
+
+    # The merged chat, and the raws the merge moved to deep storage. Without
+    # these an archived entry looks like one whose chat was never captured.
+    merged = f"{idx_padded}_merged-chat.json"
+    if os.path.exists(os.path.join(nas, merged)):
+        found["merged_chat"] = merged
+
+    arch = config.get("chat_archive_path")
+    if arch:
+        arch = os.path.join(nas, arch)
+        for pat in patterns:
+            for filepath in glob.glob(os.path.join(arch, pat)):
+                filename = os.path.basename(filepath)
+                if os.path.splitext(filename)[1].lower() != ".json":
+                    continue
+                if ls_chat.is_derived(filename):
+                    continue
+                m = re.match(r"^(\d+)_", filename)
+                if not m or int(m.group(1)) != int(index):
+                    continue
+                vid = ls_common.extract_video_id_from_filename(filename)
+                if not vid:
+                    continue
+                p = "yt" if ls_common.classify_video_id(vid) == "youtube" else "tw"
+                found[f"{p}_chats_archived"].append(filename)
 
     # Largest first: the best single representative, and a stable order for
     # the merge regardless of how glob happened to return them.
@@ -404,6 +438,21 @@ def _get_title(config: dict, cache: list[dict], video_id: str,
     return None
 
 
+def _chat_link_target(nas: dict, prefix: str) -> str | None:
+    """What the entry's chat icon should open.
+
+    The raw while it is still on the NAS; once the merge has taken it, the
+    merged file — that is where this platform's messages now live, and an
+    empty link would say the chat was lost.
+    """
+    if nas.get(f"{prefix}_chat"):
+        return nas[f"{prefix}_chat"]
+    if nas.get(f"{prefix}_chats_archived"):
+        return nas.get("merged_chat") or os.path.join(
+            "deep-storage", nas[f"{prefix}_chats_archived"][0])
+    return None
+
+
 def _build_platform_line(config: dict, tag: str, video_id: str | None,
                          platform: str, title: str | None,
                          video_file: str | None,
@@ -486,7 +535,7 @@ def build_entry(config: dict, cache: list[dict], index: int,
                     if yt_id else None)
         lines.append(_build_platform_line(
             config, "YT", yt_id, "youtube", yt_title,
-            nas["yt_video"], nas["yt_chat"],
+            nas["yt_video"], _chat_link_target(nas, "yt"),
             video_x=entry.get("yt_video_x", False),
             chat_x=entry.get("yt_chat_x", False),
         ))
@@ -499,7 +548,7 @@ def build_entry(config: dict, cache: list[dict], index: int,
                     if tw_id else None)
         lines.append(_build_platform_line(
             config, "TW", tw_id, "twitch", tw_title,
-            nas["tw_video"], nas["tw_chat"],
+            nas["tw_video"], _chat_link_target(nas, "tw"),
             video_x=entry.get("tw_video_x", False),
             chat_x=entry.get("tw_chat_x", False),
         ))
@@ -515,6 +564,15 @@ def build_entry(config: dict, cache: list[dict], index: int,
 #  DOWNLOADS
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _chat_accounted(nas: dict, prefix: str) -> bool:
+    """The raw is on the NAS, or the merge holds it and moved it to storage.
+
+    Only an archived copy counts as folded in. With chat_archive_path unset
+    the merge leaves raws in place, so a missing raw really is missing.
+    """
+    return bool(nas.get(f"{prefix}_chat") or nas.get(f"{prefix}_chats_archived"))
+
+
 def _identify_missing(config: dict, nas: dict,
                       yt_id: str | None, tw_id: str | None,
                       absent: dict | None = None) -> list[dict]:
@@ -526,7 +584,7 @@ def _identify_missing(config: dict, nas: dict,
         if not nas["yt_video"] and not absent.get("yt_video"):
             missing.append({"platform": "youtube", "type": "video",
                             "url": url, "label": "YT video"})
-        if not nas["yt_chat"] and not absent.get("yt_chat"):
+        if not _chat_accounted(nas, "yt") and not absent.get("yt_chat"):
             missing.append({"platform": "youtube", "type": "chat",
                             "url": url, "label": "YT chat"})
     if tw_id:
@@ -534,7 +592,7 @@ def _identify_missing(config: dict, nas: dict,
         if not nas["tw_video"] and not absent.get("tw_video"):
             missing.append({"platform": "twitch", "type": "video",
                             "url": url, "label": "TW video"})
-        if not nas["tw_chat"] and not absent.get("tw_chat"):
+        if not _chat_accounted(nas, "tw") and not absent.get("tw_chat"):
             missing.append({"platform": "twitch", "type": "chat",
                             "url": url, "label": "TW chat"})
     return missing
@@ -1095,6 +1153,10 @@ def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
     if not dest:
         print("  Raw chats left in place (set chat_archive_path to archive).")
         return moved
+    # A relative path would resolve against the caller's CWD and quietly put
+    # the archive outside the media root, where scan_nas cannot see it and the
+    # server reads every archived chat as lost. join() leaves absolute alone.
+    dest = os.path.join(config.get("nas_path", ""), dest)
 
     placed: dict[str, int] = {}
     for m in res["messages"]:
