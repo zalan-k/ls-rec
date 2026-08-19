@@ -217,11 +217,17 @@ def _print_media_analysis(config: dict, nas: dict):
 def scan_nas(config: dict, index: int) -> dict:
     """Scan NAS for files matching this index prefix.
 
-    Returns dict with yt_video, yt_chat, tw_video, tw_chat filenames.
+    Returns dict with yt_video, yt_chat, tw_video, tw_chat filenames, plus
+    yt_chats / tw_chats holding EVERY capture found for that platform.
+
+    A restart, or a repair written beside the original, leaves two captures
+    of one video id. Picking one is a guess -- the merge takes them all and
+    dedupes. `*_chat` stays the single largest for callers that need one
+    file (coverage check, meta sidecar, archive path).
     """
     found = {
-        "yt_video": None, "yt_chat": None,
-        "tw_video": None, "tw_chat": None,
+        "yt_video": None, "yt_chat": None, "yt_chats": [],
+        "tw_video": None, "tw_chat": None, "tw_chats": [],
     }
     nas = config["nas_path"]
     if not os.path.exists(nas):
@@ -263,7 +269,19 @@ def scan_nas(config: dict, index: int) -> dict:
                 if not existing or (ext == ".mp4" and not existing.lower().endswith(".mp4")):
                     found[f"{prefix}_video"] = filename
             elif ext == ".json" and not ls_chat.is_derived(filename):
-                found[f"{prefix}_chat"] = filename
+                found[f"{prefix}_chats"].append(filename)
+
+    # Largest first: the best single representative, and a stable order for
+    # the merge regardless of how glob happened to return them.
+    for prefix in ("yt", "tw"):
+        chats = sorted(
+            found[f"{prefix}_chats"],
+            key=lambda f: os.path.getsize(os.path.join(nas, f)),
+            reverse=True)
+        found[f"{prefix}_chats"] = chats
+        found[f"{prefix}_chat"] = chats[0] if chats else None
+        if len(chats) > 1:
+            print(f"    {len(chats)} {prefix} chat captures; all will be merged")
 
     return found
 
@@ -1118,14 +1136,16 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
 
     nas = scan_nas(config, index)
     sources = []
-    for key, label in (("yt_chat", "YT"), ("tw_chat", "TW")):
-        filename = nas.get(key)
-        path = os.path.join(nas_root, filename) if filename else None
-        if path and os.path.exists(path):
-            print(f"  {label} chat : {filename}")
-            sources.append(path)
-        else:
+    for key, label in (("yt_chats", "YT"), ("tw_chats", "TW")):
+        names = nas.get(key) or []
+        if not names:
             print(f"  {label} chat : not found")
+            continue
+        for filename in names:
+            path = os.path.join(nas_root, filename)
+            if os.path.exists(path):
+                print(f"  {label} chat : {filename}")
+                sources.append(path)
 
     if not sources:
         print("\n  No chat files to merge.\n")
@@ -1232,7 +1252,7 @@ def _pipeline(config: dict, cache: list[dict], index: int,
     if os.path.exists(merged):
         return changed                     # chat side already finished
 
-    chats = [k for k in ("yt_chat", "tw_chat") if nas.get(k)]
+    chats = [k for k in ("yt_chats", "tw_chats") if nas.get(k)]
     if not chats:
         print("    no chats present — nothing to merge")
         return changed
