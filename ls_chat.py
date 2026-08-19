@@ -42,9 +42,11 @@ YT_MESSAGE_RENDERERS = (
 )
 
 # Derived artifacts, not captures. ls_audit.scan_nas should skip these.
-DERIVED_SUFFIXES = (".chat.json", ".posthoc.json", ".unified.json",
-                    ".live.json", ".merged.json", ".merging", ".archive",
-                    ".timings.json", "merged-chat.json")
+# Anything produced from a capture rather than being one. Old names are kept
+# so files already on the NAS stay recognised.
+DERIVED_SUFFIXES = (".chat.json", ".posthoc.json", ".live.json", ".merging",
+                    ".archive", "merged-chat.json", ".meta.json",
+                    ".unified.json", ".merged.json", ".timings.json")
 
 
 def is_derived(filename: str) -> bool:

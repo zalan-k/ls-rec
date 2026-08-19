@@ -12,7 +12,7 @@ Usage:
     ls-audit --cache-info ID                Look up cached video by ID
 """
 
-import os, re, glob, sys, json, subprocess, datetime, argparse
+import os, re, glob, sys, json, shutil, subprocess, datetime, argparse
 from yt_dlp.utils import sanitize_filename
 
 import ls_common
@@ -1001,7 +1001,8 @@ def _backfill_yt_chat(config: dict, item: dict) -> bool:
     return False
 
 
-def _offer_chat_backfill(config: dict, item: dict) -> bool:
+def _offer_chat_backfill(config: dict, item: dict,
+                         interactive: bool = True) -> bool:
     print("\n  ⚠ YouTube chat looks truncated:")
     print(f"      {item['count']:,} messages, ending at "
           f"{_seconds_to_hhmmss(item['last_secs'])} of "
@@ -1009,6 +1010,8 @@ def _offer_chat_backfill(config: dict, item: dict) -> bool:
     print(f"      short by {_seconds_to_hhmmss(item['shortfall_secs'])} "
           f"(flags above {_seconds_to_hhmmss(item['limit_secs'])})")
 
+    if not interactive:
+        return _backfill_yt_chat(config, item)
     if input("\n  Download post-hoc chat and merge? [y/N]: ").strip().lower() \
             not in ("y", "yes"):
         print("  Skipped.")
@@ -1041,9 +1044,49 @@ def _cache_zeros(cache: list[dict], yt_id: str | None,
     return out
 
 
+def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> None:
+    """
+    Move raw captures to deep storage once the merge holds them.
+
+    A raw is only moved if its platform actually landed messages in the
+    output and the source had a real zero -- otherwise the merge dropped
+    content and the raw is the only copy of it.
+    """
+    dest = config.get("chat_archive_path")
+    if not dest:
+        print("  Raw chats left in place (set chat_archive_path to archive).")
+        return
+
+    placed: dict[str, int] = {}
+    for m in res["messages"]:
+        placed[m["origin"]] = placed.get(m["origin"], 0) + 1
+    by_name = {os.path.basename(p): p for p in sources}
+
+    os.makedirs(dest, exist_ok=True)
+    for src in res["metadata"]["sources"]:
+        path = by_name.get(src["file"])
+        if not path:
+            continue
+        if src["zero_ms"] is None:
+            print(f"  ⚠ {src['file']}: no zero, messages unplaced — keeping")
+            continue
+        if not placed.get(src["platform"]):
+            print(f"  ⚠ {src['file']}: contributed nothing — keeping")
+            continue
+        target = os.path.join(dest, src["file"])
+        if os.path.exists(target):
+            print(f"  ⚠ {src['file']}: already in archive — keeping")
+            continue
+        try:
+            shutil.move(path, target)
+            print(f"  → archived {src['file']}")
+        except OSError as e:
+            print(f"  ✗ archive failed for {src['file']}: {e}")
+
+
 def cmd_merge_chat(config: dict, index: int, ref="youtube",
                    zeros: list | None = None, output: str | None = None,
-                   dry_run: bool = False):
+                   dry_run: bool = False, keep_raw: bool = False):
     """Merge this entry's chat captures into one origin-tagged file."""
     nas_root = config.get("nas_path", "")
     print(f"\n{'=' * 60}")
@@ -1104,12 +1147,104 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
         return
 
     if not output:
-        stem = _title_from_filename(os.path.basename(sources[0]))
-        output = os.path.join(nas_root, f"{int(index):03d}_{stem}.merged.json")
+        output = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
     with open(output, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=1)
     size = os.path.getsize(output) / (1024 * 1024)
-    print(f"\n  ✔ {output}  ({size:.1f}MB)\n")
+    print(f"\n  ✔ {os.path.basename(output)}  ({size:.1f}MB)")
+
+    if keep_raw:
+        print("  Raw chats kept (--keep-raw).\n")
+    else:
+        _archive_raw_chats(config, sources, res)
+        print()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  POST-STREAM PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _recent_indices(config: dict, n: int = 5) -> list[int]:
+    """Highest n entry indices present on the NAS."""
+    nas = config.get("nas_path", "")
+    if not os.path.exists(nas):
+        return []
+    idxs = set()
+    for name in os.listdir(nas):
+        m = re.match(r"^(\d+)_", name)
+        if m:
+            idxs.add(int(m.group(1)))
+    return sorted(idxs)[-n:]
+
+
+def _pipeline(config: dict, cache: list[dict], index: int,
+              interactive: bool = True) -> bool:
+    """
+    Bring one entry to its finished shape: meta sidecar, merged chat, raws
+    archived.
+
+    Order is not negotiable: the meta sidecar derives exact zeros by reading
+    the raw captures, so it must be written while they are still in place.
+
+    Anything not ready yet is left alone and picked up by a later run, so
+    this is safe to call repeatedly.
+    """
+    nas_root = config.get("nas_path", "")
+    nas = scan_nas(config, index)
+    merged = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
+    changed = False
+
+    # 1. Meta sidecar, ensured first and independently of the merge: it reads
+    #    the raw captures for exact zeros, and an entry merged before this
+    #    step existed would otherwise never get one.
+    meta_glob = os.path.join(nas_root, f"{int(index):03d}_*.meta.json")
+    if not glob.glob(meta_glob):
+        cmd_timings(config, index)
+        # Only count it if a file actually appeared. An entry with nothing
+        # left to describe writes none, and claiming otherwise would make
+        # every sweep report work it did not do.
+        changed = bool(glob.glob(meta_glob))
+
+    if os.path.exists(merged):
+        return changed                     # chat side already finished
+
+    chats = [k for k in ("yt_chat", "tw_chat") if nas.get(k)]
+    if not chats:
+        print("    no chats present — nothing to merge")
+        return changed
+
+    # A truncated YouTube chat blocks the merge: merging now would archive
+    # the raws with hours of chat still missing.
+    yt_id = (ls_common.extract_video_id_from_filename(nas["yt_chat"])
+             if nas.get("yt_chat") else None)
+    short = _yt_chat_shortfall(config, cache, nas, yt_id)
+    if short:
+        if not _offer_chat_backfill(config, short, interactive=interactive):
+            print("    repair unavailable (replay chat not ready?) — will retry")
+            return changed
+        nas = scan_nas(config, index)
+        if _yt_chat_shortfall(config, cache, nas, yt_id):
+            print("    still short after repair — will retry")
+            return changed
+
+    cmd_merge_chat(config, index)          # merges, then archives the raws
+    return True
+
+
+def cmd_sweep(config: dict, count: int = 5, interactive: bool = False):
+    """Run the pipeline over the most recent entries. Safe to run hourly."""
+    idxs = _recent_indices(config, count)
+    print(f"\n{'=' * 60}")
+    print(f"  Sweep: {len(idxs)} most recent entries — "
+          f"{', '.join(str(i) for i in idxs) or 'none'}")
+    print(f"{'=' * 60}")
+
+    for idx in idxs:
+        try:
+            audit(config, idx, interactive=interactive)
+        except Exception as e:
+            print(f"  ✗ #{idx:03d} {type(e).__name__}: {e}")
+    print()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1118,7 +1253,8 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
 
 def audit(config: dict, index: int,
           yt_override: str | None = None,
-          tw_override: str | None = None):
+          tw_override: str | None = None,
+          interactive: bool = True):
     """
     Reconstruct entry #index.
 
@@ -1211,16 +1347,20 @@ def audit(config: dict, index: int,
     changed = False
 
     if missing:
-        if _download_files(config, missing, index):
+        if not interactive:
+            # A missing VOD can be many GB; never pull one unattended.
+            for m in missing:
+                print(f"  ✗ missing: {m['label']}")
+        elif _download_files(config, missing, index):
             changed = True
             nas = scan_nas(config, index)   # coverage needs the new files
     else:
         print("  ✔ All files present.\n")
 
-    # 7. YouTube chat present but truncated
-    short = _yt_chat_shortfall(config, cache, nas, yt_id)
-    if short and _offer_chat_backfill(config, short):
+    # 7. meta sidecar, merged chat, archive raws
+    if _pipeline(config, cache, index, interactive=interactive):
         changed = True
+        nas = scan_nas(config, index)
 
     if not changed:
         # Save cache (may have been updated by title lookups)
@@ -1288,8 +1428,9 @@ examples:
                         help="Use manual input for --inject")
     parser.add_argument("--cache-info", metavar="ID",
                         help="Look up a video ID in the cache")
-    parser.add_argument("--timings", action="store_true",
-                        help="Write a timings sidecar for this entry")
+    parser.add_argument("--meta", "--timings", dest="meta",
+                        action="store_true",
+                        help="Write the meta/timings sidecar for this entry")
     parser.add_argument("--merge-chat", action="store_true",
                         help="Merge this entry's chats into one tagged file")
     parser.add_argument("--ref", default="youtube",
@@ -1302,10 +1443,21 @@ examples:
                         help="--merge-chat: output path")
     parser.add_argument("--dry-run", action="store_true",
                         help="--merge-chat: report without writing")
+    parser.add_argument("--keep-raw", action="store_true",
+                        help="--merge-chat: do not archive the raw captures")
+    parser.add_argument("--sweep", nargs="?", const=5, type=int,
+                        metavar="N",
+                        help="Audit the N most recent entries (default 5), "
+                             "non-interactive. Intended for an hourly timer.")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Non-interactive: never prompt")
 
     args = parser.parse_args()
     config = ls_common.load_config()
 
+    if args.sweep is not None:
+        cmd_sweep(config, args.sweep)
+        return
     if args.refresh is not None:
         cmd_refresh(config, args.refresh)
         return
@@ -1320,7 +1472,7 @@ examples:
         parser.print_help()
         return
 
-    if args.timings:
+    if args.meta:
         cmd_timings(config, args.index, output=args.output,
                     dry_run=args.dry_run)
         return
@@ -1328,10 +1480,12 @@ examples:
     if args.merge_chat:
         ref = int(args.ref) if args.ref.lstrip("-").isdigit() else args.ref
         cmd_merge_chat(config, args.index, ref=ref, zeros=args.zero,
-                       output=args.output, dry_run=args.dry_run)
+                       output=args.output, dry_run=args.dry_run,
+                       keep_raw=args.keep_raw)
         return
 
-    audit(config, args.index, yt_override=args.yt_id, tw_override=args.tw_id)
+    audit(config, args.index, yt_override=args.yt_id, tw_override=args.tw_id,
+          interactive=not args.yes)
 
 
 if __name__ == "__main__":
