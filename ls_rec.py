@@ -785,6 +785,12 @@ class LivestreamRecorder:
         if stream["_from_start"]:
             part_num = 1
             stream["_part_num"] = 1
+        elif stream.get("_retry_part"):
+            # A failed restart is the same part again, not the next one.
+            # Advancing here logged "restart 1/10" beside "Part 03 started"
+            # and left a trail of empty parts for the concat to pick up.
+            stream["_retry_part"] = False
+            part_num = stream["_part_num"]
         else:
             stream["_part_num"] += 1
             part_num = stream["_part_num"]
@@ -929,25 +935,34 @@ class LivestreamRecorder:
 
     # ── monitor / watchdog ────────────────────────────────────────────────
 
-    def _source_still_live(self, stream: dict, attempts: int = 3) -> bool:
+    def _source_still_live(self, stream: dict, attempts: int = 3,
+                           default: bool = True) -> bool:
         """
         Only believe "ended" when a probe actually says so.
 
-        A stub, timeout or blip returns None, and treating that as "ended"
-        permanently kills the chat capture mid-stream. Inconclusive fails
-        toward still-live: the cost is a few wasted segments at stream end,
-        against losing hours of chat.
+        An offline channel is a definitive answer, not a failed probe. Without
+        that distinction a Twitch stream could never be seen to end: yt-dlp
+        exits non-zero saying "is offline", the probe returned None, and three
+        Nones read as inconclusive -- so the recorder rotated into a broadcast
+        that had already finished and burned its whole restart budget.
+
+        `default` is what a genuinely inconclusive result means, and it differs
+        by caller: the chat loop keeps capturing (cheap), the video rotate does
+        not (a live-edge part against an ended stream re-downloads the VOD).
         """
         for i in range(attempts):
-            data = ls_common.ytdlp_probe(self.config, stream["url"],
-                                         playlist_items="1")
+            data, reason = ls_common.ytdlp_probe(
+                self.config, stream["url"], playlist_items="1", with_reason=True)
             if data and data.get("id") == stream["identifier"]:
-                return bool(data.get("is_live"))      # a real answer
+                return bool(data.get("is_live"))
+            if reason == "offline":
+                return False                    # the platform said so
             if i < attempts - 1:
                 time.sleep(20)
         logger.warning(f"Liveness probe inconclusive x{attempts} for "
-                       f"{stream['stream_title']}; assuming still live")
-        return True
+                       f"{stream['stream_title']}; assuming "
+                       f"{'still live' if default else 'ended'}")
+        return default
 
     def _video_monitor(self, stream_key, process, log_fh, title, part_num):
         """Wait for yt-dlp exit, then classify: superseded / natural-end / failure."""
@@ -1008,10 +1023,25 @@ class LivestreamRecorder:
                 f"Recording failed after {RESTART_MAX} restarts "
                 f"(rc={rc}, part {part_num:02d}): {title}"
             )
+            # The chat is a separate process and may be perfectly healthy.
+            # Completing here kills it, which is how a YouTube capture that
+            # could not get video threw away a whole stream's chat three
+            # minutes in. Video and chat fail independently; let chat run on
+            # and finish the capture when the broadcast actually ends.
+            chat = stream.get("chat_thread")
+            if chat and chat.is_alive() and self._source_still_live(stream):
+                logger.warning(
+                    f"Video abandoned but {title} is still live; chat keeps "
+                    f"recording until the stream ends")
+                stream["_video_abandoned"] = True
+                threading.Thread(target=self._wait_chat_then_complete,
+                                 args=(stream_key,), daemon=True).start()
+                return
             self._handle_completion(stream_key)
             return
 
         stream["_restart_count"] = restart_count + 1
+        stream["_retry_part"] = True
         logger.warning(
             f"yt-dlp exited rc={rc}, restart "
             f"{restart_count + 1}/{RESTART_MAX} in {RESTART_DELAY_S}s: "
@@ -1213,6 +1243,47 @@ class LivestreamRecorder:
             except subprocess.TimeoutExpired:
                 continue
 
+    # Hard cap on holding a capture open for chat alone. Chat cannot reliably
+    # see the broadcast end by itself, so liveness is what ends this, and the
+    # cap is only a backstop against a probe that never gives a clear answer.
+    ABANDONED_MAX_S = 12 * 3600
+
+    def _wait_chat_then_complete(self, stream_key: str):
+        """
+        Hold the capture open for a chat whose video gave up — but only while
+        the broadcast is actually live.
+
+        Liveness decides, not the chat thread: chat has no view of the video
+        stream ending and would otherwise sit in a segment loop indefinitely.
+        Polls at the platform's own configured interval so this adds no
+        traffic beyond what monitoring would have done anyway, and an
+        inconclusive probe keeps waiting rather than discarding a live chat —
+        ABANDONED_MAX_S is what guarantees it ends.
+        """
+        stream = self.active_streams.get(stream_key)
+        if not stream:
+            return
+        title = stream["stream_title"]
+        interval = self._platform_interval(stream["platform"])
+        deadline = time.time() + self.ABANDONED_MAX_S
+        reason = "cap reached"
+
+        while time.time() < deadline:
+            stream = self.active_streams.get(stream_key)
+            if not stream:
+                return                          # completed elsewhere
+            chat = stream.get("chat_thread")
+            if not (chat and chat.is_alive()):
+                reason = "chat ended"
+                break
+            if not self._source_still_live(stream):
+                reason = "stream ended"
+                break
+            time.sleep(interval)
+
+        logger.info(f"Video abandoned, {reason}; completing: {title}")
+        self._handle_completion(stream_key)     # sets chat_stop_event
+
     def _handle_completion(self, stream_key: str, upload: bool = True):
         """Stop chat, merge parts, upload, write final metadata."""
         if stream_key not in self.active_streams:
@@ -1237,8 +1308,9 @@ class LivestreamRecorder:
 
             if stream.get("chat_stop_event"):
                 stream["chat_stop_event"].set()
-                if stream.get("chat_thread"):
-                    stream["chat_thread"].join(timeout=15)
+                chat = stream.get("chat_thread")
+                if chat and chat is not threading.current_thread():
+                    chat.join(timeout=15)
 
             if not upload or not os.path.exists(self.config["nas_path"]):
                 return
@@ -1308,6 +1380,25 @@ class LivestreamRecorder:
                 )
             except Exception as e:
                 logger.warning(f"archive completion packet failed: {e}")
+            # yt-dlp leaves fragments behind when a chat segment is killed
+            # mid-write (.part-FragNN, orphan .live_chat.json), and an empty
+            # part log per failed retry. None of it is recoverable data, and
+            # left alone it accumulates in the output dir forever.
+            out = self.config["output"]
+            esc = glob.escape(title)
+            junk = (glob.glob(os.path.join(out, f"{esc}.chatseg*.part-Frag*"))
+                    + glob.glob(os.path.join(out, f"{esc}.chatseg*.ytdl"))
+                    + glob.glob(os.path.join(out, f"{esc}.chatseg*.live_chat.json")))
+            for lg in glob.glob(os.path.join(out, f"{esc}.part*.log")):
+                try:
+                    if os.path.getsize(lg) == 0:
+                        junk.append(lg)
+                except OSError:
+                    pass
+            if junk:
+                self._cleanup(junk)
+                logger.info(f"Removed {len(junk)} leftover temp file(s): {title}")
+
             self.active_streams.pop(stream_key, None)
             logger.info(f"Cleanup done: {title}")
 

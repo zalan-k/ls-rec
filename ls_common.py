@@ -160,31 +160,49 @@ def _probe_once(config: dict, url: str, cookies: bool,
 
 def ytdlp_probe(config: dict, url: str, *,
                 playlist_items: str | None = None,
-                timeout: int = 30) -> dict | None:
+                timeout: int = 30, with_reason: bool = False):
     """
     Probe URL for metadata. Twitch always cookied (ad-free); YouTube tries
     anonymous first and only falls back to cookies on a bot check.
+
+    with_reason returns (data, reason) where reason is ok | offline | failed.
+    "Offline" is an ANSWER, not a failure: bare None for both leaves a caller
+    unable to tell "the stream ended" from "the probe broke", and one that
+    guesses "still live" rotates a recording into a finished broadcast.
     """
+    def out(data, reason):
+        return (data, reason) if with_reason else data
+
     if not _is_youtube(url):
-        return _probe_once(config, url, True, playlist_items, timeout)[0]
+        data, err, _ = _probe_once(config, url, True, playlist_items, timeout)
+        if data is not None:
+            return out(data, "ok")
+        if _is_offline(err):
+            return out(None, "offline")
+        _log.warning("Probe failed: %s", err.strip()[-200:])
+        return out(None, "failed")
 
     if not youtube_anon_blocked():
         data, err, blocked = _probe_once(config, url, False,
                                          playlist_items, timeout)
         if data is not None:
             _mark_anon_ok()
-            return data
+            return out(data, "ok")
         if not blocked:
-            if not _is_offline(err):
-                _log.warning("YouTube probe failed: %s", err.strip()[-200:])
-            return None
+            if _is_offline(err):
+                return out(None, "offline")
+            _log.warning("YouTube probe failed: %s", err.strip()[-200:])
+            return out(None, "failed")
         _mark_anon_blocked(config, err)
 
     data, err, _ = _probe_once(config, url, True, playlist_items, timeout)
-    if data is None and not _is_offline(err):
-        _log.warning("YouTube probe failed with cookies too: %s",
-                     err.strip()[-200:])
-    return data
+    if data is not None:
+        return out(data, "ok")
+    if _is_offline(err):
+        return out(None, "offline")
+    _log.warning("YouTube probe failed with cookies too: %s",
+                 err.strip()[-200:])
+    return out(None, "failed")
 
 
 def ytdlp_dump_playlist(config: dict, url: str, playlist_items: str, *,
