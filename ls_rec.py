@@ -13,15 +13,31 @@ Usage:
     ls-rec watch <url>           Add URL to watch list
     ls-rec unwatch [url|N]       Remove from watch list
 
+    ls-rec mark "what happened"  Write a !note into the stream's Obsidian entry
+    ls-rec clip <when> [length]  Cut a clip from the recording already on disk
+    ls-rec clip --all [length]   Cut every !note on the entry, clearing each !
+
     ls-rec mando <url> [--index N] [--type video|chat|both]
                                  Download VOD directly to NAS
 
 YouTube recording uses yt-dlp's --live-from-start, pulling from the
 broadcast start via DVR. One process per stream, no rotation. A watchdog
 thread samples file size every 10s and restarts yt-dlp if it stalls.
+
+`clip` cuts from the file the recorder is already writing -- no network, no
+second download, no re-encode. It only ever reads an ACTIVE recording; a
+finished broadcast is a normal file on the NAS and wants a normal editor.
+
+`mark` writes nothing but a line of text: it appends
+
+    - [ ] !Tenma ate an orange (00:42:13 / r00:41:09)
+
+to the stream's Obsidian entry, where the first stamp is broadcast time (what
+a player shows) and the second is the offset into the captured file. The `!`
+is a queue marker for a later pass that cuts the clip and clears it.
 """
 
-import os, re, glob, time, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common, ls_archive
+import os, re, glob, time, shlex, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common, ls_archive
 from collections import deque
 from pathlib import Path
 from yt_dlp.utils import sanitize_filename
@@ -36,6 +52,220 @@ STALL_DISPLAY_S      = 30     # status shows STALLED after this long
 BITRATE_PROBE_MIN_MB = 30     # ffprobe once file reaches this size
 RESTART_MAX          = 10     # bounded restart attempts per stream
 RESTART_DELAY_S      = 15     # backoff between restart attempts
+
+# ── Clipping constants ────────────────────────────────────────────────────
+CLIP_TAIL_GUARD_S    = 5      # never cut closer than this to the live edge
+CLIP_TIMEOUT_S       = 900    # ffmpeg wall-clock ceiling for one cut
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLIP TIME PARSING
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Every accepted spelling of "when" resolves to one absolute epoch before
+#  anything touches a file. Wall-clock is the only timebase that survives a
+#  Twitch part rotation: the gap between part N dying and part N+1 spawning
+#  exists in wall-clock but not on disk, so an offset measured from the start
+#  of the recording drifts by the sum of every gap before it. Each part
+#  instead carries the wall time it was spawned, and the epoch picks the part.
+#
+#  The SHAPE of the token picks the timebase, so there is no flag to remember
+#  and no way for one string to mean two things:
+#
+#      -12m / -90s / -1h20m     that long ago
+#      21:42 / 21:42:30         today, local wall clock
+#      @1:23:45                 that far into the broadcast
+#      2026.08.20 21:42         absolute (quote it, or 2026.08.20T21:42)
+#      now                      right now
+
+_DUR_RE   = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", re.I)
+_CLOCK_RE = re.compile(r"^(\d{1,3}):([0-5]?\d)(?::([0-5]?\d(?:\.\d+)?))?$")
+_DATE_RE  = re.compile(r"^(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})$")
+
+
+def _parse_clock(s: str) -> float | None:
+    """HH:MM[:SS] -> seconds. Two fields are HOURS:MINUTES, never MM:SS."""
+    m = _CLOCK_RE.match(s.strip())
+    if not m:
+        return None
+    h, mi, sec = m.group(1), m.group(2), m.group(3)
+    if sec is None:
+        return int(h) * 3600 + int(mi) * 60
+    return int(h) * 3600 + int(mi) * 60 + float(sec)
+
+
+def _parse_duration(s: str, bare_seconds: bool = False) -> float | None:
+    """`5` -> 5 minutes (or seconds if bare_seconds). `90s` `5m` `1h` `1h30m`.
+    Full `HH:MM:SS` also works.
+
+    Two-field `5:00` is REJECTED rather than guessed. It reads as five
+    minutes to a human and as five hours to _parse_clock, and silently
+    cutting a five-hour clip is a worse outcome than an error message.
+    """
+    s = (s or "").strip().lower()
+    if not s:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return float(s) * (1 if bare_seconds else 60)
+    if s.count(":") == 2:
+        return _parse_clock(s)
+    if ":" in s:
+        return None
+    m = _DUR_RE.fullmatch(s)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, sec = m.groups()
+    return int(h or 0) * 3600 + int(mi or 0) * 60 + float(sec or 0)
+
+
+def _fmt_hms(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Compact and human: 90s, 12m, 1h20m, 3m00s."""
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s" if s else f"{m}m"
+    return f"{s}s"
+
+
+def _local_dt(day: datetime.date, seconds_into_day: float) -> datetime.datetime:
+    """Combine a local date with an offset into it.
+
+    datetime.combine is used rather than midnight + timedelta because only
+    the former asks the platform to resolve a naive local time; adding a
+    raw 21h42m to midnight lands an hour off on the two DST days a year.
+    """
+    total = int(seconds_into_day)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    base = datetime.datetime.combine(day, datetime.time(h % 24, m, s))
+    return base + datetime.timedelta(days=h // 24)
+
+
+_NOTE_RE = re.compile(r"^!\s*(?P<text>.*?)\s*\((?P<stamp>[^)]*)\)\s*$")
+
+
+def _parse_note(raw: str) -> dict | None:
+    """Parse a `!` note back into a clip request.
+
+    Accepts everything `mark` writes and everything you would plausibly type
+    by hand:
+
+        !text (00:16:00 / r00:15:00)      both stamps -- prefer the r one
+        !text (r00:15:00)                 broadcast start was unknown
+        !text (00:42:13)                  hand-written, broadcast-relative
+        !text (00:42:13, 4m)              with an explicit length
+
+    The trailing stamp wins because `mark` writes the record-relative one
+    last, and that one needs no conversion and cannot be missing.
+    """
+    m = _NOTE_RE.match(raw.strip())
+    if not m:
+        return None
+    parts = [p.strip() for p in m.group("stamp").split(",")]
+    times = [t.strip() for t in parts[0].split("/") if t.strip()]
+    if not times:
+        return None
+    tok  = times[-1]
+    secs = _parse_clock(tok.lstrip("rR"))
+    if secs is None:
+        return None
+    return {
+        "text":        m.group("text"),
+        "offset":      secs,
+        "from_record": tok[:1] in ("r", "R"),
+        "length":      _parse_duration(parts[1]) if len(parts) > 1 else None,
+    }
+
+
+def _looks_like_time(tok: str) -> bool:
+    """Is this leading-dash token `-12m` rather than a mistyped flag?
+
+    Needed because the most natural way to say when is also the one shape
+    that collides with option syntax.
+    """
+    return tok.startswith("-") and _parse_duration(tok[1:]) is not None
+
+
+def _parse_when(tokens: list[str], now: float,
+                stream_zero: float | None) -> tuple[float, str, list[str]]:
+    """Consume the leading token(s) of `tokens` as one instant.
+
+    Returns (epoch, human description, remaining tokens).
+    `stream_zero` is the broadcast-start epoch, needed only for `@` offsets.
+    """
+    if not tokens:
+        raise ValueError("missing <when>")
+    tok, rest = tokens[0], tokens[1:]
+
+    if tok.lower() == "now":
+        return now, "now", rest
+
+    # -12m : that long ago. Bare numbers here are MINUTES, matching <length>.
+    if tok.startswith("-"):
+        d = _parse_duration(tok[1:])
+        if d is None:
+            raise ValueError(f"bad relative time {tok!r} (try -12m, -90s, -1h20m)")
+        return now - d, f"{_fmt_dur(d)} ago", rest
+
+    # @1:23:45 : offset into the broadcast, the number a VOD player shows.
+    if tok.startswith("@"):
+        off = _parse_clock(tok[1:])
+        if off is None:
+            raise ValueError(f"bad stream offset {tok!r} (use @HH:MM:SS)")
+        if stream_zero is None:
+            raise ValueError("broadcast start unknown for this stream — "
+                             "use a wall-clock time or -Nm instead")
+        return stream_zero + off, f"broadcast +{_fmt_hms(off)}", rest
+
+    # 2026.08.20 21:42  /  2026.08.20T21:42  /  2026.08.20_21:42
+    datepart = timepart = None
+    m = _DATE_RE.match(tok)
+    if m:
+        datepart = m.groups()
+        if rest and _CLOCK_RE.match(rest[0]):
+            timepart, rest = rest[0], rest[1:]
+        else:
+            raise ValueError(f"date {tok!r} needs a time after it "
+                             f'(quote it: "{tok} 21:42")')
+    else:
+        for sep in ("T", "t", "_"):
+            if sep in tok:
+                a, _, b = tok.partition(sep)
+                m2 = _DATE_RE.match(a)
+                if m2 and _CLOCK_RE.match(b):
+                    datepart, timepart = m2.groups(), b
+                    break
+
+    if datepart and timepart:
+        y, mo, d = (int(x) for x in datepart)
+        dt = _local_dt(datetime.date(y, mo, d), _parse_clock(timepart))
+        return dt.timestamp(), dt.strftime("%Y-%m-%d %H:%M:%S"), rest
+
+    # 21:42 : today, local.
+    secs = _parse_clock(tok)
+    if secs is not None:
+        dt = _local_dt(datetime.date.fromtimestamp(now), secs)
+        ep = dt.timestamp()
+        # A clock time in the future means the broadcast crossed midnight and
+        # you are naming a moment from last night, not one from this evening.
+        if ep > now + 60:
+            ep -= 86400
+            dt = datetime.datetime.fromtimestamp(ep)
+        return ep, dt.strftime("%Y-%m-%d %H:%M:%S"), rest
+
+    raise ValueError(
+        f"unrecognised time {tok!r} — use -12m, 21:42, @1:23:45, "
+        f'or "2026.08.20 21:42"')
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  LOGGING (daemon only — configured lazily so CLI commands stay clean)
@@ -192,6 +422,7 @@ class LivestreamRecorder:
 
         # Filesystem
         Path(self.config["output"]).mkdir(parents=True, exist_ok=True)
+        Path(self._clips_dir()).mkdir(parents=True, exist_ok=True)
         self._log_disk_space()
 
         # Signals
@@ -263,7 +494,12 @@ class LivestreamRecorder:
     # ── command dispatch ──────────────────────────────────────────────────
 
     def handle_command(self, command: str) -> str:
-        parts = command.split()
+        # shlex, not split(): a quoted datetime ("2026.08.20 21:42") and a
+        # multi-word --name have to survive the trip over the socket intact.
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
         if not parts:
             return ""
         cmd = parts[0].lower()
@@ -280,8 +516,13 @@ class LivestreamRecorder:
             return self._cmd_watch(parts[1] if len(parts) > 1 else None)
         if cmd == "unwatch":
             return self._cmd_unwatch(parts[1] if len(parts) > 1 else None)
+        if cmd == "mark":
+            return self._cmd_mark(parts[1:])
+        if cmd == "clip":
+            return self._cmd_clip(parts[1:])
         return ("Commands: status | tail [YT|TW] | check [youtube|twitch] | "
-                "record <url> | watch <url> | unwatch [url|N]")
+                "record <url> | watch <url> | unwatch [url|N] | "
+                "mark <text> | clip <when> [length]")
 
     # ── status ────────────────────────────────────────────────────────────
 
@@ -760,6 +1001,14 @@ class LivestreamRecorder:
             "_from_start":       (platform == "youtube"),
             "_part_num":         0,      # Twitch: incremented per part. from-start: pinned to 1.
             "_current_part_num": None,
+            # Clip timebase. record_start is when WE started pulling bytes;
+            # stream_start is when the broadcast began. They are not the same
+            # number and the difference is exactly what makes a naive
+            # "00:08:30 into the stream" point at the wrong frame -- Twitch
+            # can be a full check_interval late, YouTube from-start is ~0.
+            "_record_start_epoch": record_start.timestamp(),
+            "_stream_start_epoch": float(stream_start) if stream_start else None,
+            "_part_history":       [],
         }
         self._record_video(stream_key)
         self._record_chat(stream_key)
@@ -795,6 +1044,7 @@ class LivestreamRecorder:
             stream["_part_num"] += 1
             part_num = stream["_part_num"]
         stream["_current_part_num"] = part_num
+        self._note_part_start(stream, part_num)
 
         output_template = f"{title}.part{part_num:02d}.%(ext)s"
         log_path = os.path.join(
@@ -1219,6 +1469,487 @@ class LivestreamRecorder:
         self._cleanup([list_file])           # leave parts in place for recovery
         return False, None
 
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  CLIPPING
+    # ══════════════════════════════════════════════════════════════════════
+    #
+    #  The bytes are already on local disk, so a clip is one ffmpeg stream
+    #  copy: no network, no auth, no second download. Clipping therefore
+    #  keeps working on days the extractor does not.
+    #
+    #  Clips go in their own directory, and that is load-bearing rather than
+    #  tidiness. _current_growing_file() globs `<title>.partNN*` and takes
+    #  the LARGEST match, so a clip left in the output dir under a matching
+    #  prefix becomes the file the watchdog samples -- it would see no growth
+    #  and force-restart a healthy recording. _find_part_files() would then
+    #  sweep the same clip into the final concat.
+
+    def _clips_dir(self) -> str:
+        return (self.config.get("clips_dir")
+                or os.path.join(self.config["output"], "clips"))
+
+    # ── part timebase ─────────────────────────────────────────────────────
+
+    def _note_part_start(self, stream: dict, part_num: int):
+        """Record the wall time this part's file begins.
+
+        `zero_epoch` is the wall time of media t=0 in the file being written:
+        the broadcast start under --live-from-start (the file opens at the
+        beginning of the stream), otherwise the moment yt-dlp was spawned
+        (the file opens at the live edge).
+        """
+        hist = stream.setdefault("_part_history", [])
+        now  = time.time()
+        from_start = bool(stream.get("_from_start"))
+        entry = {
+            "num":        part_num,
+            "started_ts": now,
+            "from_start": from_start,
+            "zero_epoch": (stream.get("_stream_start_epoch") or now)
+                          if from_start else now,
+        }
+        last = hist[-1] if hist else None
+        if last and last["num"] == part_num and last["from_start"] == from_start:
+            # Same part twice: --live-from-start resumes its own download from
+            # .ytdl state and keeps its timebase; a Twitch retry rewrites the
+            # part, so the timebase moves with it.
+            if not from_start:
+                hist[-1] = entry
+            return
+        hist.append(entry)
+
+    def _resolve_part(self, stream: dict, epoch: float) -> tuple[dict, float] | None:
+        """Absolute epoch -> (part entry, seconds into that part's file)."""
+        hist = stream.get("_part_history") or []
+        found = None
+        for i, part in enumerate(hist):
+            if epoch < part["zero_epoch"]:
+                continue
+            upper = hist[i + 1]["started_ts"] if i + 1 < len(hist) else None
+            if upper is None or epoch < upper:
+                found = (part, epoch - part["zero_epoch"])
+        return found
+
+    # ── source files ──────────────────────────────────────────────────────
+
+    def _classify_media(self, path: str) -> str:
+        """'muxed' | 'video' | 'audio' — what streams this file carries."""
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=30,
+            )
+            types = {t.strip() for t in r.stdout.split() if t.strip()}
+            if "video" in types and "audio" in types:
+                return "muxed"
+            if "video" in types:
+                return "video"
+            if "audio" in types:
+                return "audio"
+        except Exception:
+            pass
+        # ffprobe can refuse a half-written fragment; fall back to the name.
+        base = os.path.basename(path).lower().removesuffix(".part")
+        return "audio" if base.endswith((".m4a", ".opus", ".ogg", ".aac", ".mp3")) else "muxed"
+
+    def _part_sources(self, title: str, part_num: int) -> list[tuple[str, str]]:
+        """Media file(s) holding this part, as (path, kind).
+
+        Twitch live-edge writes one file. YouTube --live-from-start writes
+        video and audio as separate `.fNNN.` streams and only merges them when
+        yt-dlp exits, so mid-recording there are two and the clip has to mux
+        them back together itself.
+        """
+        pattern = os.path.join(
+            self.config["output"], f"{glob.escape(title)}.part{part_num:02d}*")
+        merged, frags = [], []
+        for p in glob.glob(pattern):
+            base = os.path.basename(p)
+            if base.endswith((".log", ".ytdl", ".json", ".concat.txt",
+                              ".frag.json", ".temp")):
+                continue
+            try:
+                if os.path.getsize(p) <= 0:
+                    continue
+            except OSError:
+                continue
+            stem = base.removesuffix(".part")
+            if re.search(r"\.part\d{2}\.f\d+(-\w+)?\.\w+$", stem):
+                frags.append(p)
+            elif re.fullmatch(rf"{re.escape(title)}\.part{part_num:02d}\.\w+", stem):
+                merged.append(p)
+
+        # A finished part beats the fragments it was built from.
+        if merged:
+            best = max(merged, key=os.path.getsize)
+            return [(best, self._classify_media(best))]
+        if not frags:
+            return []
+
+        picked: dict[str, tuple[str, int]] = {}
+        for p in frags:
+            kind = self._classify_media(p)
+            size = os.path.getsize(p)
+            if kind not in picked or size > picked[kind][1]:
+                picked[kind] = (p, size)
+        if "muxed" in picked:
+            return [(picked["muxed"][0], "muxed")]
+        return [(picked[k][0], k) for k in ("video", "audio") if k in picked]
+
+    # ── the cut ───────────────────────────────────────────────────────────
+
+    def _cut(self, sources: list[tuple[str, str]], offset: float,
+             length: float, out_path: str) -> bool:
+        """ffmpeg stream copy, on a worker thread. Input-side -ss to seek cheap.
+
+        -c copy can only start on a keyframe, so the real start snaps back by
+        up to one GOP (~2s Twitch, up to ~5s YouTube DASH). That is what the
+        lead is for; re-encoding to land the frame exactly would cost minutes
+        of CPU on a box already running two captures.
+        """
+        args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        maps: list[str] = []
+        for i, (path, kind) in enumerate(sources):
+            args += ["-ss", f"{offset:.3f}", "-i", path]
+            if kind in ("video", "muxed"):
+                maps += ["-map", f"{i}:v:0?"]
+            if kind in ("audio", "muxed"):
+                maps += ["-map", f"{i}:a:0?"]
+        args += maps + [
+            "-t", f"{length:.3f}", "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-movflags", "+faststart", out_path,
+        ]
+        name    = os.path.basename(out_path)
+        started = time.time()
+        try:
+            r = subprocess.run(args, capture_output=True, text=True,
+                               timeout=CLIP_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            logger.error(f"Clip timed out: {name}")
+            return False
+        took = time.time() - started
+        got  = (ls_common.probe_duration(out_path)
+                if os.path.exists(out_path) else None)
+        if not got:
+            logger.error(f"Clip failed: {name}: "
+                         f"{(r.stderr or 'no output').strip()[-300:]}")
+            return False
+        # A short clip is not a failure: the recording simply does not reach
+        # that far yet. Say so rather than pretending it is complete.
+        short = f" (short: {_fmt_dur(got)} of {_fmt_dur(length)})" if got < length * 0.8 else ""
+        logger.info(f"Clip written: {name} — {_fmt_dur(got)}, {took:.1f}s{short}")
+        return True
+
+    def _clip_out_path(self, stream: dict, start_epoch: float,
+                       length: float, label: str | None) -> str:
+        idx  = stream.get("obsidian_index")
+        when = datetime.datetime.fromtimestamp(start_epoch).strftime("%Y-%m-%d_%H-%M-%S")
+        bits = [f"{idx:03d}" if idx else stream["platform"], when, _fmt_dur(length)]
+        if label:
+            clean = sanitize_filename(label, restricted=True).strip("_")
+            if clean:
+                bits.append(clean[:60])
+        base = "_".join(bits)
+        path = os.path.join(self._clips_dir(), f"{base}.mp4")
+        n = 2
+        while os.path.exists(path):
+            path = os.path.join(self._clips_dir(), f"{base}_{n}.mp4")
+            n += 1
+        return path
+
+    # ── command ───────────────────────────────────────────────────────────
+
+    def _pick_stream(self, platform: str | None) -> tuple[dict | None, str]:
+        cands = [s for s in self.active_streams.values()
+                 if platform is None or s["platform"] == platform]
+        if not cands:
+            if platform:
+                return None, f"No active {platform} recording."
+            return None, ("No active recording — `clip` and `mark` both work "
+                          "on a live capture only.")
+        # Twitch first: it records at the live edge, so its file always holds
+        # the moment you just watched. A from-start YouTube capture can be
+        # minutes behind and simply not have those frames yet.
+        cands.sort(key=lambda s: s["platform"] != "twitch")
+        return cands[0], ""
+
+    def _cmd_mark(self, argv: list[str]) -> str:
+        """ls-rec mark <text> [--tw|--yt]
+
+        Writes a `!`-prefixed note into the stream's Obsidian entry, stamped
+        with both timebases: the broadcast time a player shows, and the offset
+        into the file we actually captured. Those differ by however late the
+        daemon noticed the stream — up to a full check interval on Twitch —
+        so writing only one of them would make the note readable in exactly
+        one context and wrong in the other.
+        """
+        platform, words = None, []
+        for a in argv:
+            if a in ("--tw", "--twitch"):
+                platform = "twitch"
+            elif a in ("--yt", "--youtube"):
+                platform = "youtube"
+            else:
+                words.append(a)
+        text = " ".join(words).strip()
+        if not text:
+            return '\n  Usage: ls-rec mark "what happened" [--tw|--yt]\n'
+        if text.startswith("["):
+            # `![[...]]` is an Obsidian embed, not a note. Refusing beats
+            # silently planting a broken transclusion in the vault.
+            return "\n  Note cannot start with '[' — it would become an embed.\n"
+
+        stream, err = self._pick_stream(platform)
+        if stream is None:
+            return f"\n  {err}\n"
+        idx = stream.get("obsidian_index")
+        if not idx:
+            return "\n  That recording has no Obsidian entry to mark.\n"
+
+        now  = time.time()
+        rec0 = stream.get("_record_start_epoch")
+        brd0 = stream.get("_stream_start_epoch")
+        if not rec0:
+            return "\n  No recording timebase for that stream.\n"
+        rec   = _fmt_hms(now - rec0)
+        brd   = _fmt_hms(now - brd0) if brd0 else None
+        stamp = f"{brd} / r{rec}" if brd else f"r{rec}"
+        note  = f"!{text} ({stamp})"
+
+        if not ls_common.obsidian_append_note(self.config, idx, note):
+            return f"\n  Could not write to Obsidian entry {idx:03d}.\n"
+        logger.info(f"Mark on {stream['stream_title']}: {note}")
+
+        out = ["", f"  {idx:03d}  {note}"]
+        if not brd:
+            out.append("  (broadcast start unknown — recording-relative only)")
+        out += [f"  cut it with:  ls-rec clip @{brd or rec}", ""]
+        return "\n".join(out)
+
+    def _cmd_clip(self, argv: list[str]) -> str:
+        """ls-rec clip <when> [length] [--tw|--yt] [--lead S] [--name T]"""
+        platform = name = lead = None
+        do_all = False
+        pos: list[str] = []
+        i = 0
+        try:
+            while i < len(argv):
+                a = argv[i]
+                if a in ("--tw", "--twitch"):
+                    platform = "twitch"
+                elif a in ("--yt", "--youtube"):
+                    platform = "youtube"
+                elif a in ("--all", "-a"):
+                    do_all = True
+                elif a in ("--lead", "-l"):
+                    i += 1
+                    lead = _parse_duration(argv[i], bare_seconds=True)
+                    if lead is None:
+                        return f"\n  Bad --lead value: {argv[i]!r}\n"
+                elif a in ("--name", "-n"):
+                    i += 1
+                    name = argv[i]
+                elif a.startswith("-") and not _looks_like_time(a):
+                    return f"\n  Unknown option: {a}\n"
+                else:
+                    pos.append(a)
+                i += 1
+        except IndexError:
+            return f"\n  Bad arguments: {' '.join(argv)}\n"
+
+        if do_all and name:
+            return "\n  --name has no meaning with --all (each note names its own).\n"
+        if not pos and not do_all:
+            return ("\n  Usage: ls-rec clip <when> [length] [--tw|--yt]\n"
+                    "         ls-rec clip --all [length]\n"
+                    "    -12m            12 minutes ago\n"
+                    "    21:42           today, local time\n"
+                    "    @1:23:45        that far into the broadcast\n"
+                    '    "2026.08.20 21:42"\n')
+
+        stream, err = self._pick_stream(platform)
+        if stream is None:
+            return f"\n  {err}\n"
+        if not stream.get("_part_history"):
+            return "\n  That recording has not written anything yet.\n"
+
+        now = time.time()
+        if lead is None:
+            lead = float(self.config.get("clip_lead_s", 60))
+
+        if do_all:
+            all_len = None
+            if pos:
+                all_len = _parse_duration(pos[0])
+                if all_len is None:
+                    return f"\n  Bad length {pos[0]!r}.\n"
+            return self._clip_all(stream, all_len, lead)
+
+        brd = stream.get("_stream_start_epoch") or stream.get("_record_start_epoch")
+        try:
+            epoch, desc, pos = _parse_when(pos, now, brd)
+        except ValueError as e:
+            return f"\n  {e}\n"
+
+        if pos:
+            length = _parse_duration(pos[0])
+            if length is None:
+                return (f"\n  Bad length {pos[0]!r} — use 5 (minutes), 90s, "
+                        f"5m, 1h30m or 00:05:00.\n")
+        else:
+            length = float(self.config.get("clip_length_s", 180))
+        if length <= 0:
+            return "\n  Length must be positive.\n"
+
+        plan, err = self._plan_clip(stream, epoch, length, lead, name, now)
+        if plan is None:
+            # _plan_clip phrases reasons lowercase so --all can inline them
+            # after an em dash; standing alone they want a capital.
+            return f"\n  {err[:1].upper()}{err[1:]}\n"
+        threading.Thread(target=self._cut,
+                         args=(plan["sources"], plan["offset"],
+                               plan["length"], plan["out"]),
+                         daemon=True).start()
+
+        lines = [
+            "",
+            "  Clip queued",
+            f"    moment   {desc}",
+            f"    from     {datetime.datetime.fromtimestamp(plan['start']):%Y-%m-%d %H:%M:%S}"
+            f"  (−{_fmt_dur(lead)} lead)",
+            f"    length   {_fmt_dur(plan['length'])}",
+            f"    source   part {plan['part']:02d} @ {_fmt_hms(plan['offset'])}",
+            f"    out      {plan['out']}",
+        ]
+        for n in plan["notes"]:
+            lines.append(f"    note     {n}")
+        lines += ["", "  (cutting in background — see the daemon log)", ""]
+        return "\n".join(lines)
+
+    def _plan_clip(self, stream: dict, epoch: float, length: float,
+                   lead: float, label: str | None,
+                   now: float) -> tuple[dict | None, str]:
+        """Resolve one requested instant into a concrete ffmpeg job.
+
+        Returns (plan, "") or (None, reason). Shared by the single-clip path
+        and --all so both clamp, refuse and name files identically.
+        """
+        # The lead shifts the window earlier without lengthening it, so the
+        # clip is exactly as long as asked and the named moment sits `lead`
+        # seconds in. You notice a funny thing after it lands, and the
+        # stream's own latency pushes the same way.
+        start = epoch - lead
+        notes = []
+
+        first_zero = stream["_part_history"][0]["zero_epoch"]
+        if start < first_zero:
+            notes.append("clamped to the start of the recording")
+            start = first_zero
+        edge = now - CLIP_TAIL_GUARD_S
+        if start >= edge:
+            return None, (f"at (or past) the live edge — nothing on disk yet "
+                          f"(wait {int(start - edge) + CLIP_TAIL_GUARD_S}s)")
+        if start + length > edge:
+            length = edge - start
+            notes.append(f"trimmed to {_fmt_dur(length)} at the live edge")
+
+        resolved = self._resolve_part(stream, start)
+        if resolved is None:
+            return None, "not inside any part of this recording"
+        part, offset = resolved
+        sources = self._part_sources(stream["stream_title"], part["num"])
+        if not sources:
+            return None, f"no media file on disk yet for part {part['num']:02d}"
+
+        # A window starting in one part and ending after the next one began
+        # would run off the end of the file it is cutting from.
+        idx = stream["_part_history"].index(part)
+        if idx + 1 < len(stream["_part_history"]):
+            nxt = stream["_part_history"][idx + 1]["started_ts"]
+            if start + length > nxt:
+                length = nxt - start
+                notes.append(f"trimmed to {_fmt_dur(length)} at the part boundary")
+
+        return {
+            "start":   start,
+            "offset":  offset,
+            "length":  length,
+            "sources": sources,
+            "part":    part["num"],
+            "notes":   notes,
+            "out":     self._clip_out_path(stream, start, length, label),
+        }, ""
+
+    # ── --all: cut every ! note on the current entry ───────────────────────
+
+    def _clip_all(self, stream: dict, length: float | None,
+                  lead: float) -> str:
+        """Cut every `!` note under this stream's Obsidian entry, in order."""
+        idx = stream.get("obsidian_index")
+        if not idx:
+            return "\n  That recording has no Obsidian entry to read.\n"
+        pending = [n for n in ls_common.obsidian_entry_notes(self.config, idx)
+                   if n.lstrip().startswith("!")]
+        if not pending:
+            return f"\n  No ! notes on entry {idx:03d}.\n"
+
+        rec0 = stream.get("_record_start_epoch")
+        brd0 = stream.get("_stream_start_epoch")
+        now  = time.time()
+        jobs, skipped = [], []
+        for raw in pending:
+            note = _parse_note(raw)
+            if note is None:
+                skipped.append((raw, "no timestamp"))
+                continue
+            zero = rec0 if note["from_record"] else brd0
+            if not zero:
+                skipped.append((raw, "no broadcast start for that timebase"))
+                continue
+            want = note["length"] or length or float(
+                self.config.get("clip_length_s", 180))
+            plan, err = self._plan_clip(stream, zero + note["offset"], want,
+                                        lead, note["text"], now)
+            if plan is None:
+                skipped.append((raw, err))
+                continue
+            plan["raw"] = raw
+            jobs.append(plan)
+
+        if jobs:
+            threading.Thread(target=self._run_all, args=(idx, jobs),
+                             daemon=True).start()
+
+        lines = ["", f"  Entry {idx:03d} — {len(jobs)} queued"
+                     + (f", {len(skipped)} skipped" if skipped else "")]
+        for p in jobs:
+            lines.append(f"    {_fmt_hms(p['offset'])}  {_fmt_dur(p['length']):>6}  "
+                         f"{os.path.basename(p['out'])}")
+            for n in p["notes"]:
+                lines.append(f"              ↳ {n}")
+        for raw, why in skipped:
+            lines.append(f"    skipped   {raw[:48]} — {why}")
+        lines += ["", "  (cutting in order — ! clears as each one lands)", ""]
+        return "\n".join(lines)
+
+    def _run_all(self, index: int, jobs: list[dict]):
+        """Cut queued clips one at a time, clearing each note as it lands.
+
+        Sequential on purpose: they are stream copies off one disk so there
+        is nothing to win by racing them, and one worker means only one
+        writer touching the Obsidian file. A failed cut keeps its `!`, so
+        the next --all retries it instead of losing it silently.
+        """
+        for p in jobs:
+            if not self._cut(p["sources"], p["offset"], p["length"], p["out"]):
+                continue
+            cleared = p["raw"].lstrip()[1:].lstrip()
+            if not ls_common.obsidian_replace_note(self.config, index,
+                                                   p["raw"], cleared):
+                logger.warning(f"Clip cut but ! not cleared: {p['raw'][:60]}")
 
     # ── completion & upload ───────────────────────────────────────────────
 
@@ -1688,8 +2419,11 @@ def main():
         do_tail(target)
         return
 
-    # Everything else → daemon over socket
-    send_command_and_print(" ".join(sys.argv[1:]))
+    # Everything else → daemon over socket.
+    # shlex.join, not " ".join: `clip "2026.08.20 21:42" 5` and
+    # `clip -12m 3 --name "monkey bit"` both have to arrive as the same
+    # argv the shell handed us, not as a re-split word soup.
+    send_command_and_print(shlex.join(sys.argv[1:]))
 
 
 if __name__ == "__main__":

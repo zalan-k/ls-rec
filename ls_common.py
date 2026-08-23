@@ -33,6 +33,15 @@ _DEFAULTS: dict[str, Any] = {
     "archive_url":          "",
     "archive_token":        "",
     "archive_media_prefix": "raws/",
+    # ── clipping (ls-rec dl / mark) ──────────────────────────────────────
+    # Clips are cut with `-c copy` from the file already on disk, so the
+    # only real cost of being generous is disk. Both of these exist because
+    # you notice a funny moment *after* it lands: the lead buys back your
+    # reaction time, the stream's own latency, and the keyframe snap that
+    # `-c copy` forces (up to one GOP, ~2s on Twitch).
+    "clip_lead_s":    60,     # head start before the requested instant
+    "clip_length_s":  180,    # default clip length
+    "clips_dir":      "",     # blank -> <output>/clips
 }
 
 _REQUIRED = (
@@ -752,6 +761,34 @@ def obsidian_parse_entry(config: dict, index: int) -> dict:
 
     return result
 
+def _write_lines_atomic(path: str, lines: list[str]):
+    """tmp + rename. The daemon writes this file from several places and
+    Obsidian keeps it open; a torn write loses a whole stream's notes."""
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.replace(tmp, path)
+
+
+def _find_entry_block(lines: list[str], index: int) -> tuple[int, int] | None:
+    """(start, end) line indices of entry #index. end is exclusive."""
+    header_re = re.compile(rf"\*\*{int(index):03d}\*\*\s*:")
+    start = None
+    for i, line in enumerate(lines):
+        if header_re.search(line):
+            start = i
+            break
+    if start is None:
+        return None
+    end = start + 1
+    while end < len(lines):
+        if (lines[end].strip() == "---"
+                or re.match(r"^-\s*\[.\]\s*\*\*\d+\*\*", lines[end])):
+            break
+        end += 1
+    return start, end
+
+
 def obsidian_write_entry(config: dict, index: int,
                          new_lines: list[str]) -> bool:
     """Replace entry #index in the Obsidian file with new_lines."""
@@ -762,29 +799,99 @@ def obsidian_write_entry(config: dict, index: int,
     with open(obs_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    idx_str = f"{int(index):03d}"
-    header_re = re.compile(rf"\*\*{idx_str}\*\*\s*:")
-    start = None
-    for i, line in enumerate(lines):
-        if header_re.search(line):
-            start = i
-            break
-    if start is None:
+    block = _find_entry_block(lines, index)
+    if block is None:
+        return False
+    start, end = block
+
+    lines[start:end] = [(l if l.endswith("\n") else l + "\n") for l in new_lines]
+    _write_lines_atomic(obs_path, lines)
+    return True
+
+
+_NOTE_LINE_RE = re.compile(r"^\s*-\s*\[[ xX]\]\s*(?P<text>.*?)\s*$")
+
+
+def obsidian_entry_notes(config: dict, index: int) -> list[str]:
+    """Checkbox note texts under entry #index, in file order."""
+    obs_path = config["obsidian"]
+    if not os.path.exists(obs_path):
+        return []
+    try:
+        with open(obs_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        block = _find_entry_block(lines, index)
+        if block is None:
+            return []
+        start, end = block
+        out = []
+        for line in lines[start + 1:end]:
+            if re.match(r"^\t`(YT|TW)`", line):
+                continue
+            m = _NOTE_LINE_RE.match(line)
+            if m and m.group("text"):
+                out.append(m.group("text"))
+        return out
+    except Exception:
+        return []
+
+
+def obsidian_replace_note(config: dict, index: int, old: str, new: str) -> bool:
+    """Swap one note's text inside entry #index.
+
+    Re-reads the file on every call rather than holding a parsed copy, so a
+    worker clearing notes one at a time cannot stomp an edit you made in
+    Obsidian between two of them.
+    """
+    obs_path = config["obsidian"]
+    if not os.path.exists(obs_path):
+        return False
+    try:
+        with open(obs_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        block = _find_entry_block(lines, index)
+        if block is None:
+            return False
+        start, end = block
+        for i in range(start + 1, end):
+            m = _NOTE_LINE_RE.match(lines[i])
+            if m and m.group("text") == old:
+                lines[i] = lines[i].replace(old, new, 1)
+                _write_lines_atomic(obs_path, lines)
+                return True
+        return False
+    except Exception:
         return False
 
-    end = start + 1
-    while end < len(lines):
-        stripped = lines[end].strip()
-        if stripped == "---" or re.match(r"^-\s*\[.\]\s*\*\*\d+\*\*", lines[end]):
-            break
-        end += 1
 
-    replacement = [(l if l.endswith("\n") else l + "\n") for l in new_lines]
-    lines[start:end] = replacement
+def obsidian_append_note(config: dict, index: int, text: str) -> bool:
+    """Append a checkbox note to entry #index.
 
-    with open(obs_path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    return True
+    Reuses the blank `- [ ]` the entry template ships with, so the first note
+    does not leave an empty checkbox hanging above it.
+    """
+    obs_path = config["obsidian"]
+    if not os.path.exists(obs_path):
+        return False
+    try:
+        with open(obs_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        block = _find_entry_block(lines, index)
+        if block is None:
+            return False
+        start, end = block
+        note = f"\t- [ ] {text}\n"
+
+        for i in range(end - 1, start, -1):
+            if re.fullmatch(r"\t-\s*\[ \]\s*", lines[i].rstrip("\n")):
+                lines[i] = note
+                break
+        else:
+            lines.insert(end, note)
+        _write_lines_atomic(obs_path, lines)
+        return True
+    except Exception:
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
