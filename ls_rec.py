@@ -1013,6 +1013,12 @@ class LivestreamRecorder:
         self._record_video(stream_key)
         self._record_chat(stream_key)
 
+        # Don't make the badge wait for the next tick. The poll loop would get
+        # to it within check_interval anyway, but "she went live" is exactly the
+        # moment anyone is looking at the page, and a minute of dark badge while
+        # the stream is plainly running is the one lag people notice.
+        ls_archive.post_live(self.config, self.active_streams)
+
     def _record_video(self, stream_key: str):
         """Spawn yt-dlp for this stream.
 
@@ -2131,6 +2137,10 @@ class LivestreamRecorder:
                 logger.info(f"Removed {len(junk)} leftover temp file(s): {title}")
 
             self.active_streams.pop(stream_key, None)
+            # AFTER the pop, not before: the heartbeat sends whatever this dict
+            # holds, and sending it a line earlier would announce the stream
+            # that just finished as still running.
+            ls_archive.post_live(self.config, self.active_streams)
             logger.info(f"Cleanup done: {title}")
 
     def _upload(self, src: str, dst: str) -> bool:
@@ -2176,6 +2186,15 @@ class LivestreamRecorder:
                     ls_archive.flush(self.config)
                 except Exception as e:
                     logger.warning(f"archive flush failed: {e}")
+
+                # Say what is recording, every tick, whether or not anything
+                # is. Up here beside flush() and above the cooldown check for
+                # the same reason that one is: the `continue` below skips the
+                # rest of the loop, and a tick that sends nothing reads to the
+                # archive as "the recorder has gone quiet" rather than "nothing
+                # is running" — which are different states and drawn
+                # differently. Never fatal; post_live swallows its own failures.
+                ls_archive.post_live(self.config, self.active_streams)
 
                 # Cooldown after manual termination
                 if not self._is_monitoring_allowed():
@@ -2241,6 +2260,11 @@ class LivestreamRecorder:
         self.command_server.stop()
         for key in list(self.active_streams):
             self._handle_completion(key, upload=False)
+        # A farewell, so a planned restart drops the badge now instead of three
+        # intervals from now. Belt and braces — each _handle_completion above
+        # already beat on its way out — but it also covers the case where one
+        # of them threw, and it costs one request on a path taken once.
+        ls_archive.post_live(self.config, self.active_streams)
         logger.info("Shutdown complete.")
 
 

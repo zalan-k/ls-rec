@@ -1,9 +1,12 @@
 """Post what the recorder sees to the tenma archive.
 
-Two packets, one endpoint. `POST /api/ingest/capture` upserts on
-(platform, remote_id), so a start and a completion are the same call twice and
-replaying either is free — there is no ordering requirement and no way to make
-a duplicate.
+Two packets on one endpoint, plus a heartbeat on another.
+`POST /api/ingest/capture` upserts on (platform, remote_id), so a start and a
+completion are the same call twice and replaying either is free — there is no
+ordering requirement and no way to make a duplicate.
+
+`POST /api/ingest/live` is the odd one out and is documented at post_live():
+it is the only call here that must NOT be retried.
 
 The recorder is the ONLY thing that is present at both of these moments:
 
@@ -23,12 +26,14 @@ and is retried on the next poll tick.
 from __future__ import annotations
 
 import datetime
+import itertools
 import json
 import logging
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +116,9 @@ def _headers(config: dict) -> dict:
             "authorization": f"Bearer {config['archive_token']}"}
 
 
-def _post(config: dict, body: dict) -> dict | None:
+def _post(config: dict, body: dict, *, path: str = "/api/ingest/capture") -> dict | None:
     """One request. Returns the parsed response, or None on any failure."""
-    url = config["archive_url"].rstrip("/") + "/api/ingest/capture"
+    url = config["archive_url"].rstrip("/") + path
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers=_headers(config))
@@ -252,6 +257,106 @@ def post_done(config: dict, *, platform: str, video_id: str,
         logger.info(f"archive: wrapped #{r.get('index')} "
                     f"vod={r.get('vod_state')} chat={r.get('chat_state')}")
     return r
+
+
+# ── the heartbeat ─────────────────────────────────────────────────────────
+#
+# Not a packet in the sense the other two are, and the difference decides
+# everything about how it is sent.
+#
+# post_start and post_done record things that HAPPENED. They must eventually
+# land, nothing else in the world knows their numbers, and so they queue.
+#
+# This one records what is true RIGHT NOW, and a heartbeat that arrives late is
+# worse than one that never arrives at all: replaying a queued backlog would
+# walk the archive through a series of "she is live" claims that are every one
+# of them already false. So it never queues, never retries, and a failure is a
+# debug line rather than a warning — a long broadcast with an unreachable
+# archive would otherwise write one complaint per minute for five hours.
+#
+# The archive needs no help recovering. Every beat carries the FULL set of what
+# is recording, including the empty set, so a lost beat cannot strand a stuck
+# LIVE badge, and whatever it last heard expires on its own after three
+# intervals. There is no "stopped" event to send, and therefore none to forget.
+
+_BOOT_ID = uuid.uuid4().hex[:16]    # new on every process start
+_seq = itertools.count()
+_live_err: str | None = None        # last failure, so it is logged once not forever
+
+
+def post_live(config: dict, active_streams: dict, *,
+              interval_s: int | None = None) -> bool:
+    """Tell the archive what is being recorded at this instant.
+
+    `active_streams` is the recorder's own dict, passed straight in — every
+    field below already lives there, so this adds no state to track and cannot
+    drift from what is really running.
+    """
+    global _live_err
+    if not enabled(config):
+        return False
+
+    recording = []
+    for s in (active_streams or {}).values():
+        try:
+            recording.append({
+                "platform":  PLATFORM.get(s["platform"], str(s["platform"]).upper()[:2]),
+                "remote_id": s["identifier"],
+                # The archive's own stream index, so it can resolve this to the
+                # row post_start created without guessing.
+                "index":     s.get("obsidian_index"),
+                "title":     s.get("obsidian_title"),
+                "url":       s.get("url"),
+                # Sent for completeness; the archive prefers its OWN started_at
+                # for anything it measures against, and rightly so.
+                "broadcast_started_at": (int(s["_stream_start_epoch"])
+                                         if s.get("_stream_start_epoch") else None),
+                "record_started_at": (int(s["_record_start_epoch"])
+                                      if s.get("_record_start_epoch") else None),
+                # Recording, but the file has stopped growing. Still live —
+                # the badge should stay lit — but the archive is told the
+                # difference rather than left to assume all is well.
+                "stalled":   bool(s.get("_watchdog_triggered")),
+            })
+        except Exception as e:
+            # One malformed stream must not cost the whole heartbeat.
+            logger.debug(f"archive: leaving a stream out of the heartbeat: {e}")
+
+    body = {
+        "boot_id":    _BOOT_ID,
+        "seq":        next(_seq),
+        "sent_at":    int(datetime.datetime.now().timestamp()),
+        # What the archive multiplies by three to decide we have gone quiet.
+        # Sent rather than configured there, so changing the poll interval here
+        # does not silently start flapping the badge between beats.
+        "interval_s": int(interval_s or config.get("check_interval", 60)),
+        "recording":  recording,
+    }
+
+    try:
+        _post(config, body, path="/api/ingest/live")
+        _live_err = None
+        return True
+    except urllib.error.HTTPError as e:
+        # 4xx means the packet itself is wrong, which is a bug here and not a
+        # network condition. Worth saying out loud — but once, not every minute.
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        msg = f"HTTP {e.code} {detail}"
+        if msg != _live_err:
+            _live_err = msg
+            logger.warning(f"archive refused the heartbeat: {msg}")
+        return False
+    except Exception as e:
+        msg = type(e).__name__
+        if msg != _live_err:
+            _live_err = msg
+            logger.debug(f"archive heartbeat not delivered: {e}")
+        return False
+
 
 # ── reconciliation, for ls-audit ──────────────────────────────────────────
 #
