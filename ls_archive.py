@@ -684,3 +684,196 @@ def push_plan(config: dict, plan: dict) -> list[dict]:
     if skipped:
         logger.info(f"archive: left {len(skipped)} field(s) as they were")
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  JOBS — what the archive asks this machine to do
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The direction of everything above this line is recorder → archive: packets
+# about things that happened, which the archive stores. This half is the other
+# direction, and it is the only place where the archive gets to ask for
+# anything.
+#
+# It is still not allowed to TELL us anything. A job carries a kind, a snippet
+# id, a url and a couple of relative names — never a directory, never an
+# absolute path, never a command. Where the files are is this machine's
+# business and is resolved from this machine's config, and ls_jobs.py refuses
+# any name that does not stay inside the roots it resolved. That is the whole
+# security posture in one sentence: the archive publishes intent, and the
+# recorder decides what intent is allowed to mean.
+#
+# Claiming takes a five-minute lease. A worker that dies holding one frees it
+# when the lease lapses, and the job is handed to whoever asks next — so the
+# only thing that must not be lost is the REPORT. A report that never arrives
+# means work already done gets done again, which for a fetch is a second
+# download and for a purge is a file that is already gone. So reports retry,
+# and then spool, and are replayed before the next claim. The archive answers
+# `already: true` to a report it has already seen, so replaying one is free.
+
+JOBS_SPOOL_PATH = os.path.join(SCRIPT_DIR, ".archive_jobs_outbox.json")
+
+# What this machine is willing to be asked for. The archive has its own copy of
+# this list and will refuse to hand out anything else, but that copy is a
+# courtesy: this one is the one that decides.
+PI_KINDS = ("fetch", "promote", "purge")
+
+JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
+
+
+def _job_post(config: dict, path: str, body: dict) -> dict:
+    url = config["archive_url"].rstrip("/") + path
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers=_headers(config))
+    with urllib.request.urlopen(req, timeout=JOB_TIMEOUT) as r:
+        return json.loads(r.read().decode("utf-8") or "{}")
+
+
+# ── the spool ─────────────────────────────────────────────────────────────
+
+def _load_reports() -> list[dict]:
+    try:
+        with open(JOBS_SPOOL_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning(f"archive job spool unreadable, starting a new one: {e}")
+        return []
+
+
+def _save_reports(items: list[dict]) -> None:
+    try:
+        if not items:
+            if os.path.exists(JOBS_SPOOL_PATH):
+                os.remove(JOBS_SPOOL_PATH)
+            return
+        tmp = JOBS_SPOOL_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items[-OUTBOX_MAX:], f, ensure_ascii=False, indent=1)
+        os.replace(tmp, JOBS_SPOOL_PATH)
+    except Exception as e:
+        logger.warning(f"could not write the archive job spool: {e}")
+
+
+def spooled_reports() -> int:
+    """How many finished jobs have not been reported. For the status line."""
+    return len(_load_reports())
+
+
+def flush_reports(config: dict) -> int:
+    """Replay anything the archive did not hear. Call before claiming.
+
+    Before, and not after: a spooled report is about a job whose lease may be
+    about to lapse, and telling the archive it is done is what stops it being
+    handed out again.
+    """
+    if not enabled(config):
+        return 0
+    items = _load_reports()
+    if not items:
+        return 0
+    sent = 0
+    for i, item in enumerate(items):
+        try:
+            _job_post(config, f"/api/ingest/jobs/{item['job_id']}", item["body"])
+        except urllib.error.HTTPError as e:
+            # 404 means the job is gone from the archive entirely — there is
+            # nothing left to tell, and keeping the report forever would mean
+            # never draining the spool.
+            if e.code == 404:
+                sent += 1
+                continue
+            _save_reports(items[i:])
+            return sent
+        except Exception:
+            _save_reports(items[i:])
+            if sent:
+                logger.info(f"archive: reported {sent}, {len(items) - sent} still waiting")
+            return sent
+        sent += 1
+    _save_reports([])
+    logger.info(f"archive: reported {sent} finished job(s) from the spool")
+    return sent
+
+
+# ── claiming ──────────────────────────────────────────────────────────────
+
+def claim_jobs(config: dict, *, worker: str, kinds=PI_KINDS, limit: int = 1) -> list[dict]:
+    """Take a lease on up to `limit` jobs. Never raises.
+
+    An empty list is the normal answer and is not worth a log line — this is
+    polled every few seconds and the queue is empty almost always.
+    """
+    if not enabled(config):
+        return []
+    wanted = [k for k in kinds if k in PI_KINDS]
+    if not wanted:
+        return []
+    try:
+        r = _job_post(config, "/api/ingest/jobs/claim",
+                      {"worker": worker, "kinds": wanted, "limit": int(limit)})
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        logger.warning(f"archive refused the claim: HTTP {e.code} {detail}")
+        return []
+    except Exception as e:
+        logger.debug(f"archive not reachable for a claim: {e}")
+        return []
+    jobs = r.get("jobs") or []
+    if jobs:
+        logger.info("archive: claimed " + ", ".join(
+            f"{j.get('kind')} {j.get('id', '')[:8]}" for j in jobs))
+    return jobs
+
+
+# ── reporting ─────────────────────────────────────────────────────────────
+
+def report_job(config: dict, job_id: str, status: str, *,
+               result_path: str | None = None, error: str | None = None) -> bool:
+    """Say what happened. Spools rather than gives up.
+
+    `status` is 'done' or 'failed' and both are terminal at the archive — there
+    is no "try again later", because the thing that decides whether to try
+    again is the human looking at the queue. A fetch that failed because
+    YouTube was rate-limiting is a fetch somebody re-presses the button for.
+    """
+    if not enabled(config):
+        return False
+    body: dict = {"status": status}
+    if result_path:
+        body["result_path"] = str(result_path)
+    if error:
+        body["error"] = str(error)[:4000]
+    try:
+        _job_post(config, f"/api/ingest/jobs/{job_id}", body)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            logger.warning(f"archive does not know job {job_id[:8]}; dropping the report")
+            return False
+        # 4xx otherwise is a bug in this file, and spooling a packet the
+        # archive will refuse forever is how a spool stops draining.
+        if e.code < 500:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+            logger.error(f"archive refused the report: HTTP {e.code} {detail}")
+            return False
+    except Exception as e:
+        logger.warning(f"archive unreachable for the report on {job_id[:8]}: {e}")
+    items = _load_reports()
+    items.append({"job_id": job_id, "queued_at": int(datetime.datetime.now().timestamp()),
+                  "body": body})
+    _save_reports(items)
+    logger.warning(f"archive: spooled the {status} report for {job_id[:8]} "
+                   f"({len(items)} waiting)")
+    return False
