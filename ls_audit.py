@@ -283,9 +283,7 @@ def scan_nas(config: dict, index: int) -> dict:
 
     # The merged chat, and the raws the merge moved to deep storage. Without
     # these an archived entry looks like one whose chat was never captured.
-    merged = f"{idx_padded}_merged-chat.json"
-    if os.path.exists(os.path.join(nas, merged)):
-        found["merged_chat"] = merged
+    found["merged_chat"] = find_merged_chat(nas, index)
 
     arch = config.get("chat_archive_path")
     if arch:
@@ -1138,25 +1136,75 @@ def _cache_zeros(cache: list[dict], yt_id: str | None,
     return out
 
 
-def _write_gz(path: str) -> float | None:
-    """Write `path`.gz beside the merged chat. Returns its size in MB, or None.
+MERGED_SUFFIXES = (".json.gz", ".json")
 
-    The archive serves this file and nothing in its stack compresses: express
-    with one dependency and no proxy of its own. A merged chat is the most
-    compressible thing in the whole archive — a megabyte of repeated names and
-    repeated words, about an eighth of that gzipped — so the difference is a
-    second of loading versus none, on every viewer, forever.
+
+def merged_chat_name(index: int) -> str:
+    return f"{int(index):03d}_merged-chat.json"
+
+
+def find_merged_chat(nas_root: str, index: int) -> str | None:
+    """The merged chat for this entry, compressed for preference.
+
+    Both spellings exist in the wild: everything merged from now on is written
+    compressed and only compressed, and everything merged before that is a
+    plain .json sitting on the NAS. Neither is wrong and the archive reads
+    both, so this looks for the good one and settles for the old one.
+    """
+    base = merged_chat_name(index)
+    for name in (base + ".gz", base):
+        if os.path.exists(os.path.join(nas_root, name)):
+            return name
+    return None
+
+
+def _write_merged(path: str, res: dict) -> tuple[str, float] | None:
+    """Write the merged chat, compressed, and return (path, MB).
+
+    Compressed and NOT also plain. The archive serves this file and nothing in
+    its stack compresses — express with one dependency and no proxy of its own
+    — and a merged chat is the most compressible thing in the whole archive: a
+    megabyte of repeated names and repeated words, about an eighth of that
+    gzipped. Keeping the plain copy as well would be eight times the bytes on
+    a 21 TB NAS for a file nothing reads, and a second thing to keep in step.
 
     Doing it here follows the rule the rest of the media follows: the recorder
-    writes under the media root, the container only ever reads. Compressing on
-    the server instead would spend the same CPU on every request for a file
-    that changes about once.
+    writes under the media root, the container only ever reads.
 
     Written to a .part and renamed, because rename is atomic and a half-written
-    .gz served as a complete one is a truncated JSON parse in somebody's
-    browser with nothing on either side saying why. Failure is not fatal: the
-    route falls back to the plain file, which is always there.
+    file served as a complete one is a truncated parse in somebody's browser
+    with nothing on either side saying why.
     """
+    dest = path if path.endswith(".gz") else path + ".gz"
+    tmp = dest + ".part"
+    try:
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=9) as f:
+            json.dump(res, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, dest)
+    except OSError as e:
+        print(f"  ✗ could not write {os.path.basename(dest)} ({e})")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return None
+    # The plain twin from a previous merge is now stale — it describes an
+    # earlier merge of the same entry — and a stale chat served as the current
+    # one is worse than no chat. Only ever the twin of what was just written.
+    plain = dest[:-3]
+    if plain != dest and os.path.exists(plain):
+        try:
+            os.remove(plain)
+            print(f"  · removed {os.path.basename(plain)}, "
+                  f"superseded by the compressed one")
+        except OSError as e:
+            print(f"  ⚠ {os.path.basename(plain)} is stale and would not delete ({e})")
+    return dest, os.path.getsize(dest) / (1024 * 1024)
+
+
+def _write_gz(path: str) -> float | None:
+    """Compress an existing merged chat that was written plain. Kept for the
+    entries that already are."""
     tmp, dest = path + ".gz.part", path + ".gz"
     # Dropped FIRST, not overwritten. This only ever runs straight after the
     # merge rewrote the json, so any .gz already here describes the previous
@@ -1306,12 +1354,11 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
 
     if not output:
         output = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
-    with open(output, "w", encoding="utf-8") as f:
-        json.dump(res, f, ensure_ascii=False, indent=1)
-    size = os.path.getsize(output) / (1024 * 1024)
-    gz = _write_gz(output)
-    print(f"\n  ✔ {os.path.basename(output)}  ({size:.1f}MB"
-          + (f", {gz:.1f}MB gzipped)" if gz is not None else ")"))
+    wrote = _write_merged(output, res)
+    if wrote is None:
+        return
+    output, size = wrote
+    print(f"\n  ✔ {os.path.basename(output)}  ({size:.1f}MB)")
 
     # The pictures this file only names. Straight from the metadata in hand
     # rather than by re-reading what was just written, and after the file is on
@@ -1685,9 +1732,8 @@ def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
     # The merged chat is a property of the broadcast, not of one platform, so
     # it lives on the stream. It is also the only chat the site serves.
     nas_root = config.get("nas_path", "")
-    merged_name = f"{int(index):03d}_merged-chat.json"
-    merged_rel = (ls_archive.archive_path(config, merged_name)
-                  if os.path.exists(os.path.join(nas_root, merged_name)) else None)
+    merged_name = find_merged_chat(nas_root, index)
+    merged_rel = ls_archive.archive_path(config, merged_name) if merged_name else None
 
     for prefix, platform, vid, no_it in (
             ("yt", "youtube", yt_id, entry.get("no_yt")),

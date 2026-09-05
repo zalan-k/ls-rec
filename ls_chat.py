@@ -18,6 +18,7 @@ never modified.
 
 import argparse
 import datetime
+import gzip
 import json
 import os
 import re
@@ -87,11 +88,15 @@ class Msg:
     notice: Optional[str] = None
     params: Optional[dict] = None
     system_message: Optional[str] = None
+    # YouTube's own card colours, where the source stated them. Only paid
+    # messages and memberships carry these, so they cost nothing on the
+    # ordinary line of chat.
+    colors: Optional[dict] = None
 
 
 _OPTIONAL = ("id", "author", "badges", "text", "amount", "currency", "tier",
              "months", "count", "recipient", "viewers", "pinned_by", "user",
-             "duration", "notice", "params", "system_message")
+             "duration", "notice", "params", "system_message", "colors")
 
 
 def serialize(m: Msg, origin: str = "") -> dict:
@@ -134,7 +139,11 @@ def read_header(path: str, max_bytes: int = MERGED_HEAD_BYTES) -> Optional[dict]
     """
     try:
         buf, size = [], 0
-        with open(path, "r", encoding="utf-8") as f:
+        # The merged file is written compressed and the archive serves it that
+        # way; the plain one is what entries merged before that still have.
+        opener = (lambda: gzip.open(path, "rt", encoding="utf-8")) \
+            if path.endswith(".gz") else (lambda: open(path, "r", encoding="utf-8"))
+        with opener() as f:
             for line in f:
                 if line.rstrip("\n") == ' "messages": [':
                     buf.append(' "messages": []}')
@@ -731,6 +740,34 @@ class TdcConverter(Converter):
 
 # ── yt-dlp live_chat ──────────────────────────────────────────────────────
 
+# What YouTube calls them, and what the renderer wants to call them. Only the
+# keys actually present are kept: a membership card states two backgrounds and
+# no author colour, and inventing the missing ones would be the archive
+# claiming to know something it was not told.
+_YT_COLORS = {
+    "headerBackgroundColor": "header_bg",
+    "headerTextColor": "header_text",
+    "bodyBackgroundColor": "body_bg",
+    "bodyTextColor": "body_text",
+    "authorNameTextColor": "name",
+}
+
+
+def _yt_colors(r: dict) -> Optional[dict]:
+    """The card's colours, as #RRGGBB.
+
+    They arrive as unsigned ARGB integers — 4293271831 is 0xFFE62117, the red
+    of a $100 card. The alpha is always opaque on these and is dropped rather
+    than carried as a byte nobody reads.
+    """
+    out = {}
+    for key, name in _YT_COLORS.items():
+        v = r.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            out[name] = f"#{v & 0xFFFFFF:06X}"
+    return out or None
+
+
 def _yt_thumb(node) -> Optional[str]:
     """The largest URL in one of YouTube's `{thumbnails: [...]}` blocks.
 
@@ -894,7 +931,8 @@ class YtdlpConverter(Converter):
         return Msg(type="superchat", ts=ts, abs_ms=self._abs(r), id=r.get("id"),
                    author=self._author(r), badges=self._badges(r) or None,
                    text=self._runs((r.get("message") or {}).get("runs")) or None,
-                   amount=amount, currency=currency, hearted=hearted)
+                   amount=amount, currency=currency, hearted=hearted,
+                   colors=_yt_colors(r))
 
     def _sticker(self, r, ts) -> Msg:
         """A paid sticker. Same money as a superchat with no words in it —
@@ -903,12 +941,16 @@ class YtdlpConverter(Converter):
             (r.get("purchaseAmountText") or {}).get("simpleText", ""))
         return Msg(type="superchat", ts=ts, abs_ms=self._abs(r), id=r.get("id"),
                    author=self._author(r), badges=self._badges(r) or None,
-                   text=None, amount=amount, currency=currency)
+                   text=None, amount=amount, currency=currency,
+                   colors=_yt_colors(r))
 
     def _member(self, r, ts) -> Msg:
         header = r.get("headerPrimaryText") or {}
         kw = dict(ts=ts, abs_ms=self._abs(r), id=r.get("id"),
-                  author=self._author(r), badges=self._badges(r) or None, tier=1)
+                  author=self._author(r), badges=self._badges(r) or None, tier=1,
+                  # A membership card is two greens, and which two is the
+                  # renderer's to say rather than ours to hardcode.
+                  colors=_yt_colors(r))
         if header:
             text = "".join(x.get("text", "") for x in header.get("runs") or [])
             m = re.search(r"(\d+)", text)

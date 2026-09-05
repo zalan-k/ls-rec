@@ -49,6 +49,19 @@ having no network; nothing is recorded and the sweep stops, because writing six
 hundred tombstones for pictures that are all still there would then take a week
 to expire.
 
+## The merged chat is written compressed, and only compressed
+
+`ls-audit N --merge-chat` writes `NNN_merged-chat.json.gz` and nothing else.
+It is the most compressible file in the archive — a megabyte of repeated names
+and repeated words, about an eighth of that gzipped — and nothing in the
+archive's stack compresses, so the plain copy was eight times the bytes for a
+file no browser ever asked for. The archive serves the compressed one as it
+sits and gunzips on the way out for the rare client that cannot take it.
+
+Both spellings are read. Everything merged before this is a plain `.json` and
+keeps working; a re-merge replaces it with the compressed one and removes the
+plain twin, which by then describes an earlier merge of the same entry.
+
 ## ls_jobs.py — the archive's other half
 
 The tenma archive holds no write handle inside the media tree; `/media` is
