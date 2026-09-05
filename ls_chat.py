@@ -58,7 +58,8 @@ def is_derived(filename: str) -> bool:
 
 @dataclass
 class Msg:
-    type: str                       # chat superchat sub resub gift raid pinned ban
+    type: str                       # chat superchat sub resub gift raid pinned
+                                    # ban notice
     ts: int                         # ms from source zero
     abs_ms: Optional[int] = None    # epoch ms
     id: Optional[str] = None
@@ -78,11 +79,19 @@ class Msg:
     pinned_by: Optional[str] = None
     user: Optional[dict] = None
     duration: Optional[int] = None
+    # type='notice' only. `notice` is Twitch's own msg-id and `params` is
+    # whatever msg-param-* arrived with it, key prefix stripped. Deliberately
+    # untyped: the point of keeping an unrecognised notice is that nobody has
+    # to have modelled it first, and a schema that insisted on modelling it
+    # would be the same hole in a different shape.
+    notice: Optional[str] = None
+    params: Optional[dict] = None
+    system_message: Optional[str] = None
 
 
 _OPTIONAL = ("id", "author", "badges", "text", "amount", "currency", "tier",
              "months", "count", "recipient", "viewers", "pinned_by", "user",
-             "duration")
+             "duration", "notice", "params", "system_message")
 
 
 def serialize(m: Msg, origin: str = "") -> dict:
@@ -102,6 +111,43 @@ def serialize(m: Msg, origin: str = "") -> dict:
     if m.hearted:
         d["hearted"] = True
     return d
+
+
+# A merged file's header is `metadata`, and merge() writes it before
+# `messages` precisely so that it can be read on its own. 8 MB is a ceiling
+# rather than an expectation: the header is kilobytes, and anything past this
+# is a file whose shape we no longer recognise.
+MERGED_HEAD_BYTES = 8 * 1024 * 1024
+
+
+def read_header(path: str, max_bytes: int = MERGED_HEAD_BYTES) -> Optional[dict]:
+    """A merged file's `metadata`, without reading the messages.
+
+    cmd_merge_chat writes with indent=1, so the array opens on a line of its
+    own and everything before it is the header — kilobytes at the front of a
+    file that can be hundreds of megabytes. Read to that line, close the object
+    by hand, parse.
+
+    Returns None rather than raising, and rather than guessing: every caller
+    of this would sooner record a gap than a value it inferred from a file it
+    did not recognise.
+    """
+    try:
+        buf, size = [], 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.rstrip("\n") == ' "messages": [':
+                    buf.append(' "messages": []}')
+                    break
+                size += len(line)
+                if size > max_bytes:
+                    return None
+                buf.append(line)
+            else:
+                return None
+        return json.loads("".join(buf))["metadata"]
+    except Exception:
+        return None
 
 
 def emote_token(name: str) -> str:
@@ -291,8 +337,11 @@ class Converter:
 
     def __init__(self):
         self.messages: list[Msg] = []
-        self.emotes: dict[str, str] = {}
-        self.badges: dict[str, str] = {}
+        # token -> {"id": ..., "url": ...}. `url` only where the id does not
+        # determine it; see _emote().
+        self.emotes: dict[str, dict] = {}
+        # key -> {"title": ..., "url"|"icon"|"set"+"version": ...}; see _badge().
+        self.badges: dict[str, dict] = {}
         self.deletions: dict[str, int] = {}
         self.bans: dict[str, int] = {}
         self.zero_ms: Optional[int] = None
@@ -327,6 +376,53 @@ class Converter:
         for m in self.messages:
             if m.abs_ms is None:
                 m.abs_ms = zero_ms + m.ts
+
+    def _emote(self, tok: str, eid, url: Optional[str] = None):
+        """Note where an emote's picture can be fetched from.
+
+        Merging rather than assigning, because the same token arrives many
+        times in one file and not every occurrence carries the same detail: a
+        YouTube run without an `image` block would otherwise overwrite a good
+        URL with nothing, and the loss would be invisible until a harvest
+        months later came up empty.
+
+        Twitch stores no URL on purpose. The id IS the address —
+        static-cdn.jtvnw.net/emoticons/v2/<id>/... — so writing it out would be
+        the same string in two places, and the one that rots is the copy.
+        """
+        cur = self.emotes.setdefault(tok, {})
+        if eid:
+            cur["id"] = str(eid)
+        if url and not cur.get("url"):
+            cur["url"] = url
+        return cur
+
+    def _badge(self, key: str, title: str, **rest):
+        """Note a badge, and whatever this source knows about its picture.
+
+        The three platforms know three different things, and none of them
+        knows nothing:
+
+          YouTube member badges carry the image URL inline (`url`), which is
+            the only place it will ever exist once the raw dump is archived.
+          YouTube's built-ins carry an `icon` type instead — MODERATOR, OWNER,
+            VERIFIED — because they are the same three pictures on every
+            channel and there is nothing to fetch.
+          Twitch carries neither. Its badge images come from Helix, keyed by
+            set and version, so those are recorded HERE rather than split back
+            out of the joined key later — `sub-gifter_1` and `predictions_
+            blue-1` do not come apart the same way, and a harvester guessing
+            wrong just fetches nothing and says the badge is gone.
+
+        Merged, not assigned, for the same reason _emote() merges.
+        """
+        cur = self.badges.setdefault(key, {})
+        if title and not cur.get("title"):
+            cur["title"] = title
+        for k, v in rest.items():
+            if v and not cur.get(k):
+                cur[k] = v
+        return cur
 
     def result(self) -> dict:
         return {
@@ -366,8 +462,20 @@ def _irc_abs(item: dict) -> Optional[int]:
 class IrcConverter(Converter):
     platform, fmt = "twitch", IRC
 
+    def __init__(self):
+        super().__init__()
+        # None means the capture predates the header, which is the same thing
+        # as saying it predates the parser fix — so it saw PRIVMSG and nothing
+        # else, and the absence of deletions in it means nothing at all.
+        self.recorder = None
+
     def convert(self, path):
         items = self._load(path)
+        for it in items:
+            if it.get("message_type") == "_meta":
+                self.recorder = it.get("recorder")
+                self.meta["recorder"] = self.recorder
+                break
         bombs = set()
         for it in items:
             mt = it.get("message_type")
@@ -426,9 +534,10 @@ class IrcConverter(Converter):
     def _badges(self, it) -> list:
         out = []
         for b in (it.get("author") or {}).get("badges") or []:
-            key = f"{b.get('name', '')}_{b.get('version', '1')}"
+            name, version = b.get("name", ""), str(b.get("version", "1"))
+            key = f"{name}_{version}"
             out.append(key)
-            self.badges[key] = b.get("title") or b.get("name", "")
+            self._badge(key, b.get("title") or name, set=name, version=version)
         return out
 
     def _text(self, text, emotes) -> str:
@@ -449,7 +558,7 @@ class IrcConverter(Converter):
                 continue
             tok = emote_token(name)
             raw = raw[:start] + tok.encode("utf-8") + raw[end:]
-            self.emotes[tok] = eid
+            self._emote(tok, eid)
         return raw.decode("utf-8", errors="replace")
 
     def _one(self, it, bombs) -> Optional[Msg]:
@@ -502,6 +611,16 @@ class IrcConverter(Converter):
             return Msg(type="ban", **base,
                        user={"id": str(a["target_id"]), "name": a.get("name", "")},
                        duration=it.get("ban_duration"))
+
+        # A notice the recorder did not have a name for. It kept the msg-id and
+        # the params rather than dropping the line, and so does this.
+        if mt == "notice":
+            return Msg(type="notice", **base, author=self._author(it),
+                       badges=self._badges(it) or None,
+                       text=self._text(it.get("message") or "", it.get("emotes")) or None,
+                       notice=it.get("notice"),
+                       params=it.get("notice_params") or None,
+                       system_message=it.get("system_message"))
         return None
 
 
@@ -578,7 +697,8 @@ class TdcConverter(Converter):
             # Titled the same way the live recorder titles them, so a stream
             # merged from both sources does not carry two spellings of
             # `subscriber` for the renderer to reconcile.
-            self.badges[key] = bid.replace("-", " ").replace("_", " ").title()
+            self._badge(key, bid.replace("-", " ").replace("_", " ").title(),
+                        set=bid, version=str(b.get("version", "1")))
 
         parts = []
         for fr in m.get("fragments") or []:
@@ -586,7 +706,7 @@ class TdcConverter(Converter):
             if emo and emo.get("emoticon_id"):
                 tok = emote_token(text.strip())
                 parts.append(tok)
-                self.emotes[tok] = emo["emoticon_id"]
+                self._emote(tok, emo["emoticon_id"])
             else:
                 parts.append(text)
 
@@ -610,6 +730,26 @@ class TdcConverter(Converter):
 
 
 # ── yt-dlp live_chat ──────────────────────────────────────────────────────
+
+def _yt_thumb(node) -> Optional[str]:
+    """The largest URL in one of YouTube's `{thumbnails: [...]}` blocks.
+
+    Largest, because these are 24px and 48px and the archive keeps the file
+    once — a picture can be scaled down later and cannot be scaled up. Chosen
+    by area rather than by taking the last entry: the order is YouTube's
+    convention, not a promise, and a convention is not worth betting two
+    hundred entries of emotes and badges on.
+    """
+    thumbs = ((node or {}).get("thumbnails")) or []
+    best = max((t for t in thumbs if t.get("url")),
+               key=lambda t: (t.get("width") or 0) * (t.get("height") or 0),
+               default=None)
+    return best.get("url") if best else None
+
+
+def _yt_emote_url(e: dict) -> Optional[str]:
+    return _yt_thumb(e.get("image"))
+
 
 class YtdlpConverter(Converter):
     platform, fmt = "youtube", YTDLP
@@ -705,11 +845,18 @@ class YtdlpConverter(Converter):
     def _badges(self, r) -> list:
         out = []
         for b in r.get("authorBadges") or []:
-            tip = (b.get("liveChatAuthorBadgeRenderer") or {}).get("tooltip") or ""
-            if tip:
-                key = "yt_" + re.sub(r"[^a-z0-9]+", "_", tip.lower()).strip("_")
-                out.append(key)
-                self.badges[key] = tip
+            br = b.get("liveChatAuthorBadgeRenderer") or {}
+            tip = br.get("tooltip") or ""
+            if not tip:
+                continue
+            key = "yt_" + re.sub(r"[^a-z0-9]+", "_", tip.lower()).strip("_")
+            out.append(key)
+            # A member badge is a picture the channel uploaded and this dump is
+            # the only thing that knows its address; a moderator badge is one of
+            # three pictures YouTube draws everywhere and has no address at all.
+            self._badge(key, tip,
+                        url=_yt_thumb(br.get("customThumbnail")),
+                        icon=((br.get("icon") or {}).get("iconType") or None))
         return out
 
     def _runs(self, runs) -> str:
@@ -724,7 +871,12 @@ class YtdlpConverter(Converter):
                     sc = e.get("shortcuts") or []
                     tok = emote_token(sc[0].strip(":") if sc else "emoji")
                     parts.append(tok)
-                    self.emotes[tok] = eid
+                    # The URL is the whole point here. A YouTube emojiId is
+                    # `<channelId>/<hash>` and there is no public formula that
+                    # turns it into a picture — the address is only ever stated
+                    # in the dump, right here, and this is the last moment it
+                    # exists before the raws leave for deep storage.
+                    self._emote(tok, eid, _yt_emote_url(e))
                 else:
                     parts.append(eid)
         return "".join(parts)
@@ -850,6 +1002,22 @@ def convert_file(path: str, zero_ms: Optional[int] = None) -> Converter:
 
 # ── merge ─────────────────────────────────────────────────────────────────
 
+def _fold(into: dict, src: dict) -> None:
+    """Combine two dictionaries of records, keeping whatever is already known.
+
+    dict.update() would let whichever converter happened to run second decide
+    everything, and they do not know the same things: one YouTube stream can
+    arrive as a live dump and a post-hoc one, and only the live dump reliably
+    carries emote and badge images. Losing a URL that way is invisible until a
+    harvest months later comes up empty.
+    """
+    for key, rec in src.items():
+        cur = into.setdefault(key, {})
+        for k, v in rec.items():
+            if v and not cur.get(k):
+                cur[k] = v
+
+
 # How far apart two recordings of one message may be and still be one
 # message. tmi-sent-ts and the VOD comment's created_at are the same instant
 # recorded by two systems; a couple of seconds covers the disagreement without
@@ -964,24 +1132,80 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             if m.id:
                 seen.add((c.platform, m.id))
             d = serialize(m, origin=c.platform)
-            d["ts"] = m.abs_ms - ref
+            # Neither of these travels in a merged file.
+            #
+            # `ts` is abs_ms minus a zero that is sitting in the metadata three
+            # lines away, so it is the same number written twice. `id` is a
+            # dedupe key that has finished its work by the time it gets here —
+            # and being random, it is the one field gzip cannot compress, which
+            # made it a fifth of the bytes on the wire for nothing.
+            #
+            # Between them, 1.19 MB becomes 0.71, and 242 KB gzipped becomes
+            # 116. Re-merging from the captures is what recovers either.
+            d.pop("ts", None)
+            d.pop("id", None)
             out.append(d)
-    out.sort(key=lambda d: d["ts"])
+    out.sort(key=lambda d: d["abs_ms"])
 
     emotes: dict[str, dict] = {}
     badges: dict[str, dict] = {}
     for c in convs:
         # Nested by platform: the ID namespaces differ, so a renderer needs
         # the origin to resolve one. Also fewer bytes than prefixed keys.
-        emotes.setdefault(c.platform, {}).update(c.emotes)
-        badges.setdefault(c.platform, {}).update(c.badges)
+        #
+        # Per token rather than dict.update(), for the reason _emote() merges:
+        # one YouTube stream can arrive as a live dump and a post-hoc one, and
+        # only the live dump reliably carries emote images. update() would let
+        # whichever converter happened to run second decide, silently.
+        _fold(emotes.setdefault(c.platform, {}), c.emotes)
+        _fold(badges.setdefault(c.platform, {}), c.badges)
+
+    # complete > unknown > none: if any source for a platform could see
+    # moderation, that platform's history is as good as its best source.
+    rank = {"none": 0, "unknown": 1, "complete": 2}
+    moderation = {}
+    for c in convs:
+        if c.fmt == YTDLP:
+            # Both the live and the post-hoc dumps carry
+            # markChatItemAsDeletedAction, so YouTube has always had this.
+            v = "complete"
+        elif c.fmt == TDC:
+            # Twitch's VOD comments are comments. A deleted message is simply
+            # absent, which is indistinguishable from never having been sent.
+            v = "none"
+        else:
+            v = "complete" if (getattr(c, "recorder", None) or 0) >= 2 else "unknown"
+        if rank[v] > rank.get(moderation.get(c.platform, "none"), 0):
+            moderation[c.platform] = v
+        moderation.setdefault(c.platform, v)
 
     return {
         "metadata": {
             "merged": True,
+            # 1 carried `ts` and `id` per message. 2 does not, and says what it
+            # knows about moderation. A reader can tell them apart by this or,
+            # failing that, by whether a message has an `id`.
+            "version": 2,
             "zero_epoch_ms": ref,
             "zero_source": ref_src,
+            # Per platform, because it is a property of how that platform was
+            # captured — and the difference between "nothing was deleted" and
+            # "this log cannot say" is exactly the kind of claim this archive
+            # refuses to fudge elsewhere.
+            #
+            #   complete  the source records deletions and bans
+            #   none      it cannot: a VOD download has no moderation history
+            #   unknown   a live Twitch capture from before the recorder could
+            #             see CLEARCHAT and CLEARMSG at all
+            "moderation": moderation,
             "messages": len(out),
+            # When the first and last message landed, so a reader can place the
+            # log against a stream — and decide whether to fetch it at all —
+            # without opening the array. Absolute, like the messages: the zero
+            # is three lines up and subtracting it here would just be the same
+            # number written a third way.
+            "first_abs_ms": out[0]["abs_ms"] if out else None,
+            "last_abs_ms": out[-1]["abs_ms"] if out else None,
             "duplicates_removed": dupes,
             "unplaced_no_abs": unplaced,
             "sources": [{"file": os.path.basename(p), "platform": c.platform,
@@ -1045,8 +1269,15 @@ def main():
         if md["unplaced_no_abs"]:
             print(f"  UNPLACED  {md['unplaced_no_abs']:,} (no absolute time, omitted)")
         if res["messages"]:
-            lo, hi = res["messages"][0]["ts"], res["messages"][-1]["ts"]
+            z = md["zero_epoch_ms"]
+            lo = res["messages"][0]["abs_ms"] - z
+            hi = res["messages"][-1]["abs_ms"] - z
             print(f"  range     {lo / 1000:.0f}s to {hi / 1000:.0f}s")
+        for plat, how in sorted(md["moderation"].items()):
+            if how != "complete":
+                print(f"  MODERATION {plat}: {how}"
+                      + ("  (a VOD download has none)" if how == "none"
+                         else "  (capture predates the recorder fix)"))
         if args.stats:
             return
         out = args.output or os.path.splitext(args.inputs[0])[0] + ".merged.json"

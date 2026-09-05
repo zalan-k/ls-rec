@@ -12,12 +12,13 @@ Usage:
     ls-audit --cache-info ID                Look up cached video by ID
 """
 
-import os, re, glob, sys, json, shutil, subprocess, datetime, argparse, calendar, logging
+import os, re, glob, gzip, sys, json, shutil, subprocess, datetime, argparse, calendar, logging
 from yt_dlp.utils import sanitize_filename
 
 import ls_common
 import ls_chat
 import ls_archive
+import ls_assets
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1137,6 +1138,57 @@ def _cache_zeros(cache: list[dict], yt_id: str | None,
     return out
 
 
+def _write_gz(path: str) -> float | None:
+    """Write `path`.gz beside the merged chat. Returns its size in MB, or None.
+
+    The archive serves this file and nothing in its stack compresses: express
+    with one dependency and no proxy of its own. A merged chat is the most
+    compressible thing in the whole archive — a megabyte of repeated names and
+    repeated words, about an eighth of that gzipped — so the difference is a
+    second of loading versus none, on every viewer, forever.
+
+    Doing it here follows the rule the rest of the media follows: the recorder
+    writes under the media root, the container only ever reads. Compressing on
+    the server instead would spend the same CPU on every request for a file
+    that changes about once.
+
+    Written to a .part and renamed, because rename is atomic and a half-written
+    .gz served as a complete one is a truncated JSON parse in somebody's
+    browser with nothing on either side saying why. Failure is not fatal: the
+    route falls back to the plain file, which is always there.
+    """
+    tmp, dest = path + ".gz.part", path + ".gz"
+    # Dropped FIRST, not overwritten. This only ever runs straight after the
+    # merge rewrote the json, so any .gz already here describes the previous
+    # merge — and a failure below that left it in place would have the archive
+    # serving last week's chat to anyone whose browser asked for gzip, with
+    # the correct file sitting right beside it. No .gz is a slower page; a
+    # stale one is a wrong one.
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+    try:
+        with open(path, "rb") as src, gzip.open(tmp, "wb", compresslevel=9) as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+        os.replace(tmp, dest)
+        return os.path.getsize(dest) / (1024 * 1024)
+    except OSError as e:
+        print(f"  ⚠ could not write {os.path.basename(path)}.gz ({e})")
+        for leftover in (tmp, dest):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+        # Only reachable if the filesystem refused the delete as well, which is
+        # the one state worth shouting about: the archive would serve this to
+        # every browser that asks for gzip, and it is not the file beside it.
+        if os.path.exists(dest):
+            print(f"  ✗ {os.path.basename(dest)} is STALE and could not be removed — "
+                  f"delete it by hand before the archive serves it")
+        return None
+
+
 def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
     """
     Move raw captures to deep storage once the merge holds them.
@@ -1189,7 +1241,8 @@ def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
 
 def cmd_merge_chat(config: dict, index: int, ref="youtube",
                    zeros: list | None = None, output: str | None = None,
-                   dry_run: bool = False, keep_raw: bool = False):
+                   dry_run: bool = False, keep_raw: bool = False,
+                   assets: bool = True):
     """Merge this entry's chat captures into one origin-tagged file."""
     nas_root = config.get("nas_path", "")
     print(f"\n{'=' * 60}")
@@ -1256,7 +1309,16 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
     with open(output, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=1)
     size = os.path.getsize(output) / (1024 * 1024)
-    print(f"\n  ✔ {os.path.basename(output)}  ({size:.1f}MB)")
+    gz = _write_gz(output)
+    print(f"\n  ✔ {os.path.basename(output)}  ({size:.1f}MB"
+          + (f", {gz:.1f}MB gzipped)" if gz is not None else ")"))
+
+    # The pictures this file only names. Straight from the metadata in hand
+    # rather than by re-reading what was just written, and after the file is on
+    # disk rather than before: a failure here is a slower-looking chat, and a
+    # merge that did not get written is a lost one.
+    if assets:
+        ls_assets.harvest(config, res["metadata"])
 
     if keep_raw:
         print("  Raw chats kept (--keep-raw).\n")
@@ -1546,32 +1608,38 @@ def _vault_epoch(date_obj, tz_min: int | None) -> int | None:
 MERGED_CHAT_HEAD_BYTES = 8 * 1024 * 1024
 
 
-def _merged_chat_sources(path: str) -> str | None:
-    """Which platforms are inside a merged chat, without reading the messages.
+# Whole numbers the archive will accept, and the smallest each may be. The
+# server enforces the same floors and 400s on anything else; sending a value
+# it will refuse is a sweep that fails every time it runs.
+_CHAT_META_INTS = (("version", "chat_version", 1),
+                   ("messages", "chat_messages", 0),
+                   ("first_abs_ms", "chat_first_ms", 0),
+                   ("last_abs_ms", "chat_last_ms", 0))
+_MODERATION = ("complete", "none", "unknown")
 
-    ls_chat.merge() serialises `metadata` before `messages`, and cmd_merge_chat
-    writes it with indent=1, so the sources are in the first few kilobytes of a
-    file that can be hundreds of megabytes. Read up to the messages array,
-    close the object, and parse that.
 
-    Deliberately best-effort. If the format ever changes this returns None and
-    the caller simply does not send chat_sources, which is a gap rather than a
-    lie.
+def _merged_chat_meta(path: str) -> dict | None:
+    """What a merged chat says about itself, without reading the messages.
+
+    The header read itself lives in ls_chat, which owns the format. This turns
+    it into the archive's vocabulary.
+
+    Returns the archive's own field names, ready to merge into stream_fields —
+    the caller should not have to know that `first_abs_ms` in the file is
+    `chat_first_ms` in the database.
+
+    Deliberately best-effort, and per field rather than all-or-nothing: a v1
+    file has no `moderation` and no span, and the right outcome there is four
+    fields sent and two left alone, not a stream the archive knows nothing
+    about. If the format changes past recognition this returns None and the
+    caller sends nothing, which is a gap rather than a lie.
     """
+    meta = ls_chat.read_header(path, MERGED_CHAT_HEAD_BYTES)
+    if meta is None:
+        return None
     try:
-        buf, size = [], 0
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.rstrip("\n") == ' "messages": [':
-                    buf.append(' "messages": []}')
-                    break
-                size += len(line)
-                if size > MERGED_CHAT_HEAD_BYTES:
-                    return None
-                buf.append(line)
-            else:
-                return None
-        meta = json.loads("".join(buf))["metadata"]
+        out: dict = {}
+
         # ls_chat names platforms 'youtube', 'twitch' and 'unknown'. Map by
         # name, never by truncation: 'youtube'[:2] is 'YO', which silently
         # dropped YouTube from the list and left the archive recording that a
@@ -1581,7 +1649,30 @@ def _merged_chat_sources(path: str) -> str | None:
                  if src.get("messages") and src.get("zero_ms") is not None}
         # 'unknown' maps to None and is dropped: a source ls_chat could not
         # identify is not evidence that either platform had chat.
-        return ",".join(sorted(p for p in plats if p)) or None
+        sources = ",".join(sorted(p for p in plats if p))
+        if sources:
+            out["chat_sources"] = sources
+
+        for key, col, floor in _CHAT_META_INTS:
+            v = meta.get(key)
+            # `not isinstance(v, bool)` because True is an int in Python and
+            # would sail through as a message count of 1.
+            if isinstance(v, int) and not isinstance(v, bool) and v >= floor:
+                out[col] = v
+
+        mod = {}
+        for plat, how in (meta.get("moderation") or {}).items():
+            p = ls_archive.PLATFORM.get(str(plat).strip().lower())
+            if p and how in _MODERATION:
+                mod[p] = how
+        if mod:
+            # Sorted and space-free, matching the archive's canonical form
+            # exactly. The two are string-compared on every sweep to decide
+            # whether anything changed, so a second spelling of the same fact
+            # would collide forever and ask a human about it every run.
+            out["chat_moderation"] = json.dumps(mod, sort_keys=True,
+                                                separators=(",", ":"))
+        return out or None
     except Exception:
         return None
 
@@ -1653,9 +1744,13 @@ def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
         stream_fields["tz_offset_min"] = tz_min
     if merged_rel:
         stream_fields["chat_path"] = merged_rel
-        sources = _merged_chat_sources(os.path.join(nas_root, merged_name))
-        if sources:
-            stream_fields["chat_sources"] = sources
+        # Everything the file says about itself, in the archive's field names.
+        # Sent WITH the path, never separately: the archive records which file
+        # a description belongs to by looking at the path in the same packet,
+        # and a description arriving on its own would be filed against
+        # whatever happened to be there.
+        stream_fields.update(
+            _merged_chat_meta(os.path.join(nas_root, merged_name)) or {})
     return stream_fields, caps
 
 
@@ -1769,6 +1864,9 @@ examples:
                         help="--merge-chat: output path")
     parser.add_argument("--dry-run", action="store_true",
                         help="--merge-chat: report without writing")
+    parser.add_argument("--no-assets", action="store_true",
+                        help="--merge-chat: skip fetching emote and badge "
+                             "pictures")
     parser.add_argument("--archive", action="store_true",
                         help="Reconcile with the archive and do nothing else")
     parser.add_argument("--no-archive", action="store_true",
@@ -1808,7 +1906,8 @@ examples:
     if args.merge_chat:
         ref = int(args.ref) if args.ref.lstrip("-").isdigit() else args.ref
         cmd_merge_chat(config, args.index, ref=ref, zeros=args.zero,
-                       output=args.output, dry_run=args.dry_run)
+                       output=args.output, dry_run=args.dry_run,
+                       assets=not args.no_assets)
         return
 
     if args.archive:

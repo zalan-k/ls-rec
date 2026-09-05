@@ -67,6 +67,31 @@ def archive_path(config: dict, filename: str | None) -> str | None:
     return f"{_media_prefix(config)}{filename}" if filename else None
 
 
+def media_root(config: dict) -> str | None:
+    """The archive's media root, as this machine sees it.
+
+    `nas_path` is where raws are uploaded and `archive_media_prefix` says where
+    that sits inside the root, so the root is nas_path with the prefix walked
+    back off it. Overridable for the cases where that guess is wrong.
+
+    Returns None rather than a guess when the prefix does not describe
+    nas_path: everything built on this writes files, and the failure mode of a
+    wrong answer here is a directory of pictures nothing can find.
+    """
+    explicit = str(config.get("archive_media_root") or "").strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    nas = str(config.get("nas_path") or "").rstrip("/")
+    if not nas:
+        return None
+    root = os.path.abspath(os.path.expanduser(nas))
+    for part in reversed([p for p in _media_prefix(config).split("/") if p]):
+        if os.path.basename(root) != part:
+            return None
+        root = os.path.dirname(root)
+    return root
+
+
 def _tz_offset_min() -> int:
     off = datetime.datetime.now().astimezone().utcoffset()
     return int(off.total_seconds() // 60) if off else 0

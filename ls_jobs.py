@@ -133,21 +133,10 @@ def _mmss(s: float) -> str:
 # avoid: a promote into the wrong directory is a master that no longer exists
 # anywhere the archive can see.
 
-def media_root(config: dict) -> str | None:
-    explicit = str(config.get("archive_media_root") or "").strip()
-    if explicit:
-        return os.path.abspath(os.path.expanduser(explicit))
-    nas = str(config.get("nas_path") or "").rstrip("/")
-    if not nas:
-        return None
-    root = os.path.abspath(os.path.expanduser(nas))
-    prefix = str(config.get("archive_media_prefix") or "")
-    for part in reversed([p for p in prefix.split("/") if p]):
-        # The prefix does not describe nas_path. Say nothing rather than guess.
-        if os.path.basename(root) != part:
-            return None
-        root = os.path.dirname(root)
-    return root
+# Lives in ls_archive now — ls_assets needs the same answer, and two copies of
+# a path derivation is how the two of them come to disagree. Kept as a name
+# here because everything below and the startup banner call it.
+media_root = ls_archive.media_root
 
 
 def quarantine_dir(config: dict) -> str | None:

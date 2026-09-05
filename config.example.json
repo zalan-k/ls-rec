@@ -10,5 +10,26 @@
     "twitch_client_id"       : "",
     "twitch_client_secret"   : "",
     "venv"                   : "",
-    "twitch_downloader_cli"  : ""
+    "twitch_downloader_cli"  : "",
+
+    "_archive"               : "Both blank disables the archive entirely: nothing posted, no outbox, no polling.",
+    "archive_url"            : "",
+    "archive_token"          : "",
+    "archive_media_prefix"   : "raws/",
+
+    "_jobs"                  : "ls_jobs.py only. Run `ls_jobs.py --check` to see what these resolve to before enabling the service.",
+    "_archive_media_root"    : "Blank derives it: nas_path with archive_media_prefix walked back off the end.",
+    "archive_media_root"     : "",
+    "_archive_quarantine_dir": "Blank derives it: the sibling of the media root named quarantine.",
+    "archive_quarantine_dir" : "",
+    "archive_job_kinds"      : ["fetch", "promote", "purge"],
+    "archive_job_interval"   : 20,
+    "archive_worker_name"    : "",
+
+    "_fetch"                 : "The allowlist that matters. The archive has its own copy, but that one is a courtesy to whoever is pasting; this one decides.",
+    "archive_fetch_hosts"    : ["youtube.com", "youtu.be", "twitch.tv", "twitter.com", "x.com",
+                                "cdn.discordapp.com", "media.discordapp.net"],
+    "archive_fetch_max_s"    : 600,
+    "archive_fetch_max_mb"   : 200,
+    "archive_fetch_timeout_s": 1800
 }

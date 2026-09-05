@@ -901,6 +901,12 @@ def obsidian_append_note(config: dict, index: int, text: str) -> bool:
 #  Connects to Twitch anonymous IRC, parses tagged messages, and writes a
 #  JSON array to disk. Runs until stop_event is set or the connection drops.
 
+# Bumped when the recorder's coverage changes, never for a bug fix that does
+# not. 1 was PRIVMSG only — everything else was dropped by the parser before
+# the command was read. 2 sees USERNOTICE, CLEARCHAT and CLEARMSG.
+CHAT_RECORDER_VERSION = 2
+
+
 def record_twitch_chat(channel: str, stream_start_ms: int, output_path: str,
                        stop_event, logger=None) -> None:
     """Block and record Twitch chat to a JSON file."""
@@ -917,6 +923,19 @@ def record_twitch_chat(channel: str, stream_start_ms: int, output_path: str,
 
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("[\n")
+            # A header line, so a reader can tell what this capture was ABLE
+            # to see. Every capture written before this existed is missing all
+            # of its USERNOTICE and CLEARCHAT/CLEARMSG traffic, and nothing in
+            # the file says so — an archive that cannot tell "nothing was
+            # deleted" from "this recorder could not see deletions" will state
+            # the first when it means the second.
+            #
+            # Shaped as a message with a type nothing handles, so every older
+            # reader skips it exactly the way it skips a PING.
+            json.dump({"message_type": "_meta", "recorder": CHAT_RECORDER_VERSION,
+                       "channel": channel.lower(),
+                       "started_ms": int(stream_start_ms)}, f)
+            f.write(",\n")
             first = True
             buf = ""
 
@@ -1112,6 +1131,22 @@ def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
         if msg_id == "announcement":
             return {**base, "message_type": "text_message",
                     "message": message, "message_id": tags.get("id", "")}
+
+        # Everything else Twitch sends. Named or not, it is kept.
+        #
+        # The four asked for by name — primepaidupgrade, giftpaidupgrade,
+        # anongiftpaidupgrade, viewermilestone — land here along with whatever
+        # comes next, because a list of four is the same shape of bug as the
+        # one this parser just had: a thing arrives, nothing matches it, it
+        # disappears and nobody finds out. The msg-id and every msg-param-*
+        # travel with it, so a notice type nobody has written code for is still
+        # recoverable from the file years later.
+        if msg_id:
+            params = {k[len("msg-param-"):]: v for k, v in tags.items()
+                      if k.startswith("msg-param-")}
+            return {**base, "message_type": "notice", "notice": msg_id,
+                    "notice_params": params or None,
+                    "system_message": tags.get("system-msg") or None}
         return None
 
     # ── CLEARCHAT / CLEARMSG ──────────────────────────────────────────
