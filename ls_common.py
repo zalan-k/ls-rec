@@ -954,16 +954,55 @@ def record_twitch_chat(channel: str, stream_start_ms: int, output_path: str,
             pass
 
 
+# One line off the wire. The prefix is OPTIONAL, and that is the whole point:
+#
+#     @tags :nick!nick@nick.tmi.twitch.tv PRIVMSG #chan :hello
+#     @tags :tmi.twitch.tv USERNOTICE #chan :thanks for 6 months
+#     @tags :tmi.twitch.tv CLEARMSG #chan :the deleted text
+#     @tags :tmi.twitch.tv CLEARCHAT #chan :someone
+#
+# Only PRIVMSG carries `nick!user@host`. The previous pattern required it, so
+# every USERNOTICE and both CLEAR* commands failed to match and were dropped
+# here — which is why the sub, resub, gift, raid, ban and delete handlers
+# below have never been reached. The channel is optional too: a chat-wide
+# CLEARCHAT and a bare NOTICE both arrive without one.
+_IRC_LINE = re.compile(
+    r"@(?P<tags>[^ ]+) "
+    r":(?:(?P<user>[^! ]+)![^ ]+|[^ ]+) "
+    r"(?P<cmd>[A-Z]+)"
+    r"(?: #(?P<chan>[^ ]+))?"
+    r"(?: :(?P<msg>.*))?$"
+)
+
+# IRCv3 tag values escape five characters. The old code handled two of them
+# with chained str.replace, which is wrong twice over: it left `\\` and the two
+# line breaks encoded, and chaining can un-escape an escape it just produced.
+# One left-to-right pass, which is what the spec describes.
+_TAG_UNESCAPE = {":": ";", "s": " ", "r": "\r", "n": "\n", "\\": "\\"}
+
+
+def _untag(v: str) -> str:
+    if "\\" not in v:
+        return v
+    out, i = [], 0
+    while i < len(v):
+        if v[i] == "\\" and i + 1 < len(v):
+            # An undefined escape drops the backslash and keeps the character,
+            # which is what the spec says to do with one.
+            out.append(_TAG_UNESCAPE.get(v[i + 1], v[i + 1]))
+            i += 2
+        else:
+            out.append(v[i])
+            i += 1
+    return "".join(out)
+
+
 def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
     """Parse a single tagged IRC line into a chat message dict."""
     if not line.startswith("@"):
         return None
 
-    match = re.match(
-        r"@(?P<tags>[^ ]+) :(?P<user>[^!]+)![^ ]+ "
-        r"(?P<cmd>\w+) #[^ ]+(?: :(?P<msg>.*))?",
-        line,
-    )
+    match = _IRC_LINE.match(line)
     if not match:
         return None
 
@@ -972,10 +1011,15 @@ def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
     for tag in match.group("tags").split(";"):
         if "=" in tag:
             k, v = tag.split("=", 1)
-            tags[k] = v.replace("\\s", " ").replace("\\:", ";")
+            tags[k] = _untag(v)
 
     cmd = match.group("cmd")
-    username = match.group("user")
+    # A command sent by the server has no nick in the prefix. USERNOTICE names
+    # the person in `login`; CLEARMSG names the author of the message it is
+    # deleting the same way. Falling back to display-name last, because it is
+    # the only one that can contain non-ASCII.
+    username = (match.group("user") or tags.get("login")
+                or tags.get("display-name") or "")
     message = match.group("msg") or ""
     # Absolute & relative timestamps (ms)
     sent_ms = int(tags.get("tmi-sent-ts", time.time() * 1000))
@@ -1061,6 +1105,13 @@ def _parse_irc_message(line: str, stream_start_ms: int) -> dict | None:
         if msg_id == "raid":
             return {**base, "message_type": "raid",
                     "number_of_raiders": int(tags.get("msg-param-viewerCount", 0))}
+        # An announcement is a USERNOTICE carrying a normal message that chat
+        # sees highlighted — almost always the broadcaster or a mod. Returning
+        # None here would throw the words away, which is a worse loss than not
+        # recording that it was highlighted.
+        if msg_id == "announcement":
+            return {**base, "message_type": "text_message",
+                    "message": message, "message_id": tags.get("id", "")}
         return None
 
     # ── CLEARCHAT / CLEARMSG ──────────────────────────────────────────

@@ -507,6 +507,21 @@ class IrcConverter(Converter):
 
 # ── TwitchDownloaderCLI ───────────────────────────────────────────────────
 
+# What a VOD comment's user_notice_params says it was. Twitch's GQL keeps the
+# notices that CARRIED A MESSAGE and nothing else — a resub with words survives
+# as a comment, a bare sub does not, and no msg-param-* comes with it. So the
+# type is recoverable and its detail is not; months, tiers and recipients stay
+# unset rather than being guessed.
+#
+# Anything unrecognised falls through to `chat`, because the body is real text
+# whatever the notice was, and dropping it would lose more than mislabelling it.
+TDC_NOTICE = {
+    "sub": "sub", "resub": "resub",
+    "subgift": "gift", "anonsubgift": "gift", "submysterygift": "gift",
+    "raid": "raid",
+}
+
+
 class TdcConverter(Converter):
     platform, fmt = "twitch", TDC
 
@@ -529,6 +544,24 @@ class TdcConverter(Converter):
         for c in data.get("comments") or []:
             self.messages.append(self._one(c))
 
+    @staticmethod
+    def _created(c) -> Optional[int]:
+        """The comment's own absolute time.
+
+        Better than offset + video zero, which is what this used to rely on
+        entirely: `created_at` is what Twitch recorded, while the offset is
+        measured against a VOD start that can sit seconds away from the
+        broadcast's. Merging is a subtraction against absolute times, so the
+        one the source actually knows is the one to carry."""
+        v = c.get("created_at")
+        if not v:
+            return None
+        try:
+            dt = datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return int(dt.timestamp() * 1000)
+
     def _one(self, c) -> Msg:
         m = c.get("message") or {}
         cm = c.get("commenter") or {}
@@ -542,7 +575,10 @@ class TdcConverter(Converter):
             bid = b.get("_id") or b.get("id") or ""
             key = f"{bid}_{b.get('version', '1')}"
             badges.append(key)
-            self.badges[key] = bid
+            # Titled the same way the live recorder titles them, so a stream
+            # merged from both sources does not carry two spellings of
+            # `subscriber` for the renderer to reconcile.
+            self.badges[key] = bid.replace("-", " ").replace("_", " ").title()
 
         parts = []
         for fr in m.get("fragments") or []:
@@ -555,8 +591,18 @@ class TdcConverter(Converter):
                 parts.append(text)
 
         kw = dict(ts=int(float(c.get("content_offset_seconds") or 0) * 1000),
+                  abs_ms=self._created(c),
                   id=c.get("_id") or c.get("id"), author=author,
                   badges=badges or None, text="".join(parts))
+
+        # A notice that came with words. TDC spells the key either way
+        # depending on build, and Twitch's own field is msg-id.
+        notice = m.get("user_notice_params") or {}
+        msg_id = notice.get("msg_id") or notice.get("msg-id") or ""
+        kind = TDC_NOTICE.get(str(msg_id).lower())
+        if kind:
+            return Msg(type=kind, **kw)
+
         bits = m.get("bits_spent") or 0
         if bits:
             return Msg(type="superchat", **kw, amount=float(bits), currency="bits")
@@ -616,6 +662,12 @@ class YtdlpConverter(Converter):
             item = (act["addChatItemAction"] or {}).get("item") or {}
             for key, fn in (("liveChatTextMessageRenderer", self._chat),
                             ("liveChatPaidMessageRenderer", self._superchat),
+                            # Listed in YT_MESSAGE_RENDERERS since the start, so
+                            # a sticker has always been trusted to place a zero
+                            # — and then had no handler here, so it was never
+                            # emitted. Money that the archive counted and did
+                            # not keep.
+                            ("liveChatPaidStickerRenderer", self._sticker),
                             ("liveChatMembershipItemRenderer", self._member),
                             ("liveChatSponsorshipsGiftPurchaseAnnouncementRenderer",
                              self._gift),
@@ -691,6 +743,15 @@ class YtdlpConverter(Converter):
                    author=self._author(r), badges=self._badges(r) or None,
                    text=self._runs((r.get("message") or {}).get("runs")) or None,
                    amount=amount, currency=currency, hearted=hearted)
+
+    def _sticker(self, r, ts) -> Msg:
+        """A paid sticker. Same money as a superchat with no words in it —
+        the image is the message, and the archive has no copy of it."""
+        amount, currency = parse_amount(
+            (r.get("purchaseAmountText") or {}).get("simpleText", ""))
+        return Msg(type="superchat", ts=ts, abs_ms=self._abs(r), id=r.get("id"),
+                   author=self._author(r), badges=self._badges(r) or None,
+                   text=None, amount=amount, currency=currency)
 
     def _member(self, r, ts) -> Msg:
         header = r.get("headerPrimaryText") or {}
@@ -789,6 +850,31 @@ def convert_file(path: str, zero_ms: Optional[int] = None) -> Converter:
 
 # ── merge ─────────────────────────────────────────────────────────────────
 
+# How far apart two recordings of one message may be and still be one
+# message. tmi-sent-ts and the VOD comment's created_at are the same instant
+# recorded by two systems; a couple of seconds covers the disagreement without
+# swallowing a person saying the same thing twice, which takes longer than that
+# even when they are spamming.
+SAME_WORDS_MS = 5000
+
+
+def _same_words(said: dict, platform: str, m) -> bool:
+    """Have we already got this message from the other source?
+
+    Author, words and roughly when — the only three things a live capture and
+    a post-hoc download agree about. Messages with no text are exempt: a bare
+    sub notice has nothing to compare, and two of them a second apart are two
+    people subscribing."""
+    if not m.text:
+        return False
+    key = (platform, ((m.author or {}).get("id") or ""), m.text)
+    for prev in said.get(key, ()):
+        if abs(prev - m.abs_ms) <= SAME_WORDS_MS:
+            return True
+    said.setdefault(key, []).append(m.abs_ms)
+    return False
+
+
 def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
           fallback_zeros: Optional[dict] = None) -> dict:
     """
@@ -852,13 +938,27 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             c.apply_zero(parse_zero(raw, ref=ref_ms))
     ref = ref_ms
 
+    # Which platforms arrived in more than one FORMAT. Two yt-dlp dumps share
+    # YouTube's message ids and dedupe perfectly on them; a live IRC capture and
+    # a TwitchDownloader download of the same hour share nothing but the words.
+    # So the second, weaker check is armed only where it is needed, and a
+    # platform captured one way keeps the old exact behaviour.
+    fmts = {}
+    for c in convs:
+        fmts.setdefault(c.platform, set()).add(c.fmt)
+    mixed = {p for p, f in fmts.items() if len(f) > 1}
+
     out, seen, dupes, unplaced = [], set(), 0, 0
+    said = {}                    # (platform, author, text) -> [abs_ms, ...]
     for c in convs:
         for m in c.messages:
             if m.abs_ms is None:
                 unplaced += 1
                 continue
             if m.id and (c.platform, m.id) in seen:
+                dupes += 1
+                continue
+            if c.platform in mixed and _same_words(said, c.platform, m):
                 dupes += 1
                 continue
             if m.id:
