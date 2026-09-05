@@ -59,6 +59,20 @@ MAX_BYTES = 8 * 1024 * 1024
 
 TWITCH_EMOTE = "https://static-cdn.jtvnw.net/emoticons/v2/{id}/{fmt}/dark/3.0"
 
+# Google's image hosts take a size on the end of the URL — `=w48-h48-c-k-nd` —
+# and the dump offers 24 and 48. Cutting it off asks for the original, which is
+# what a 4x screenshot needs and what the 48px one cannot be scaled up to.
+_GOOGLE_IMG = ("ggpht.com", "googleusercontent.com")
+
+
+def _full_size(url: str) -> str | None:
+    """The same picture at whatever size it was uploaded, or None if this is
+    not a URL that can be asked."""
+    if "=" not in url or not any(h in url for h in _GOOGLE_IMG):
+        return None
+    bare = url.rsplit("=", 1)[0]
+    return bare if bare and bare != url else None
+
 # What a fetched file is allowed to be. An emote endpoint that answers with an
 # HTML error page is not an emote, and writing it out under a .png would make a
 # broken image that looks exactly like a real one on disk.
@@ -227,7 +241,12 @@ def _emote_targets(platform: str, rec: dict) -> tuple[str, str, list[tuple[str, 
         url = rec.get("url")
         if not url or "/" not in eid:
             return None
-        return (f"youtube/{eid}", f"emotes/youtube/{eid}.png", [(url, "png")])
+        # Original first, the offered thumbnail second: if Google ever stops
+        # honouring a bare URL this still fetches something rather than
+        # recording the emote as gone.
+        big = _full_size(url)
+        return (f"youtube/{eid}", f"emotes/youtube/{eid}.png",
+                ([(big, "png")] if big else []) + [(url, "png")])
     return None
 
 
@@ -245,7 +264,9 @@ def _badge_targets(platform: str, key: str, rec: dict,
         # channel and has no address; the renderer draws those itself.
         if rec.get("icon") or not rec.get("url"):
             return None
-        return (f"youtube/{key}", f"badges/youtube/{key}.png", [(rec["url"], "png")])
+        big = _full_size(rec["url"])
+        return (f"youtube/{key}", f"badges/youtube/{key}.png",
+                ([(big, "png")] if big else []) + [(rec["url"], "png")])
     return None
 
 
