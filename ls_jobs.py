@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import errno
 import glob
+import json
 import logging
 import os
 import re
@@ -520,7 +521,142 @@ def do_fetch(config: dict, job: dict):
 #  THE LOOP
 # ══════════════════════════════════════════════════════════════════════════
 
-HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge}
+def probe_file(path: str) -> dict:
+    """Everything ffprobe will say about a file, in one call.
+
+    One call rather than one per field: this runs over every capture on a
+    stream and ffprobe is the slow part. A file that will not probe returns an
+    empty dict — the archive writes nothing for what is not in it, so "could
+    not read it" and "read it and it was empty" stay different answers.
+    """
+    try:
+        r = _run(["ffprobe", "-v", "error", "-show_entries",
+                  "format=duration,format_name:stream=codec_type,codec_name,"
+                  "width,height,avg_frame_rate",
+                  "-of", "json", path], 120)
+        if r.returncode != 0:
+            return {}
+        doc = json.loads(r.stdout or "{}")
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError,
+            json.JSONDecodeError):
+        return {}
+
+    fmt = doc.get("format") or {}
+    out: dict = {}
+    try:
+        out["file_duration_s"] = int(round(float(fmt["duration"])))
+    except (KeyError, TypeError, ValueError):
+        pass
+    if fmt.get("format_name"):
+        # "mov,mp4,m4a,3gp,3g2,mj2" — the first is the one anyone means.
+        out["container"] = str(fmt["format_name"]).split(",")[0]
+
+    vid = next((s for s in doc.get("streams", []) if s.get("codec_type") == "video"), None)
+    aud = next((s for s in doc.get("streams", []) if s.get("codec_type") == "audio"), None)
+    if vid:
+        if vid.get("codec_name"):
+            out["video_codec"] = str(vid["codec_name"])
+        for k in ("width", "height"):
+            if isinstance(vid.get(k), int):
+                out[k] = vid[k]
+        # "30000/1001", which is 29.97 and not 30. Kept as the float it is.
+        fr = str(vid.get("avg_frame_rate") or "")
+        if "/" in fr:
+            try:
+                n, d = fr.split("/")
+                if float(d):
+                    out["fps"] = round(float(n) / float(d), 3)
+            except (ValueError, ZeroDivisionError):
+                pass
+    if aud and aud.get("codec_name"):
+        out["audio_codec"] = str(aud["codec_name"])
+    out["has_audio"] = 1 if aud else 0
+    return out
+
+
+def do_rescan(config: dict, job: dict):
+    """Re-read a stream from its files and its links.
+
+    Returns (status, result_path, error, findings). The findings are per
+    capture and keyed by the id the archive sent, so nothing here has to guess
+    which row it is talking about.
+
+    `alive` is reported ONLY on a definite answer. `ok` means the platform
+    served it; `gone` means the platform said it is not there any more. A probe
+    that merely failed — no network, a bot check, a timeout — reports no
+    `alive` at all, and the archive leaves the column exactly as it found it.
+    That asymmetry is the whole design: a takedown noticed late costs a stale
+    badge, and a bot check read as a takedown marks a living VOD dead.
+    """
+    pay = job.get("payload") or {}
+    caps = pay.get("captures") or []
+    if not isinstance(caps, list) or not caps:
+        return ("failed", None, "the archive named no captures to look at", None)
+    m = media_root(config)
+
+    out = []
+    for c in caps:
+        cid = str(c.get("id") or "")
+        if not cid:
+            continue
+        found: dict = {"id": cid}
+
+        rel = c.get("video_path")
+        if rel:
+            # Resolved against this worker's own media root and refused if it
+            # escapes — same discipline as promote, in the other direction.
+            path = resolve_name(m, rel)
+            if not path:
+                found["note"] = "that path is outside the media root"
+            elif not os.path.isfile(path):
+                found["note"] = "no file at that path"
+            else:
+                probed = probe_file(path)
+                if probed:
+                    found.update(probed)
+                else:
+                    found["note"] = "ffprobe would not read the file"
+
+        url = c.get("url")
+        if url and not allowed_host(config, url):
+            # The same allowlist fetch runs on, for the same reason. The route
+            # that makes these jobs builds the payload out of capture rows, so
+            # in practice this never fires — which is exactly when a check is
+            # worth having, because the day it does fire is the day something
+            # else learned to write a payload.
+            found["note"] = (found.get("note", "") + " this worker will not "
+                             "probe that host").strip()
+            url = None
+        if url:
+            data, why = ls_common.ytdlp_probe(config, url, with_reason=True)
+            if why == "ok" and data is not None:
+                found["alive"] = 1
+                # The platform's own length, which is not the file's and is not
+                # written as one. Reported so a human can see the two disagree.
+                if data.get("duration"):
+                    try:
+                        found["remote_duration_s"] = int(round(float(data["duration"])))
+                    except (TypeError, ValueError):
+                        pass
+            elif why == "gone":
+                found["alive"] = 0
+            else:
+                # offline / failed. Nothing is claimed about the video.
+                found["note"] = (found.get("note", "") + f" probe: {why}").strip()
+
+        if len(found) > 1:
+            out.append(found)
+
+    if not out:
+        return ("failed", None, "nothing could be read for any capture", None)
+    n_alive = sum(1 for x in out if "alive" in x)
+    logger.info(f"rescan {str(pay.get('stream_id', '?'))[:8]}: "
+                f"{len(out)} capture(s), {n_alive} answered on liveness")
+    return ("done", None, None, {"captures": out})
+
+
+HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
+            "rescan": do_rescan}
 
 _stop = False
 
@@ -547,16 +683,23 @@ def handle(config: dict, job: dict) -> bool:
         return False
     t0 = time.time()
     try:
-        status, result, err = fn(config, job)
+        # Four, optionally. A handler that has findings to report — rescan does
+        # — hands them back as the fourth; everything else answers in three and
+        # this pads it, so no existing handler had to change.
+        out = fn(config, job)
+        status, result, err = out[0], out[1], out[2]
+        found = out[3] if len(out) > 3 else None
     except Exception as e:
         # A handler that threw is a bug here, not a verdict on the job — but
         # the job still has to be answered, or it sits claimed until the lease
         # lapses and comes straight back to be crashed on again.
         logger.exception(f"{kind} {job['id'][:8]} crashed")
         status, result, err = "failed", None, f"the worker crashed: {type(e).__name__}: {e}"
+        found = None
     if status != "done":
         logger.warning(f"{kind} {job['id'][:8]} failed: {err}")
-    ls_archive.report_job(config, job["id"], status, result_path=result, error=err)
+    ls_archive.report_job(config, job["id"], status, result_path=result, error=err,
+                          result=found)
     logger.debug(f"{kind} {job['id'][:8]} {status} in {time.time() - t0:.1f}s")
     return status == "done"
 
@@ -581,7 +724,8 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
     say(f"  archive        {config['archive_url']}")
 
     m, q = media_root(config), quarantine_dir(config)
-    need_media = bool({"promote", "purge"} & set(kinds))
+    # rescan reads the masters; it never writes to them.
+    need_media = bool({"promote", "purge", "rescan"} & set(kinds))
     need_q = bool({"promote", "fetch"} & set(kinds))
 
     for label, path, needed, why in (

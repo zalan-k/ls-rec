@@ -100,6 +100,43 @@ _yt_anon_blocked_until = 0.0
 def _is_offline(text: str) -> bool:
     return any(m in (text or "").lower() for m in ("not currently live", "this live event will begin", "premieres in", "is offline"))
 
+def _is_geo(text: str) -> bool:
+    """Not here, as opposed to not anywhere.
+
+    A geo-block says "video unavailable" in the same breath as a takedown does,
+    and this recorder sits in one country for its whole life — so the two are
+    indistinguishable from the outside and only the second sentence separates
+    them. Checked first, and its answer is "say nothing", because a video that
+    is fine everywhere but here has not died.
+    """
+    t = (text or "").lower()
+    return any(m in t for m in (
+        "in your country", "in your location", "from your location",
+        "available in your", "not available in",
+    ))
+
+
+def _is_gone(text: str) -> bool:
+    """The video is not coming back, as opposed to the probe not working.
+
+    Deliberately narrow. Everything not matched here stays `failed`, because
+    the cost of the two mistakes is not symmetric: a takedown noticed a week
+    late is a stale badge, and a bot check read as a takedown marks a VOD dead
+    that is sitting there perfectly fine. When in doubt, say nothing.
+    """
+    if _is_geo(text):
+        return False
+    t = (text or "").lower()
+    return any(m in t for m in (
+        # YouTube
+        "video unavailable", "has been removed", "is private",
+        "private video", "account associated with this video has been terminated",
+        "removed by the uploader", "no longer available",
+        # Twitch
+        "does not exist", "unable to find video", "video does not exist",
+    ))
+
+
 def _is_bot_check(text: str) -> bool:
     return any(m in (text or "").lower() for m in ("sign in to confirm", "not a bot", "login_required"))
 
@@ -186,6 +223,10 @@ def ytdlp_probe(config: dict, url: str, *,
         data, err, _ = _probe_once(config, url, True, playlist_items, timeout)
         if data is not None:
             return out(data, "ok")
+        # Already cookied — there is no better attempt to escalate to, so the
+        # wording is as good an answer as this is ever going to get.
+        if _is_gone(err):
+            return out(None, "gone")
         if _is_offline(err):
             return out(None, "offline")
         _log.warning("Probe failed: %s", err.strip()[-200:])
@@ -198,15 +239,25 @@ def ytdlp_probe(config: dict, url: str, *,
             _mark_anon_ok()
             return out(data, "ok")
         if not blocked:
-            if _is_offline(err):
+            # An anonymous probe is the one that gets the degraded answer, so
+            # "it's gone" is not believed from it — it falls through to the
+            # cookied attempt below and that one decides. One extra yt-dlp call,
+            # only ever on a video that already looks dead.
+            if _is_gone(err):
+                pass
+            elif _is_offline(err):
                 return out(None, "offline")
-            _log.warning("YouTube probe failed: %s", err.strip()[-200:])
-            return out(None, "failed")
-        _mark_anon_blocked(config, err)
+            else:
+                _log.warning("YouTube probe failed: %s", err.strip()[-200:])
+                return out(None, "failed")
+        else:
+            _mark_anon_blocked(config, err)
 
     data, err, _ = _probe_once(config, url, True, playlist_items, timeout)
     if data is not None:
         return out(data, "ok")
+    if _is_gone(err):
+        return out(None, "gone")
     if _is_offline(err):
         return out(None, "offline")
     _log.warning("YouTube probe failed with cookies too: %s",

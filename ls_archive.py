@@ -741,7 +741,7 @@ JOBS_SPOOL_PATH = os.path.join(SCRIPT_DIR, ".archive_jobs_outbox.json")
 # What this machine is willing to be asked for. The archive has its own copy of
 # this list and will refuse to hand out anything else, but that copy is a
 # courtesy: this one is the one that decides.
-PI_KINDS = ("fetch", "promote", "purge")
+PI_KINDS = ("fetch", "promote", "purge", "rescan")
 
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 
@@ -861,7 +861,8 @@ def claim_jobs(config: dict, *, worker: str, kinds=PI_KINDS, limit: int = 1) -> 
 # ── reporting ─────────────────────────────────────────────────────────────
 
 def report_job(config: dict, job_id: str, status: str, *,
-               result_path: str | None = None, error: str | None = None) -> bool:
+               result_path: str | None = None, error: str | None = None,
+               result: dict | None = None) -> bool:
     """Say what happened. Spools rather than gives up.
 
     `status` is 'done' or 'failed' and both are terminal at the archive — there
@@ -872,6 +873,10 @@ def report_job(config: dict, job_id: str, status: str, *,
     if not enabled(config):
         return False
     body: dict = {"status": status}
+    # Facts, not a verdict. Only rescan sends any; the archive ignores the key
+    # on every other kind, so an older archive simply drops it.
+    if result:
+        body["result"] = result
     if result_path:
         body["result_path"] = str(result_path)
     if error:
