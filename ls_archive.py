@@ -741,7 +741,7 @@ JOBS_SPOOL_PATH = os.path.join(SCRIPT_DIR, ".archive_jobs_outbox.json")
 # What this machine is willing to be asked for. The archive has its own copy of
 # this list and will refuse to hand out anything else, but that copy is a
 # courtesy: this one is the one that decides.
-PI_KINDS = ("fetch", "promote", "purge", "rescan")
+PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest")
 
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 

@@ -655,8 +655,113 @@ def do_rescan(config: dict, job: dict):
     return ("done", None, None, {"captures": out})
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  HARVEST
+# ══════════════════════════════════════════════════════════════════════════
+
+# Hosts this worker will read a description from. Narrower than the fetch
+# allowlist on purpose: fetch pulls a video somebody linked, harvest copies
+# TEXT into the archive under somebody's licence, and the set of places that
+# is defensible from is small and known. Fandom is CC-BY-SA, which is why the
+# archive stores the url alongside whatever comes back.
+WIKI_HOSTS = ("wikipedia.org", "fandom.com", "wikia.org")
+
+
+def _wiki_api(url: str):
+    """(api.php, page title) for a MediaWiki article url, or None.
+
+    Both families put the article at /wiki/<Title> and expose the API at the
+    site root — Fandom at /api.php, Wikipedia at /w/api.php. Anything that does
+    not look like an article is refused rather than guessed at, because a guess
+    here is a request to an arbitrary path on somebody else's host.
+    """
+    try:
+        u = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    if u.scheme != "https":
+        return None
+    host = (u.hostname or "").lower().rstrip(".")
+    if not any(host == h or host.endswith("." + h) for h in WIKI_HOSTS):
+        return None
+    parts = [p for p in (u.path or "").split("/") if p]
+    if len(parts) < 2 or parts[-2] != "wiki":
+        return None
+    title = urllib.parse.unquote(parts[-1]).replace("_", " ")
+    base = f"{u.scheme}://{u.netloc}"
+    api = f"{base}/w/api.php" if host.endswith("wikipedia.org") else f"{base}/api.php"
+    return (api, title)
+
+
+def _get_json(url: str, timeout: int = 30):
+    req = urllib.request.Request(url, headers={"user-agent": "ls-rec/jobs"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            # A wiki API answer is kilobytes. Reading unbounded is how a
+            # redirect to something else becomes this worker's problem.
+            return json.loads(r.read(2 << 20).decode("utf-8", "replace"))
+    except Exception as e:
+        logger.warning("harvest GET failed: %s: %s", type(e).__name__, str(e)[:160])
+        return None
+
+
+def do_harvest(config: dict, job: dict):
+    """Read a wiki page for a tag. Returns (status, result_path, error, findings).
+
+    Nothing is decided here. The archive stores what comes back as `seeded`,
+    which is the row saying out loud that a machine wrote it and no human has
+    been over it — and the first hand edit clears that flag. This worker's job
+    is to be accurate about what the page said, not about whether it is right.
+    """
+    pay = job.get("payload") or {}
+    url = str(pay.get("url") or job.get("url") or "").strip()
+    if not url:
+        return ("failed", None, "the job names no link", None)
+
+    # WIKI_HOSTS is the allowlist here, and `archive_fetch_hosts` is
+    # deliberately NOT consulted. That list says where this recorder will
+    # download a VIDEO from; adding wikipedia.org to it so a description works
+    # would widen the fetch surface to make a text feature go, which is the
+    # wrong direction. What guards this is stricter than that list anyway:
+    # three domains, https only, and a path that has to look like an article.
+    api = _wiki_api(url)
+    if not api:
+        return ("failed", None,
+                "that is not a wiki article this worker knows how to read — it reads "
+                "MediaWiki article urls (Wikipedia, Fandom)", None)
+    api_url, title = api
+
+    params = urllib.parse.urlencode({
+        "action": "query", "format": "json", "redirects": "1",
+        "prop": "extracts",
+        # The lead section as plain text: what a person reads first, and not a
+        # wall of infobox markup.
+        "exintro": "1", "explaintext": "1", "exsectionformat": "plain",
+        "titles": title,
+    })
+    doc = _get_json(f"{api_url}?{params}")
+    if not doc:
+        return ("failed", None, "that wiki did not answer", None)
+
+    pages = ((doc.get("query") or {}).get("pages") or {})
+    page = next((p for p in pages.values() if isinstance(p, dict)), None)
+    if not page or "missing" in page:
+        return ("failed", None, f"that wiki has no page called {title!r}", None)
+
+    extract = str(page.get("extract") or "").strip()
+    if not extract:
+        return ("failed", None, "that page has no lead paragraph to read", None)
+
+    # One paragraph. A lead section runs to six and a tag row is not where
+    # anybody reads six — the link is right there for the rest.
+    first = extract.split("\n\n")[0].strip()
+    found = {"title": page.get("title") or title, "summary": first[:1200]}
+    logger.info("harvest %s: %d chars", found["title"], len(found["summary"]))
+    return ("done", None, None, found)
+
+
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
-            "rescan": do_rescan}
+            "rescan": do_rescan, "harvest": do_harvest}
 
 _stop = False
 
