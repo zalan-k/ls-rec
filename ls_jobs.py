@@ -7,9 +7,11 @@ compose file. So when a clip is approved, or purged, or pasted in as a link,
 the archive cannot act. It writes down what it wants and this worker comes and
 takes it.
 
-    fetch     a url someone pasted -> a file in quarantine, for review
-    promote   an approved file     -> quarantine into the media tree
-    purge     an admin said so     -> gone
+    fetch       a url someone pasted -> a file in quarantine, for review
+    promote     an approved file     -> quarantine into the media tree
+    purge       an admin said so     -> gone
+    music_probe a song's link        -> what the page says about it
+    music_fetch an approved song     -> the media tree, for keeping
 
 Run as its own service, deliberately. ls_archive.py is a library on the
 recorder's poll tick, and its own first paragraph says nothing in it may ever
@@ -41,6 +43,7 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import datetime
 import errno
 import glob
 import json
@@ -85,6 +88,23 @@ DEFAULTS = {
         # right answer for a link that has genuinely gone.
         "cdn.discordapp.com", "media.discordapp.net",
     ],
+
+    # ── music ────────────────────────────────────────────────────────────
+    # Where songs land under the media root. The archive stores the path it is
+    # told and never derives one, so this is the only place the word lives.
+    "archive_music_prefix":    "music/",
+    # Its own caps, because these are not the same thing as a pasted clip. A
+    # music video is three minutes and worth keeping at a decent size; the
+    # generous byte ceiling is the point of the module, not an oversight.
+    "archive_music_max_s":     900,
+    "archive_music_max_mb":    500,
+    "archive_music_timeout_s": 1800,
+    # THE FORMAT POLICY LIVES HERE, and that is deliberate: the archive names
+    # an id and a verb and has never told a worker what to fetch. Change this
+    # to `bestaudio/best` for an audio-only collection and nothing on the other
+    # side needs to know.
+    "archive_music_format":    "bv*[height<=1080]+ba/b[height<=1080]/b",
+    "archive_music_container": "mp4",
 }
 
 # Fetched with a plain https GET rather than yt-dlp: these are direct file
@@ -146,6 +166,20 @@ def quarantine_dir(config: dict) -> str | None:
         return os.path.abspath(os.path.expanduser(explicit))
     m = media_root(config)
     return os.path.join(os.path.dirname(m), "quarantine") if m else None
+
+
+def music_dir(config: dict) -> str | None:
+    """Where songs live, under the media root.
+
+    Not a sibling of it like quarantine: a song that has been approved IS
+    archive content, and it goes where the archive can read it. The prefix is
+    config here and a stored path there — nothing derives it twice.
+    """
+    m = media_root(config)
+    if not m:
+        return None
+    rel = str(setting(config, "archive_music_prefix")).strip().strip("/")
+    return os.path.join(m, *rel.split("/")) if rel else m
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -760,8 +794,246 @@ def do_harvest(config: dict, job: dict):
     return ("done", None, None, found)
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  MUSIC
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Somebody else's music video, kept because it will not always be there.
+#
+# Two kinds, and the split is the whole design. `music_probe` reads what a page
+# says so a person can decide whether the song belongs; `music_fetch` downloads
+# it, and only ever after that decision went the right way. Fetching at
+# submission time would mean this machine spent somebody's bandwidth and the
+# archive held the bytes of things it turned down — and then somebody has to
+# decide a second time whether to keep them.
+#
+# Neither writes to quarantine. Quarantine exists so that bytes nobody has
+# approved can sit somewhere the archive does not serve from; by the time a
+# fetch is queued the approval has already happened, so there is nothing left
+# to hold it for and the file goes where it is going to live.
+
+# A YouTube id, and nothing else is accepted as one. The archive mints this
+# from a canonical watch url and it becomes a FILENAME here, so it is checked
+# rather than trusted — the same reason a fetch names its file after the
+# snippet id and never after the remote title.
+VIDEO_ID = re.compile(r"[0-9A-Za-z_-]{6,24}")
+
+
+def _music_target(config: dict, job: dict):
+    """(url, video_id, music dir, prefix) or a refusal string."""
+    pay = job.get("payload") or {}
+    url = str(pay.get("url") or job.get("url") or "").strip()
+    vid = str(pay.get("video_id") or "").strip()
+    if not url:
+        return "the job names no link"
+    if not vid or not VIDEO_ID.fullmatch(vid):
+        return "the job does not name a video this worker can name a file after"
+    # The host first, before anything about this end — same order and same
+    # reason as a fetch: a malformed job must not mask a refused host.
+    if not allowed_host(config, url):
+        shown = (urllib.parse.urlparse(url).hostname or url)[:80]
+        return f"{shown} is not on this recorder's allowlist"
+    d = music_dir(config)
+    if not d:
+        return "this worker cannot work out where songs go"
+    prefix = str(setting(config, "archive_music_prefix")).strip().strip("/")
+    return (url, vid, d, prefix)
+
+
+def _uploaded_at(data: dict) -> int | None:
+    """When the VIDEO went up, in unix seconds.
+
+    Not when the row was made, and not when this ran. `release_timestamp` and
+    `timestamp` are exact and are preferred; `upload_date` is a date with no
+    time in it, so it reads as UTC midnight — which is the honest answer for a
+    field that genuinely does not carry a time, and is what every other date in
+    the archive does with one.
+    """
+    ts = ls_common.stream_start_epoch(data)
+    if ts:
+        return ts
+    ud = str(data.get("upload_date") or "").strip()
+    if not re.fullmatch(r"\d{8}", ud):
+        return None
+    try:
+        d = datetime.datetime.strptime(ud, "%Y%m%d").replace(
+            tzinfo=datetime.timezone.utc)
+        return int(d.timestamp())
+    except ValueError:
+        return None
+
+
+def do_music_probe(config: dict, job: dict):
+    """What a video says about itself. Returns (status, result_path, error, findings).
+
+    Facts and no file. The archive puts these on a card so somebody can judge
+    the song without leaving the page, and it decides nothing here — the same
+    arrangement as harvest, for the same reason: this worker's job is to be
+    accurate about what the page said.
+    """
+    t = _music_target(config, job)
+    if isinstance(t, str):
+        return ("failed", None, t, None)
+    url, vid, _, _ = t
+
+    # The cookied prober with the anonymous-first fallback, because YouTube
+    # answers a bare probe with a bot check often enough that a plain call
+    # would report half these songs as broken.
+    data, why = ls_common.ytdlp_probe(config, url, timeout=45, with_reason=True)
+    if data is None:
+        if why == "gone":
+            # Worth saying plainly rather than as a generic failure: a song
+            # that has already been taken down is exactly what the collection
+            # exists to catch, and the person who pasted it should be told that
+            # is what happened rather than that "the probe failed".
+            return ("failed", None,
+                    "that video is gone — taken down, private, or region-locked", None)
+        if why == "offline":
+            return ("failed", None, "that link is a stream that is not on right now", None)
+        return ("failed", None, "could not read that video's page", None)
+
+    title = str(data.get("title") or "").strip()
+    if not title:
+        return ("failed", None, "that page has no title to read", None)
+    secs = data.get("duration")
+    found = {
+        "title": title[:300],
+        # `channel` is the display name and `uploader` is the older spelling of
+        # it; channel_id survives a rename, which display names do not.
+        "channel": (str(data.get("channel") or data.get("uploader") or "").strip() or None),
+        "channel_id": (str(data.get("channel_id") or data.get("uploader_id") or "").strip()
+                       or None),
+        "uploaded_at": _uploaded_at(data),
+        "duration_s": int(secs) if isinstance(secs, (int, float)) and secs > 0 else None,
+    }
+    logger.info("music probe %s: %s%s", vid, found["title"][:60],
+                f" ({_mmss(secs)})" if secs else "")
+    return ("done", None, None, found)
+
+
+def do_music_fetch(config: dict, job: dict):
+    """An approved song into the media tree.
+
+    Returns (status, result_path, error, findings). `result_path` is relative
+    to the MEDIA ROOT and carries the prefix — the archive stores it verbatim
+    and resolves it against its own root, so a path that arrived without the
+    prefix would resolve to a file that is not there.
+    """
+    t = _music_target(config, job)
+    if isinstance(t, str):
+        return ("failed", None, t, None)
+    url, vid, mdir, prefix = t
+
+    rel = lambda name: f"{prefix}/{name}" if prefix else name
+    max_bytes = int(setting(config, "archive_music_max_mb")) * 1048576
+    max_s = int(setting(config, "archive_music_max_s"))
+    timeout = int(setting(config, "archive_music_timeout_s"))
+
+    try:
+        os.makedirs(mdir, exist_ok=True)
+    except OSError as e:
+        return ("failed", None, f"cannot make {mdir}: {e.strerror or e}", None)
+
+    existing = sorted(glob.glob(os.path.join(mdir, f"{vid}.*")))
+    existing = [f for f in existing
+                if os.path.splitext(f)[1].lower() in KEEP_EXT and os.path.getsize(f) > 0]
+    if existing:
+        # Already here. The job ran and its report was what went missing —
+        # promote answers a repeat the same way, and for the same reason.
+        got = existing[0]
+        name = os.path.basename(got)
+        logger.info("music fetch %s: already here as %s", vid, name)
+        thumb = os.path.join(mdir, f"{vid}.jpg")
+        return ("done", rel(name), None,
+                {"bytes": os.path.getsize(got),
+                 "thumb_path": rel(f"{vid}.jpg") if os.path.isfile(thumb) else None})
+
+    # Asked before anything is pulled, because a duration is the one cap that
+    # can be checked without spending the bandwidth it is protecting.
+    secs = probe_duration(config, url)
+    if secs and secs > max_s:
+        return ("failed", None,
+                f"that is {_mmss(secs)} long; the cap is {_mmss(max_s)}", None)
+
+    # The part file sits in the music directory rather than in quarantine, so
+    # the rename at the end is a rename(2) on one filesystem instead of a copy
+    # across two. Nothing serves it in the meantime: the archive resolves a
+    # song from the path on its row, and no row says `.part-`.
+    stem = os.path.join(mdir, f"{PART}{job['id']}")
+    _scraps(mdir, job["id"])
+    try:
+        r = _run(_ytdlp(config) + [
+            "--no-warnings", "--no-playlist", "--no-progress",
+            "-f", str(setting(config, "archive_music_format")),
+            "--merge-output-format", str(setting(config, "archive_music_container")),
+            # The cover, in the same pass. A second job for one JPEG would be a
+            # second thing to fail, and the archive falls back to YouTube's own
+            # thumbnail url until this lands anyway.
+            "--write-thumbnail", "--convert-thumbnails", "jpg",
+            "--max-filesize", f"{max_bytes}",
+            "-o", stem + ".%(ext)s", url], timeout)
+        if r.returncode != 0:
+            return ("failed", None,
+                    _tail(r.stderr) or _tail(r.stdout) or f"yt-dlp exited {r.returncode}", None)
+
+        got = sorted((f for f in glob.glob(stem + ".*")
+                      if os.path.splitext(f)[1].lower() in KEEP_EXT),
+                     key=os.path.getsize, reverse=True)
+        if not got:
+            # --max-filesize aborts by writing nothing, which is otherwise
+            # indistinguishable from a silent success.
+            return ("failed", None, f"nothing came back — it may be over {_mb(max_bytes)}", None)
+        media = got[0]
+        for extra in got[1:]:
+            try:
+                os.remove(extra)
+            except OSError:
+                pass
+
+        ext = os.path.splitext(media)[1].lower()
+        size = os.path.getsize(media)
+        if size == 0:
+            return ("failed", None, "the file came back empty", None)
+        if size > max_bytes:
+            return ("failed", None, f"it is {_mb(size)}; the cap is {_mb(max_bytes)}", None)
+
+        name = f"{vid}{ext}"
+        dest = resolve_name(mdir, name, bare=True)
+        if not dest:
+            return ("failed", None, "could not name the file safely", None)
+        if os.path.exists(dest):
+            return ("failed", None, "something is already at that name in the media tree", None)
+        os.replace(media, dest)
+
+        # The cover rides along or it does not. A song without one is a card
+        # that falls back to YouTube's copy, which is what it was showing while
+        # this ran — so a missing JPEG is not worth failing a download over.
+        thumb_rel = None
+        shot = next((f for f in glob.glob(stem + ".jpg")), None)
+        if shot and os.path.getsize(shot) > 0:
+            tdest = resolve_name(mdir, f"{vid}.jpg", bare=True)
+            if tdest and not os.path.exists(tdest):
+                try:
+                    os.replace(shot, tdest)
+                    thumb_rel = rel(f"{vid}.jpg")
+                except OSError as e:
+                    logger.warning("music fetch %s: kept the song, not the cover: %s", vid, e)
+
+        logger.info("music fetch %s: %s, %s%s", vid, name, _mb(size),
+                    ", with cover" if thumb_rel else "")
+        return ("done", rel(name), None, {"bytes": size, "thumb_path": thumb_rel})
+
+    except subprocess.TimeoutExpired:
+        return ("failed", None, f"it was still going after {timeout // 60} minutes", None)
+    finally:
+        _scraps(mdir, job["id"])
+
+
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
-            "rescan": do_rescan, "harvest": do_harvest}
+            "rescan": do_rescan, "harvest": do_harvest,
+            "music_probe": do_music_probe, "music_fetch": do_music_fetch}
 
 _stop = False
 
@@ -830,7 +1102,9 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
 
     m, q = media_root(config), quarantine_dir(config)
     # rescan reads the masters; it never writes to them.
-    need_media = bool({"promote", "purge", "rescan"} & set(kinds))
+    # music_fetch writes INTO the media tree rather than into quarantine — an
+    # approved song is archive content and goes where the archive reads from.
+    need_media = bool({"promote", "purge", "rescan", "music_fetch"} & set(kinds))
     need_q = bool({"promote", "fetch"} & set(kinds))
 
     for label, path, needed, why in (
@@ -870,6 +1144,17 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
         say(f"  fetch hosts    {', '.join(setting(config, 'archive_fetch_hosts'))}")
         say(f"  fetch caps     {_mmss(int(setting(config, 'archive_fetch_max_s')))}"
             f", {setting(config, 'archive_fetch_max_mb')} MB")
+    if "music_fetch" in kinds:
+        d = music_dir(config)
+        say(f"  music dir      {d}"
+            + ("" if d and os.path.isdir(d) else "  WILL BE CREATED"))
+        say(f"  music caps     {_mmss(int(setting(config, 'archive_music_max_s')))}"
+            f", {setting(config, 'archive_music_max_mb')} MB")
+        say(f"  music format   {setting(config, 'archive_music_format')}")
+    # Asked once for whichever kinds need it. It used to hang off `fetch`
+    # alone, which would have let a music-only worker start up clean and then
+    # fail every job on a binary that was never there.
+    if {"fetch", "music_probe", "music_fetch"} & set(kinds):
         if not shutil.which(_ytdlp(config)[0]):
             say(f"  yt-dlp         NOT FOUND at {_ytdlp(config)[0]}")
             ok = False

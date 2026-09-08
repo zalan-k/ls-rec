@@ -741,7 +741,13 @@ JOBS_SPOOL_PATH = os.path.join(SCRIPT_DIR, ".archive_jobs_outbox.json")
 # What this machine is willing to be asked for. The archive has its own copy of
 # this list and will refuse to hand out anything else, but that copy is a
 # courtesy: this one is the one that decides.
-PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest")
+PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
+            # Two halves of one errand, deliberately not one kind. The probe
+            # reads a page and is cheap enough to run on anybody's say-so; the
+            # fetch downloads a video and only ever follows a human saying yes.
+            # A single kind would have to be either approved twice or trusted
+            # once, and neither is what the archive means.
+            "music_probe", "music_fetch")
 
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 

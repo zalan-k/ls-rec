@@ -22,7 +22,7 @@
     "archive_media_root"     : "",
     "_archive_quarantine_dir": "Blank derives it: the sibling of the media root named quarantine.",
     "archive_quarantine_dir" : "",
-    "archive_job_kinds"      : ["fetch", "promote", "purge"],
+    "archive_job_kinds"      : ["fetch", "promote", "purge", "music_probe", "music_fetch"],
     "archive_job_interval"   : 20,
     "archive_worker_name"    : "",
 
@@ -31,5 +31,14 @@
                                 "cdn.discordapp.com", "media.discordapp.net"],
     "archive_fetch_max_s"    : 600,
     "archive_fetch_max_mb"   : 200,
-    "archive_fetch_timeout_s": 1800
+    "archive_fetch_timeout_s": 1800,
+
+    "_music"                 : "Songs the archive keeps a copy of. music_probe reads a page and needs nothing here; music_fetch writes into the media tree under archive_music_prefix.",
+    "archive_music_prefix"   : "music/",
+    "archive_music_max_s"    : 900,
+    "archive_music_max_mb"   : 500,
+    "archive_music_timeout_s": 1800,
+    "_archive_music_format"  : "yt-dlp -f. The format policy lives on this side on purpose: the archive names an id and a verb and never says what to fetch. bestaudio/best for an audio-only collection.",
+    "archive_music_format"   : "bv*[height<=1080]+ba/b[height<=1080]/b",
+    "archive_music_container": "mp4"
 }
