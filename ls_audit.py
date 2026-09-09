@@ -326,10 +326,55 @@ def scan_nas(config: dict, index: int) -> dict:
 #  Priority: CLI override → entry URL → NAS filename → cache (by index)
 #            → cache (by date, with auto-refresh if stale)
 
+# Refreshed at most once per run. The correction below wants a cache that has
+# heard of this id, and a sweep over two hundred entries must not mean two
+# hundred trips to Helix for the same answer.
+_TW_REFRESHED = False
+
+
 def resolve_id(config: dict, cache: list[dict], platform: str,
                entry: dict, nas: dict,
                cli_override: str | None = None) -> tuple[str | None, str | None]:
-    """Resolve video ID for a platform. Returns (video_id, source_label)."""
+    """Resolve video ID for a platform, correcting a Twitch STREAM id.
+
+    Everything upstream of this — the Obsidian entry, the NAS filename, and for
+    years the archive itself — can be holding the id of the BROADCAST rather
+    than of the video it became, because that is the only id that exists while
+    a stream is being recorded. Left alone it makes a watch URL that 404s and
+    an embed that plays nothing.
+
+    The correction is deliberately at the END rather than as another priority
+    step: it is not a fifth place to look, it is a fact about whatever the four
+    places returned. Wherever the id came from, if some VOD in the cache claims
+    that broadcast, the VOD's id is the answer.
+    """
+    global _TW_REFRESHED
+    vid, src = _resolve_id_raw(config, cache, platform, entry, nas, cli_override)
+    if platform != "twitch" or not vid:
+        return vid, src
+
+    fixed, corrected = ls_common.twitch_correct_id(cache, vid)
+    if corrected:
+        return fixed, f"{src} → vod (was a stream id)"
+
+    # Neither a VOD we know nor a broadcast we know. That is what a cache too
+    # old to have seen this stream looks like, so ask Helix once and re-try.
+    # An id that survives this really is a VOD id we simply have not cached.
+    if not ls_common.find_vod(cache, vid, "twitch") and not _TW_REFRESHED:
+        _TW_REFRESHED = True
+        print("  ⌛ Refreshing twitch cache (unknown id)...")
+        if ls_common.refresh_twitch_cache(config, cache, full=True):
+            ls_common.save_cache(cache)
+            fixed, corrected = ls_common.twitch_correct_id(cache, vid)
+            if corrected:
+                return fixed, f"{src} → vod (was a stream id)"
+    return vid, src
+
+
+def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
+                    entry: dict, nas: dict,
+                    cli_override: str | None = None) -> tuple[str | None, str | None]:
+    """Where an id is looked for, in order. See resolve_id for the correction."""
     tag = "yt" if platform == "youtube" else "tw"
 
     # 1. CLI override
@@ -1446,6 +1491,115 @@ def _pipeline(config: dict, cache: list[dict], index: int,
     return True
 
 
+def cmd_tw_ids(config: dict, apply_entries: bool = False):
+    """Which stored Twitch ids are broadcast ids, and what VOD each became.
+
+    Read-only by default, because the archive is the other half of this and
+    nothing here can reach it: the capture rows are keyed on the id they were
+    written with, and ls-archive refuses to repoint a capture from a sweep on
+    purpose. So this prints the mapping and lets a person carry it across.
+
+    `--apply` rewrites the Obsidian entries only, which is the half that is
+    safely rewritable — the entry is a derived document and ls-audit rebuilds
+    it anyway.
+    """
+    cache = ls_common.load_cache()
+    print("\n  ⌛ Refreshing twitch cache...")
+    if not ls_common.refresh_twitch_cache(config, cache, full=True):
+        print("  ✗ Could not reach Helix. Nothing was checked.")
+        return
+    ls_common.save_cache(cache)
+    known = sum(1 for v in cache
+                if v.get("platform") == "twitch" and v.get("stream_id"))
+    total = sum(1 for v in cache if v.get("platform") == "twitch")
+    print(f"  ✔ {total} VODs cached, {known} with a broadcast id\n")
+    if not known:
+        print("  ⚠ No VOD carries a stream_id. Twitch keeps these for a while,\n"
+              "    not forever — anything older than the window it serves can\n"
+              "    only be matched by date, which this deliberately will not do.\n")
+
+    top = ls_common.obsidian_next_index(config) - 1
+    rows, unknown = [], []
+    for idx in range(1, top + 1):
+        entry = ls_common.obsidian_parse_entry(config, idx)
+        if not entry.get("found") or not entry.get("tw_id"):
+            continue
+        stored = entry["tw_id"]
+        fixed, corrected = ls_common.twitch_correct_id(cache, stored)
+        if corrected:
+            vod = ls_common.find_vod(cache, fixed, "twitch") or {}
+            rows.append((idx, stored, fixed, vod.get("title") or "",
+                         (vod.get("start_time") or "")[:10]))
+        elif not ls_common.find_vod(cache, stored, "twitch"):
+            unknown.append((idx, stored, entry.get("date_str") or ""))
+
+    print(f"{'=' * 78}")
+    print("  Twitch ids that are broadcast ids, not videos")
+    print(f"{'=' * 78}")
+    if not rows:
+        print("  ✔ none — every entry holds a real VOD id.")
+    for idx, stored, fixed, title, date in rows:
+        print(f"  #{idx:03d}  {stored:>13}  →  {fixed:>11}   {date}  {title[:34]}")
+    print(f"\n  {len(rows)} to correct.")
+    if rows:
+        print("  In the archive, for each: set the TW capture's remote_id to the\n"
+              "  right-hand id and its url to https://www.twitch.tv/videos/<id>.")
+    if unknown:
+        print(f"\n  {len(unknown)} id{'' if len(unknown) == 1 else 's'} neither "
+              "a cached VOD nor a cached broadcast —")
+        print("  too old for the window Helix serves, or the VOD is gone:")
+        for idx, stored, date in unknown[:40]:
+            print(f"  #{idx:03d}  {stored:>13}   {date}")
+        if len(unknown) > 40:
+            print(f"  … and {len(unknown) - 40} more")
+    print()
+
+    if apply_entries and rows:
+        print("  Rewriting the Obsidian entries…")
+        done = 0
+        for idx, stored, fixed, _t, _d in rows:
+            if _rewrite_entry_tw_id(config, idx, stored, fixed):
+                done += 1
+        print(f"  ✔ {done} entr{'y' if done == 1 else 'ies'} rewritten. "
+              "The archive is untouched.\n")
+
+
+def _rewrite_entry_tw_id(config: dict, index: int,
+                         old_id: str, new_id: str) -> bool:
+    """Swap one id inside one entry's TW line, leaving everything else alone.
+
+    A targeted substitution rather than a rebuild: the entry holds notes and
+    hand edits, and this is a correction to one number in it, not a reason to
+    regenerate the whole block.
+    """
+    path = config["obsidian"]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+    span = ls_common._find_entry_block(lines, index)
+    if not span:
+        return False
+    start, end = span
+    hit = False
+    for i in range(start, end):
+        if not re.match(r"^\t`TW`", lines[i]):
+            continue
+        # Any of the three spellings in, the canonical one out.
+        def _sub(m):
+            return f"https://www.twitch.tv/videos/{new_id}"
+        fixed = re.sub(rf"https?://(?:www\.)?twitch\.tv/(?:[^/)\s]+/)?"
+                       rf"videos?/v?{re.escape(str(old_id))}", _sub, lines[i])
+        if fixed != lines[i]:
+            lines[i] = fixed
+            hit = True
+    if not hit:
+        return False
+    ls_common._write_lines_atomic(path, lines)
+    return True
+
+
 def cmd_sweep(config: dict, count: int = 5, interactive: bool = False):
     """Run the full audit over the most recent entries. Safe to run hourly."""
     idxs = _recent_indices(config, count)
@@ -1880,6 +2034,8 @@ examples:
   ls-audit --sweep [N]                Audit N recent entries (hourly timer)
   ls-audit 515 --archive              Reconcile with the archive only
   ls-audit 515 --archive --yes        ...filling blanks, asking nothing
+  ls-audit --tw-ids                   List Twitch ids that are broadcast ids
+  ls-audit --tw-ids --apply           ...and fix the Obsidian entries
         """,
     )
     parser.add_argument("index", nargs="?", type=int,
@@ -1923,10 +2079,19 @@ examples:
     parser.add_argument("--yes", action="store_true",
                         help="--archive: accept new values, leave collisions "
                              "alone, ask nothing")
+    parser.add_argument("--tw-ids", action="store_true",
+                        help="Report Twitch ids that are broadcast ids rather "
+                             "than videos, and what each should be")
+    parser.add_argument("--apply", action="store_true",
+                        help="--tw-ids: rewrite the Obsidian entries "
+                             "(the archive is never touched)")
 
     args = parser.parse_args()
     config = ls_common.load_config()
 
+    if args.tw_ids:
+        cmd_tw_ids(config, apply_entries=args.apply)
+        return
     if args.sweep is not None:
         cmd_sweep(config, args.sweep)
         return

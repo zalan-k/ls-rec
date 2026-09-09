@@ -568,6 +568,23 @@ def refresh_twitch_cache(config: dict, cache: list[dict], *,
             "start_time": v["created_at"],
             "channel":    config.get("twitch_user", ""),
             "duration":   parse_twitch_duration(v.get("duration")),
+            # The BROADCAST this VOD is a recording of, and the reason the two
+            # ids in this codebase kept disagreeing. Twitch has always sent it
+            # and we always dropped it.
+            #
+            # The recorder only ever sees the stream id — it catches the channel
+            # live, and the VOD does not exist until the broadcast ends — so
+            # this column is the only thing that can say "that broadcast became
+            # this video". Helix will not let you QUERY by it (there is no
+            # ?stream_id= filter and there never has been), which is exactly why
+            # it has to be stored on the way past rather than asked for later.
+            #
+            # Null on uploads and highlights, which were never a live broadcast.
+            # upsert_vod drops None, so those simply have no key.
+            "stream_id":  v.get("stream_id"),
+            # Twitch's own canonical link, rather than one assembled from
+            # guesses about the path. See build_stream_url.
+            "url":        v.get("url"),
         })
     return True
 
@@ -581,22 +598,82 @@ def refresh_twitch_cache(config: dict, cache: list[dict], *,
 #  surface area lives here so there's one place to touch.
 
 def extract_video_id_from_url(url: str) -> tuple[str | None, str | None]:
-    """Extract (video_id, platform) from a YouTube or Twitch URL."""
+    """Extract (video_id, platform) from a YouTube or Twitch URL.
+
+    Three Twitch spellings, because this archive has written all three:
+        twitch.tv/videos/123            the canonical one Twitch itself uses
+        twitch.tv/tenma/video/123       what build_stream_url used to make
+        twitch.tv/tenma/videos/123      what the recorder used to make
+    Only the first is written now; the other two still have to PARSE, because
+    years of Obsidian entries hold them and those entries are the input.
+
+    The optional `v` handles yt-dlp's VOD ids, which come through as `v123`.
+    """
     if not url:
         return None, None
     m = re.search(r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
     if m:
         return m.group(1), "youtube"
-    m = re.search(r"twitch\.tv/[^/]+/videos?/(\d+)", url)
+    m = re.search(r"twitch\.tv/(?:[^/]+/)?videos?/v?(\d+)", url)
     if m:
         return m.group(1), "twitch"
     return None, None
 
 
 def build_stream_url(config: dict, platform: str, video_id: str) -> str:
+    """The canonical watch URL for a video id.
+
+    Twitch's own form is `twitch.tv/videos/<id>` with no channel segment — it
+    is what Helix returns in `url` and what the site redirects everything else
+    to. This used to build `twitch.tv/<user>/video/<id>` while the recorder
+    built `twitch.tv/<user>/videos/<id>`, and since ls-audit re-derives the URL
+    through here on every pass, the two spellings meant every single archive
+    push proposed the same cosmetic rewrite forever. One builder, one spelling,
+    and the diff goes quiet.
+
+    `config` is unused for Twitch now and kept only because every call site
+    passes it; the YouTube branch has never needed it either.
+    """
     if platform == "youtube":
         return f"https://www.youtube.com/watch?v={video_id}"
-    return f"https://www.twitch.tv/{config['twitch_user']}/video/{video_id}"
+    return f"https://www.twitch.tv/videos/{str(video_id).lstrip('v')}"
+
+
+def find_vod_by_stream_id(cache: list[dict], stream_id: str,
+                          platform: str = "twitch") -> dict | None:
+    """The VOD a live broadcast turned into, or None.
+
+    The inverse of the recorder's blind spot. It probes the channel while she
+    is live, so yt-dlp hands it the STREAM id; the VOD is minted when the
+    broadcast ends and carries a different number entirely. This is the only
+    join between them, and it only works because refresh_twitch_cache now
+    keeps `stream_id`.
+    """
+    if not stream_id:
+        return None
+    want = str(stream_id).lstrip("v")
+    for v in cache:
+        if v.get("platform") != platform:
+            continue
+        if str(v.get("stream_id") or "").lstrip("v") == want:
+            return v
+    return None
+
+
+def twitch_correct_id(cache: list[dict], video_id: str) -> tuple[str, bool]:
+    """(video_id, was_a_stream_id).
+
+    Asks the cache rather than guessing from shape. A stream id is longer than
+    a VOD id today, and a rule built on that would be a rule that breaks
+    silently the year Twitch's counters roll over. "Some VOD claims this
+    broadcast" is a fact; "twelve digits" is a coincidence.
+    """
+    if not video_id:
+        return video_id, False
+    vod = find_vod_by_stream_id(cache, video_id)
+    if vod and vod.get("id") and str(vod["id"]) != str(video_id):
+        return str(vod["id"]), True
+    return video_id, False
 
 
 def build_shell_cmd(config: dict, filename: str) -> str:

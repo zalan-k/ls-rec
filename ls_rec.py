@@ -797,7 +797,27 @@ class LivestreamRecorder:
         else:
             title = data.get("description")
             stream_url = svc["url"]
-            obsidian_url = f"{svc['url']}/videos/{video_id.lstrip('v')}"
+            # The channel, and NOT a VOD link — because there is no VOD yet.
+            #
+            # This probes twitch.tv/<user> while she is live, so yt-dlp's Twitch
+            # extractor reports the STREAM id: the broadcast session. Twitch
+            # mints the VOD when the broadcast ends, with a different number.
+            # This line used to write `.../videos/<stream id>`, which is a URL
+            # that has never resolved to anything, and every downstream reader
+            # then trusted it as the VOD id — the archive keyed its capture on
+            # it, the Obsidian entry carried it, and ls-audit read it back out
+            # of that entry in preference to the Helix cache that knew better.
+            #
+            # The stream id is not lost: it stays in the recording's filename,
+            # `[{video_id}]`, which is where the id resolution reads it from and
+            # where find_vod_by_stream_id turns it into the real VOD id once the
+            # broadcast has ended. ls-audit rewrites this line with the true
+            # watch URL on its next pass.
+            #
+            # The `.lstrip('v')` that used to be here was the tell: only
+            # yt-dlp's VOD extractor emits `v123`, so this line was written for
+            # a case it is never given.
+            obsidian_url = svc["url"]
 
         return self._make_stream_info(
             platform, video_id, title, stream_url, obsidian_url, data=data,
