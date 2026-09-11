@@ -548,12 +548,10 @@ def build_entry(config: dict, cache: list[dict], index: int,
 
         vod = ls_common.find_vod(cache, vid_id, plat) if vid_id else None
         if measured:
+            # Read ffprobe, never write it back. A duplicated concat measures
+            # twice the broadcast, and persisting that made the bad number
+            # outlive the bad file -- deleting the video no longer cleared it.
             durations.append(measured)
-            if vod and abs((vod.get("duration") or 0) - measured) > 5:
-                print(f"    duration corrected from cache "
-                      f"{_seconds_to_hhmmss(vod.get('duration') or 0)} → "
-                      f"{_seconds_to_hhmmss(measured)} ({prefix})")
-                vod["duration"] = int(measured)
         elif vod and vod.get("duration"):
             durations.append(vod["duration"])
     if durations:
@@ -1041,6 +1039,9 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
 
 CHAT_SHORTFALL_MAX_SECS = 3600
 CHAT_SHORTFALL_FRACTION = 0.5
+# A video this much longer than the broadcast is a duplicated concat, not a
+# long stream. Comparing chat against it blames the chat for the video's fault.
+DUPLICATE_VIDEO_RATIO   = 1.8
 
 
 def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
@@ -1058,18 +1059,29 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
     if last is None or not isinstance(info["count"], int) or not info["count"]:
         return None
 
-    # ffprobe first: it measures the file actually held, whereas the cache
-    # holds the published length.
-    duration = None
-    video_file = nas.get("yt_video")
-    if video_file:
-        vp = os.path.join(config.get("nas_path", ""), video_file)
-        if os.path.exists(vp):
-            duration = analyze_video_file(vp).get("duration_secs")
-    if not duration and yt_id:
-        vod = ls_common.find_vod(cache, yt_id, "youtube") or {}
-        duration = vod.get("duration")
+    # Measure the file actually held. No cached fallback: with no video there
+    # is nothing to compare against, and a remembered length is how a stale
+    # number kept flagging an entry whose bad file had already been deleted.
+    def _probe(prefix):
+        f = nas.get(f"{prefix}_video")
+        if not f:
+            return None
+        vp = os.path.join(config.get("nas_path", ""), f)
+        return analyze_video_file(vp).get("duration_secs") if os.path.exists(vp) else None
+
+    duration = _probe("yt")
     if not duration or duration <= 0:
+        return None                     # no file, no verdict
+
+    # A duplicated concat measures twice the broadcast, which inverts this
+    # check: the chat looks half-missing when the video is double length.
+    # The chat's own span and the other platform agree with each other and
+    # only the video disagrees, so cross-check before blaming the chat.
+    ref = max([x for x in (last, _probe("tw")) if x] or [0])
+    if ref and duration >= ref * DUPLICATE_VIDEO_RATIO:
+        print(f"    ⚠ YT video is {duration / ref:.1f}x the broadcast "
+              f"({_seconds_to_hhmmss(duration)} vs {_seconds_to_hhmmss(ref)}) — "
+              f"likely a duplicated concat; skipping the chat coverage check")
         return None
 
     shortfall = duration - last
