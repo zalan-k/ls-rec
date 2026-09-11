@@ -119,8 +119,17 @@ PART = ".part-"
 # Extensions a fetch may keep. Not a security control — the containment check
 # is that — but a fetch that came back as a .html error page should not be
 # handed to the archive as a snippet.
+#
+# The stills are here because memes and the gallery can be linked now, and a
+# Discord attachment is the commonest way one arrives. Without them a pasted
+# png was downloaded, renamed .mp4 by the DIRECT_HOSTS branch below — which
+# falls back to .mp4 for anything not on this list — and handed to the archive
+# as a video that is not one. The archive names the file after the snippet
+# using this extension, so getting it wrong here is a wrong name on disk
+# forever, not just a wrong guess in a log line.
 KEEP_EXT = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".gif",
-            ".m4a", ".mp3", ".opus", ".ogg", ".wav", ".flac"}
+            ".m4a", ".mp3", ".opus", ".ogg", ".wav", ".flac",
+            ".png", ".jpg", ".jpeg", ".webp"}
 
 
 def setting(config: dict, key: str):
