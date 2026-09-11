@@ -1070,8 +1070,15 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
         return analyze_video_file(vp).get("duration_secs") if os.path.exists(vp) else None
 
     duration = _probe("yt")
+    dur_src = "yt video"
     if not duration or duration <= 0:
-        return None                     # no file, no verdict
+        # No YouTube video is not "no verdict" when the other half of a
+        # simulcast is sitting right there: it is the same broadcast, so its
+        # length is what the chat should have covered. Without this, a missing
+        # VOD silently disabled the repair offer for the chat too.
+        duration, dur_src = _probe("tw"), "tw video (same broadcast)"
+    if not duration or duration <= 0:
+        return None                     # nothing to compare against
 
     # A duplicated concat measures twice the broadcast, which inverts this
     # check: the chat looks half-missing when the video is double length.
@@ -1090,6 +1097,7 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
         return None
 
     return {"chat_file": chat_file, "chat_path": chat_path, "video_id": yt_id,
+            "duration_source": dur_src,
             "count": info["count"], "last_secs": last,
             "duration_secs": duration, "shortfall_secs": shortfall,
             "limit_secs": limit}
@@ -1155,7 +1163,8 @@ def _offer_chat_backfill(config: dict, item: dict,
     print("\n  ⚠ YouTube chat looks truncated:")
     print(f"      {item['count']:,} messages, ending at "
           f"{_seconds_to_hhmmss(item['last_secs'])} of "
-          f"{_seconds_to_hhmmss(item['duration_secs'])}")
+          f"{_seconds_to_hhmmss(item['duration_secs'])}"
+          f"  [{item.get('duration_source', 'yt video')}]")
     print(f"      short by {_seconds_to_hhmmss(item['shortfall_secs'])} "
           f"(flags above {_seconds_to_hhmmss(item['limit_secs'])})")
 
@@ -1347,8 +1356,13 @@ def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
 def cmd_merge_chat(config: dict, index: int, ref="youtube",
                    zeros: list | None = None, output: str | None = None,
                    dry_run: bool = False, keep_raw: bool = False,
-                   assets: bool = True):
-    """Merge this entry's chat captures into one origin-tagged file."""
+                   assets: bool = True, allow_partial: bool = False):
+    """Merge this entry's chat captures into one origin-tagged file.
+
+    Returns {"merged": path, "moved": platforms} on success, or None when
+    nothing was written -- including a refusal to write a merge that is
+    missing a whole capture.
+    """
     nas_root = config.get("nas_path", "")
     print(f"\n{'=' * 60}")
     print(f"  Merging chat for entry #{index}")
@@ -1401,13 +1415,38 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
           f"{datetime.datetime.fromtimestamp(md['zero_epoch_ms'] / 1000):%Y-%m-%d %H:%M:%S}")
     if md["duplicates_removed"]:
         print(f"  dupes    {md['duplicates_removed']:,}")
-    if md["unplaced_no_abs"]:
+    # A source that landed NOTHING is not a warning, it is a failed merge.
+    # Writing the file anyway is the dangerous part: merged-chat.json existing
+    # is what marks an entry finished, so a sweep would never look at it again
+    # and a whole platform's chat would quietly cease to exist.
+    dropped = [x for x in md["sources"] if not x.get("placed")]
+    if dropped:
+        print()
+        print("  " + "!" * 62)
+        print("  !!  MERGE INCOMPLETE — a capture contributed nothing")
+        for x in dropped:
+            print(f"  !!    {x['platform']:<8} {x['unplaced']:>6,} messages dropped"
+                  f"  (zero: {x['zero_source']})")
+            print(f"  !!    {x['file']}")
+        print("  !!")
+        print("  !!  These captures have no absolute timestamps, so nothing can")
+        print("  !!  place them on the timeline. Give one explicitly:")
+        for x in dropped:
+            print(f"  !!    ls-audit {int(index)} --merge-chat "
+                  f"--zero {x['platform']}=<epoch|ISO|+secs>")
+        print("  " + "!" * 62)
+        if not allow_partial:
+            print("\n  Nothing written; the raw captures are untouched.")
+            print("  Use --allow-partial to write a merge that is missing them.\n")
+            return None
+        print("\n  --allow-partial: writing anyway.")
+    elif md["unplaced_no_abs"]:
         print(f"  ⚠ {md['unplaced_no_abs']:,} messages had no absolute time and "
               f"were omitted.\n    Supply a zero with --zero PLATFORM=<epoch|ISO|+secs>")
 
     if dry_run:
         print("\n  --dry-run: nothing written.\n")
-        return
+        return None
 
     if not output:
         output = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
@@ -1499,8 +1538,10 @@ def _pipeline(config: dict, cache: list[dict], index: int,
             print("    still short after repair — will retry")
             return changed
 
-    cmd_merge_chat(config, index)          # merges, then archives the raws
-    return True
+    # A refused merge (a capture with no absolute time) returns None. Report
+    # nothing done, so the entry stays unfinished and a later sweep retries it
+    # once a zero has been supplied.
+    return bool(cmd_merge_chat(config, index))
 
 
 def cmd_tw_ids(config: dict, apply_entries: bool = False):
@@ -2078,6 +2119,9 @@ examples:
                         help="--merge-chat: output path")
     parser.add_argument("--dry-run", action="store_true",
                         help="--merge-chat: report without writing")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="--merge-chat: write even if a capture could not "
+                             "be placed on the timeline")
     parser.add_argument("--no-assets", action="store_true",
                         help="--merge-chat: skip fetching emote and badge "
                              "pictures")
@@ -2130,7 +2174,8 @@ examples:
         ref = int(args.ref) if args.ref.lstrip("-").isdigit() else args.ref
         cmd_merge_chat(config, args.index, ref=ref, zeros=args.zero,
                        output=args.output, dry_run=args.dry_run,
-                       assets=not args.no_assets)
+                       assets=not args.no_assets,
+                       allow_partial=args.allow_partial)
         return
 
     if args.archive:

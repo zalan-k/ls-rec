@@ -1159,11 +1159,17 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
     mixed = {p for p, f in fmts.items() if len(f) > 1}
 
     out, seen, dupes, unplaced = [], set(), 0, 0
+    # Per source. A global count cannot distinguish a few odd messages from
+    # an entire capture being dropped, and those need different responses.
+    placed_by_file: dict[str, int] = {}
+    unplaced_by_file: dict[str, int] = {}
     said = {}                    # (platform, author, text) -> [abs_ms, ...]
-    for c in convs:
+    for path, c in zip(paths, convs):
+        fname = os.path.basename(path)
         for m in c.messages:
             if m.abs_ms is None:
                 unplaced += 1
+                unplaced_by_file[fname] = unplaced_by_file.get(fname, 0) + 1
                 continue
             if m.id and (c.platform, m.id) in seen:
                 dupes += 1
@@ -1187,6 +1193,7 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             d.pop("ts", None)
             d.pop("id", None)
             out.append(d)
+            placed_by_file[fname] = placed_by_file.get(fname, 0) + 1
     out.sort(key=lambda d: d["abs_ms"])
 
     emotes: dict[str, dict] = {}
@@ -1253,7 +1260,9 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             "sources": [{"file": os.path.basename(p), "platform": c.platform,
                          "format": c.fmt, "messages": len(c.messages),
                          "zero_ms": c.zero_ms, "zero_source": c.zero_src,
-                         "skipped_lines": c.skipped}
+                         "skipped_lines": c.skipped,
+                         "placed": placed_by_file.get(os.path.basename(p), 0),
+                         "unplaced": unplaced_by_file.get(os.path.basename(p), 0)}
                         for p, c in zip(paths, convs)],
             "emotes": emotes,
             "badges": badges,
