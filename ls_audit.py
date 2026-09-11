@@ -1084,7 +1084,11 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
     # check: the chat looks half-missing when the video is double length.
     # The chat's own span and the other platform agree with each other and
     # only the video disagrees, so cross-check before blaming the chat.
-    ref = max([x for x in (last, _probe("tw")) if x] or [0])
+    # The other platform's video ONLY. The chat's own span cannot serve here:
+    # "video doubled" and "chat truncated" look identical against it, and
+    # using it turned every genuinely short chat into a phantom duplicate --
+    # suppressing the very repair offer this check exists to trigger.
+    ref = _probe("tw")
     if ref and duration >= ref * DUPLICATE_VIDEO_RATIO:
         print(f"    ⚠ YT video is {duration / ref:.1f}x the broadcast "
               f"({_seconds_to_hhmmss(duration)} vs {_seconds_to_hhmmss(ref)}) — "

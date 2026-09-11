@@ -513,9 +513,14 @@ class IrcConverter(Converter):
                 if not line or line in ("[", "]"):
                     continue
                 try:
-                    out.append(json.loads(line))
+                    item = json.loads(line)
                 except json.JSONDecodeError:
                     self.skipped += 1
+                    continue
+                if not isinstance(item, dict):
+                    self.skipped += 1
+                    continue
+                out.append(item)
         return out
 
     def _derive_zero(self, items):
@@ -801,6 +806,11 @@ class YtdlpConverter(Converter):
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
+                    self.skipped += 1
+                    continue
+                # One object per line is the norm, but a bare string or list
+                # parses fine and then crashes every accessor below.
+                if not isinstance(obj, dict):
                     self.skipped += 1
                     continue
                 ts = self._ts(obj)
