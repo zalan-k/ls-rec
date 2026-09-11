@@ -395,6 +395,45 @@ def _tail(text: str, n: int = 300) -> str:
     return re.sub(r"^ERROR:\s*", "", msg)[:n]
 
 
+# yt-dlp's complaint, turned into something the person who pasted the link can
+# act on. Only the ones that are ABOUT the link rather than about this end —
+# everything else falls through to _tail unchanged, because a message nobody
+# anticipated is more useful verbatim than flattened into "something failed".
+#
+# The X one is the reason this exists. Roughly one post in twenty comes back
+# without its media when nobody is signed in: X hands a guest incomplete JSON,
+# yt-dlp finds no media in it and says so, and the sentence it says reads like
+# a bug in the archive rather than what it is — a post this recorder cannot
+# have. Signing the Pi in would fix it and is not worth a credential sitting on
+# the recorder, so the answer to that 1-in-20 is to say so and name the way
+# round it, which is to download it yourself and upload the file.
+_EXPLAIN = (
+    (r"No video could be found in this tweet",
+     "X did not hand over the video for that post — it does this to signed-out "
+     "callers on some posts. Save the file yourself and upload it instead."),
+    (r"NSFW tweet requires authentication|Requires authentication",
+     "that post is behind a sign-in wall, and this recorder is not signed in to "
+     "anything. Save the file yourself and upload it instead."),
+    (r"Unable to find playlist|nothing to download",
+     "there is no media on that page — check the link points at the post with "
+     "the video in it, not at a reply or a profile."),
+    (r"Private video|This video is private",
+     "that one is private."),
+    (r"Video unavailable|has been removed|no longer available",
+     "that one is gone from the host."),
+    (r"Sign in to confirm|age.?restricted|age.?gated",
+     "the host wants an account before it will serve that one, and this "
+     "recorder is not signed in to anything."),
+)
+
+
+def _explain(raw: str) -> str:
+    for pattern, said in _EXPLAIN:
+        if re.search(pattern, raw, re.I):
+            return said
+    return raw
+
+
 def probe_duration(config: dict, url: str) -> float | None:
     """Seconds, or None when the host will not say."""
     try:
@@ -512,8 +551,8 @@ def do_fetch(config: dict, job: dict):
                 "--max-filesize", f"{max_bytes}",
                 "-o", stem + ".%(ext)s", url], timeout)
             if r.returncode != 0:
-                return ("failed", None,
-                        _tail(r.stderr) or _tail(r.stdout) or f"yt-dlp exited {r.returncode}")
+                return ("failed", None, _explain(
+                    _tail(r.stderr) or _tail(r.stdout) or f"yt-dlp exited {r.returncode}"))
             found = sorted(glob.glob(stem + ".*"), key=os.path.getsize, reverse=True)
             if not found:
                 # --max-filesize aborts by writing nothing at all, which is
@@ -984,8 +1023,8 @@ def do_music_fetch(config: dict, job: dict):
             "--max-filesize", f"{max_bytes}",
             "-o", stem + ".%(ext)s", url], timeout)
         if r.returncode != 0:
-            return ("failed", None,
-                    _tail(r.stderr) or _tail(r.stdout) or f"yt-dlp exited {r.returncode}", None)
+            return ("failed", None, _explain(
+                _tail(r.stderr) or _tail(r.stdout) or f"yt-dlp exited {r.returncode}"), None)
 
         got = sorted((f for f in glob.glob(stem + ".*")
                       if os.path.splitext(f)[1].lower() in KEEP_EXT),
