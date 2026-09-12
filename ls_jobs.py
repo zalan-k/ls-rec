@@ -256,6 +256,91 @@ def allowed_host(config: dict, url: str) -> str | None:
 #  PROMOTE
 # ══════════════════════════════════════════════════════════════════════════
 
+def do_clip(config: dict, job: dict):
+    """Cut a range out of a master into quarantine. (status, result_path, error).
+
+    The archive has already worked out WHICH file and WHICH second — it holds
+    the clocks — so this end does no arithmetic beyond the seek itself. That
+    split is deliberate: the wall-clock-to-file-offset conversion is the part
+    with the subtle bugs, it lives in one place, and that place has tests.
+
+    Stream copy, never a re-encode. The point of cutting from the master is to
+    get the master's own bytes: an encode would cost minutes of Pi CPU and
+    hand back something worse than what is already on disk.
+
+    `-ss` BEFORE `-i` so ffmpeg seeks rather than decoding to the start point —
+    the difference between instant and several minutes on a four-hour file. It
+    seeks to the nearest keyframe, so the real start can be a second or two off
+    the number asked for. With a lead of any size that is invisible; it is the
+    reason a zero-lead clip can open a moment late, and the reason not to
+    "fix" it with an accurate seek that re-encodes.
+    """
+    pay = job.get("payload") or {}
+    m, q = media_root(config), quarantine_dir(config)
+    src = resolve_name(m, pay.get("path"))
+    if not src:
+        return ("failed", None, "the archive named a file this worker will not touch")
+    if not os.path.isfile(src):
+        return ("failed", None, "that master is not on this recorder's mount")
+    if not q or not os.path.isdir(q):
+        return ("failed", None, "this worker has nowhere to put it")
+
+    try:
+        start = float(pay.get("start_s"))
+        dur = float(pay.get("duration_s"))
+    except (TypeError, ValueError):
+        return ("failed", None, "the job did not name a start and a duration")
+    if start < 0 or dur <= 0:
+        return ("failed", None, "that is not a range")
+
+    name = resolve_name(q, pay.get("name"), bare=True)
+    if not name:
+        return ("failed", None, "the archive named an output this worker will not write")
+    rel = os.path.basename(name)
+    # A `.part-` name while it is being written, renamed when it is whole, for
+    # the same reason a fetch does it: the archive's quarantine view reads that
+    # prefix and shows an unfinished file as unfinished rather than as an
+    # orphan it might serve half of.
+    tmp = os.path.join(q, f"{PART}{job['id']}.mp4")
+    _scraps(q, job["id"])
+
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+           "-ss", f"{start:.3f}", "-i", src, "-t", f"{dur:.3f}",
+           "-c", "copy",
+           # Without this the copied stream keeps the master's timestamps, so
+           # the clip reports itself as starting two hours in and some players
+           # show a two-hour-long file with nothing before the cut.
+           "-avoid_negative_ts", "make_zero",
+           "-movflags", "+faststart", tmp]
+    try:
+        r = _run(cmd, int(setting(config, "archive_fetch_timeout_s")))
+    except subprocess.TimeoutExpired:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return ("failed", None, "ffmpeg took too long")
+    if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return ("failed", None, _tail(r.stderr) or _tail(r.stdout) or "ffmpeg wrote nothing")
+
+    dst = os.path.join(q, rel)
+    try:
+        os.replace(tmp, dst)
+    except OSError as e:
+        return ("failed", None, f"could not name it: {e.strerror or e}")
+    got = file_duration(dst)
+    logger.info(f"clip {rel}: {_mmss(dur)} from {_mmss(start)} of "
+                f"{os.path.basename(src)}"
+                + (f" (got {_mmss(got)})" if got else ""))
+    # The path is relative to quarantine, which is what the archive resolves
+    # against when it serves the one download.
+    return ("done", rel, None)
+
+
 def do_promote(config: dict, job: dict):
     """Quarantine into the media tree. Returns (status, result_path, error)."""
     pay = job.get("payload") or {}
@@ -1081,7 +1166,8 @@ def do_music_fetch(config: dict, job: dict):
 
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
             "rescan": do_rescan, "harvest": do_harvest,
-            "music_probe": do_music_probe, "music_fetch": do_music_fetch}
+            "music_probe": do_music_probe, "music_fetch": do_music_fetch,
+            "clip": do_clip}
 
 _stop = False
 
