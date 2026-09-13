@@ -742,6 +742,11 @@ JOBS_SPOOL_PATH = os.path.join(SCRIPT_DIR, ".archive_jobs_outbox.json")
 # this list and will refuse to hand out anything else, but that copy is a
 # courtesy: this one is the one that decides.
 PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
+            # A range out of a file that is already here: a promoted master on
+            # the mount, or the part being written this second. No network and
+            # no extractor, which is why clipping keeps working on the days
+            # nothing else does.
+            "clip",
             # Two halves of one errand, deliberately not one kind. The probe
             # reads a page and is cheap enough to run on anybody's say-so; the
             # fetch downloads a video and only ever follows a human saying yes.

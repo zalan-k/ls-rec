@@ -256,6 +256,143 @@ def allowed_host(config: dict, url: str) -> str | None:
 #  PROMOTE
 # ══════════════════════════════════════════════════════════════════════════
 
+# The daemon's command socket. Named here rather than imported from ls_rec:
+# that module is the recorder, and importing it would pull yt_dlp and a whole
+# logging setup into a worker that wants neither.
+RECORDER_SOCKET    = "/tmp/livestream-recorder.sock"
+CLIP_ASK_TIMEOUT_S = 25     # planning is arithmetic; this is already generous
+CLIP_WAIT_S        = 150    # bounded well inside the archive's 5-minute lease
+CLIP_SETTLE_S      = 1.5    # an unchanged size for this long means ffmpeg is done
+
+
+def _ask_recorder(config: dict, line: str) -> str:
+    """One request to the daemon's command socket. Raises on anything."""
+    path = str(config.get("recorder_socket") or RECORDER_SOCKET)
+    if not os.path.exists(path):
+        raise FileNotFoundError("the recorder is not running")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(CLIP_ASK_TIMEOUT_S)
+    try:
+        s.connect(path)
+        s.sendall(line.encode("utf-8"))
+        chunks = []
+        while True:
+            b = s.recv(8192)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        s.close()
+    return b"".join(chunks).decode("utf-8", "replace").strip()
+
+
+def _clip_live(config: dict, job: dict, pay: dict, q: str, rel: str):
+    """Cut from the part the recorder is writing right now.
+
+    No arithmetic here, and for the opposite reason to the master path below.
+    There the archive holds the clocks because it holds the capture rows; here
+    the DAEMON holds them — which part file is open, what wall time its frame 0
+    is, how close the live edge has crept — in memory nothing else can see. So
+    this asks, the daemon's own planner answers, and a clip from the browser is
+    the same cut as one typed at `ls-rec clip`.
+
+    Returns a fourth element: what the cut actually turned out to be, so the
+    archive can say "you asked for a minute and the last nineteen seconds had
+    not happened yet" instead of quietly handing over a short file.
+    """
+    req = {
+        "at":       pay.get("at_wall"),
+        "length":   pay.get("duration_s"),
+        "lead":     pay.get("lead_s"),
+        "platform": pay.get("platform"),
+        "name":     pay.get("label") or None,
+    }
+    if req["at"] is None or not req["length"]:
+        return ("failed", None, "the job did not name a moment and a length")
+    try:
+        reply = _ask_recorder(config, "clipjob " + json.dumps(req))
+    except Exception as e:
+        return ("failed", None, f"could not reach the recorder: {type(e).__name__}")
+    try:
+        ans = json.loads(reply)
+    except ValueError:
+        return ("failed", None, f"the recorder said: {_tail(reply)}")
+    if not ans.get("ok"):
+        return ("failed", None, str(ans.get("error") or "the recorder refused the cut"))
+
+    out = str(ans.get("out") or "")
+    if not out:
+        return ("failed", None, "the recorder named no output")
+
+    # The cut runs on a thread in the daemon, so the file appears after the
+    # reply does. Wait for it to exist and then to stop growing: ffmpeg writes
+    # the moov atom last and +faststart rewrites the file to move it to the
+    # front, so a clip taken mid-write is a clip that will not play.
+    deadline = time.time() + CLIP_WAIT_S
+    size, still = -1, 0.0
+    while time.time() < deadline:
+        try:
+            grown = os.path.getsize(out)
+        except OSError:
+            time.sleep(0.5)
+            continue
+        if grown > 0 and grown == size:
+            still += 0.5
+            if still >= CLIP_SETTLE_S:
+                break
+        else:
+            size, still = grown, 0.0
+        time.sleep(0.5)
+    else:
+        return ("failed", None, "the recorder did not finish the cut in time")
+
+    # Into quarantine under the name the archive asked for. clips_dir is on
+    # this machine's own disk and quarantine sits beside the media tree, so
+    # this is usually a cross-device move: copy to a `.part-` scrap, fsync,
+    # rename into place, then drop the original. MOVED and not copied — the
+    # archive asked for this cut and the archive's copy is the deliverable, so
+    # clips_dir is not left holding a duplicate to be swept up later.
+    dst = os.path.join(q, rel)
+    tmp = os.path.join(q, f"{PART}{job['id']}.mp4")
+    _scraps(q, job["id"])
+    try:
+        try:
+            os.replace(out, dst)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+            shutil.copyfile(out, tmp)
+            with open(tmp, "rb+") as f:
+                os.fsync(f.fileno())
+            os.replace(tmp, dst)
+            os.remove(out)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return ("failed", None, f"could not move the clip: {e.strerror or e}")
+
+    got = file_duration(dst)
+    asked = float(ans.get("asked") or 0)
+    cut = float(ans.get("length") or 0)
+    logger.info(f"clip {rel}: live {_mmss(cut)} from part {ans.get('part')}"
+                f" @ {_mmss(float(ans.get('offset') or 0))}"
+                + (f" (got {_mmss(got)})" if got else "")
+                + (f" — asked {_mmss(asked)}"
+                   if asked and abs(asked - cut) >= 1 else ""))
+    return ("done", rel, None, {
+        "live":     True,
+        "platform": ans.get("platform"),
+        "part":     ans.get("part"),
+        "offset_s": ans.get("offset"),
+        "asked_s":  asked or None,
+        "length_s": cut or None,
+        "actual_s": got,
+        "notes":    ans.get("notes") or [],
+    })
+
+
 def do_clip(config: dict, job: dict):
     """Cut a range out of a master into quarantine. (status, result_path, error).
 
@@ -276,14 +413,28 @@ def do_clip(config: dict, job: dict):
     "fix" it with an accurate seek that re-encodes.
     """
     pay = job.get("payload") or {}
-    m, q = media_root(config), quarantine_dir(config)
+    q = quarantine_dir(config)
+    if not q or not os.path.isdir(q):
+        return ("failed", None, "this worker has nowhere to put it")
+    name = resolve_name(q, pay.get("name"), bare=True)
+    if not name:
+        return ("failed", None, "the archive named an output this worker will not write")
+    rel = os.path.basename(name)
+
+    # Two sources, one output, and the split is about who holds the clocks.
+    # A promoted master is a file this worker can open and seek itself, and the
+    # archive did the wall-clock arithmetic because the archive owns the
+    # capture rows. The part being written right now is the other way round:
+    # only the daemon knows which file is open and when its frame 0 was.
+    if pay.get("live"):
+        return _clip_live(config, job, pay, q, rel)
+
+    m = media_root(config)
     src = resolve_name(m, pay.get("path"))
     if not src:
         return ("failed", None, "the archive named a file this worker will not touch")
     if not os.path.isfile(src):
         return ("failed", None, "that master is not on this recorder's mount")
-    if not q or not os.path.isdir(q):
-        return ("failed", None, "this worker has nowhere to put it")
 
     try:
         start = float(pay.get("start_s"))
@@ -292,11 +443,6 @@ def do_clip(config: dict, job: dict):
         return ("failed", None, "the job did not name a start and a duration")
     if start < 0 or dur <= 0:
         return ("failed", None, "that is not a range")
-
-    name = resolve_name(q, pay.get("name"), bare=True)
-    if not name:
-        return ("failed", None, "the archive named an output this worker will not write")
-    rel = os.path.basename(name)
     # A `.part-` name while it is being written, renamed when it is whole, for
     # the same reason a fetch does it: the archive's quarantine view reads that
     # prefix and shows an unfinished file as unfinished rather than as an
@@ -453,20 +599,78 @@ def do_purge(config: dict, job: dict):
 # reason rather than a shrug. Hosts that will not report a duration fall
 # through to the byte cap and a second check once the bytes are here.
 
-def _ytdlp(config: dict) -> list[str]:
-    """The binary, without cookies.
+def _ytdlp(config: dict, cookies: bool = True) -> list[str]:
+    """The binary, with this recorder's browser cookies on it.
 
-    ls_common builds this too, but with `--cookies-from-browser` on by
-    default — right for recording her streams while signed in, wrong for a
-    public link on a headless Pi where there is no browser to read cookies
-    out of and the flag is a hard failure rather than a fallback.
+    ls_common's builder, not a second copy of it: the venv path and the browser
+    name are config and belong in one place, and a private name across two
+    files of the same package is a smaller thing to carry than two argvs that
+    drift.
+
+    Cookied, and that is the point. Post-hoc VOD downloads have always been
+    cookied — `ytdlp_vod_cmd` never asked — and this end was the outlier, on a
+    rationale about a headless Pi with no browser to read cookies out of that
+    was never true of THIS Pi: it records Twitch signed in on every stream. A
+    members-only concert or a bot-checked video is a download that cannot
+    happen any other way.
+
+    `cookies=False` exists for one thing only, and it is not a public link: a
+    jar that will not open. `--cookies-from-browser` is a hard failure rather
+    than a degradation, so a locked, moved or missing profile would otherwise
+    take down every download here — including the ones that never needed a
+    session. See _ytdlp_run.
     """
-    venv = config.get("venv")
-    return [os.path.join(venv, "bin", "yt-dlp") if venv else "yt-dlp"]
+    return ls_common._ytdlp_base(config, cookies=cookies)
 
 
 def _run(cmd: list[str], timeout: int):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+# What yt-dlp says when the COOKIES are the problem rather than the video.
+#
+# Narrow on purpose. An anonymous retry is only ever the right answer when the
+# jar could not be read; a members-only video retried without cookies fails a
+# second time, spends the bandwidth twice, and reports the less useful of its
+# two refusals — so everything not matched here is taken at its word.
+#
+# Which is why the flag's own name is NOT in here, tempting as it is. yt-dlp
+# prints `--cookies-from-browser` as ADVICE inside the bot-check message —
+# "Sign in to confirm you're not a bot. Use --cookies-from-browser ... for the
+# authentication" — so a pattern that matched the flag would read a bot check
+# as a broken jar, retry it with the cookies taken away, and report the one
+# refusal of the two that the person reading it can do nothing about.
+_COOKIE_TROUBLE = re.compile(
+    r"could not (?:find|copy|open|read|decrypt)[^\n]{0,60}cookie"
+    r"|cookie[s]?[^\n]{0,20}database"
+    r"|cookies\.sqlite"
+    r"|unsupported browser"
+    r"|failed to decrypt",
+    re.I)
+
+
+def _ytdlp_run(config: dict, args: list[str], timeout: int):
+    """yt-dlp, cookied, falling back to anonymous if the jar will not open.
+
+    One entry point for every download this worker makes, so "use my cookies"
+    is true of all of them and stays true of the next one somebody adds.
+
+    The fallback is not a retry policy. It fires on a complaint about the
+    cookies and on nothing else, and it is here so that a Firefox profile that
+    has moved or locked degrades this worker to what it did before it was
+    cookied instead of stopping it dead. The cookie complaint arrives before
+    any bytes do — extraction has not started yet — so the second attempt is
+    not a second download.
+    """
+    r = _run(_ytdlp(config) + args, timeout)
+    if r.returncode == 0:
+        return r
+    said = (r.stderr or "") + "\n" + (r.stdout or "")
+    if not _COOKIE_TROUBLE.search(said):
+        return r
+    logger.warning("yt-dlp could not read this recorder's cookies, so this one "
+                   "goes out anonymous: %s", _tail(said))
+    return _run(_ytdlp(config, cookies=False) + args, timeout)
 
 
 def _tail(text: str, n: int = 300) -> str:
@@ -486,19 +690,19 @@ def _tail(text: str, n: int = 300) -> str:
 # anticipated is more useful verbatim than flattened into "something failed".
 #
 # The X one is the reason this exists. Roughly one post in twenty comes back
-# without its media when nobody is signed in: X hands a guest incomplete JSON,
-# yt-dlp finds no media in it and says so, and the sentence it says reads like
-# a bug in the archive rather than what it is — a post this recorder cannot
-# have. Signing the Pi in would fix it and is not worth a credential sitting on
-# the recorder, so the answer to that 1-in-20 is to say so and name the way
-# round it, which is to download it yourself and upload the file.
+# without its media when the caller is not recognised: X hands a guest
+# incomplete JSON, yt-dlp finds no media in it and says so, and the sentence it
+# says reads like a bug in the archive rather than what it is — a post this
+# recorder cannot have. The recorder's cookies cover the sites it is signed in
+# to on this Pi and X is not usually one of them, so the answer to that 1-in-20
+# is to say so and name the way round it: download it yourself and upload it.
 _EXPLAIN = (
     (r"No video could be found in this tweet",
-     "X did not hand over the video for that post — it does this to signed-out "
-     "callers on some posts. Save the file yourself and upload it instead."),
+     "X did not hand over the video for that post — it does this to callers it "
+     "does not recognise. Save the file yourself and upload it instead."),
     (r"NSFW tweet requires authentication|Requires authentication",
-     "that post is behind a sign-in wall, and this recorder is not signed in to "
-     "anything. Save the file yourself and upload it instead."),
+     "that post is behind a sign-in wall this recorder's cookies did not get "
+     "past. Save the file yourself and upload it instead."),
     (r"Unable to find playlist|nothing to download",
      "there is no media on that page — check the link points at the post with "
      "the video in it, not at a reply or a profile."),
@@ -508,7 +712,7 @@ _EXPLAIN = (
      "that one is gone from the host."),
     (r"Sign in to confirm|age.?restricted|age.?gated",
      "the host wants an account before it will serve that one, and this "
-     "recorder is not signed in to anything."),
+     "recorder's cookies did not satisfy it."),
 )
 
 
@@ -522,8 +726,8 @@ def _explain(raw: str) -> str:
 def probe_duration(config: dict, url: str) -> float | None:
     """Seconds, or None when the host will not say."""
     try:
-        r = _run(_ytdlp(config) + ["--no-warnings", "--no-playlist", "--skip-download",
-                                   "--print", "%(duration)s", url], 90)
+        r = _ytdlp_run(config, ["--no-warnings", "--no-playlist", "--skip-download",
+                                "--print", "%(duration)s", url], 90)
     except subprocess.TimeoutExpired:
         return None
     if r.returncode != 0:
@@ -624,7 +828,7 @@ def do_fetch(config: dict, job: dict):
             if secs and secs > max_s:
                 return ("failed", None,
                         f"that is {_mmss(secs)} long; the cap is {_mmss(max_s)}")
-            r = _run(_ytdlp(config) + [
+            r = _ytdlp_run(config, [
                 "--no-warnings", "--no-playlist", "--no-progress",
                 # Nothing above 1080p: the archive re-encodes everything it
                 # keeps, and pulling 4K to throw the pixels away is minutes of
@@ -1097,7 +1301,7 @@ def do_music_fetch(config: dict, job: dict):
     stem = os.path.join(mdir, f"{PART}{job['id']}")
     _scraps(mdir, job["id"])
     try:
-        r = _run(_ytdlp(config) + [
+        r = _ytdlp_run(config, [
             "--no-warnings", "--no-playlist", "--no-progress",
             "-f", str(setting(config, "archive_music_format")),
             "--merge-output-format", str(setting(config, "archive_music_container")),
