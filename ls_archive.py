@@ -757,12 +757,12 @@ PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 
 
-def _job_post(config: dict, path: str, body: dict) -> dict:
+def _job_post(config: dict, path: str, body: dict, *, timeout: int | None = None) -> dict:
     url = config["archive_url"].rstrip("/") + path
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers=_headers(config))
-    with urllib.request.urlopen(req, timeout=JOB_TIMEOUT) as r:
+    with urllib.request.urlopen(req, timeout=(timeout or JOB_TIMEOUT)) as r:
         return json.loads(r.read().decode("utf-8") or "{}")
 
 
@@ -837,20 +837,40 @@ def flush_reports(config: dict) -> int:
 
 # ── claiming ──────────────────────────────────────────────────────────────
 
-def claim_jobs(config: dict, *, worker: str, kinds=PI_KINDS, limit: int = 1) -> list[dict]:
+def claim_jobs(config: dict, *, worker: str, kinds=PI_KINDS, limit: int = 1,
+               wait: int = 0) -> list[dict]:
     """Take a lease on up to `limit` jobs. Never raises.
 
     An empty list is the normal answer and is not worth a log line — this is
     polled every few seconds and the queue is empty almost always.
+
+    `wait` asks the archive to HOLD THE REQUEST OPEN for up to that many
+    seconds rather than answering "nothing" straight away. Still a pull: this
+    end asks and that end answers slowly, so nothing connects inward to this
+    machine and no credential moves. What it buys is that a person pressing a
+    button in the browser waits on the work rather than on a poll interval —
+    and it buys the same for every other kind, so a clip cut stops taking up
+    to twenty seconds to start.
+
+    0 is the old behaviour exactly, and an archive that has never heard of the
+    parameter ignores it and answers immediately, so this is safe against a
+    server older than the worker.
     """
     if not enabled(config):
         return []
     wanted = [k for k in kinds if k in PI_KINDS]
     if not wanted:
         return []
+    hold = max(0, min(int(wait or 0), 30))
     try:
         r = _job_post(config, "/api/ingest/jobs/claim",
-                      {"worker": worker, "kinds": wanted, "limit": int(limit)})
+                      {"worker": worker, "kinds": wanted, "limit": int(limit),
+                       "wait": hold},
+                      # The socket has to outlive the hold, with room for the
+                      # round trip. Without this the worker times out on its
+                      # own request at 15s and treats a working long poll as a
+                      # network fault, every time.
+                      timeout=(JOB_TIMEOUT + hold if hold else None))
     except urllib.error.HTTPError as e:
         detail = ""
         try:

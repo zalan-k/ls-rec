@@ -56,6 +56,8 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -1037,6 +1039,91 @@ def do_rescan(config: dict, job: dict):
 # archive stores the url alongside whatever comes back.
 WIKI_HOSTS = ("wikipedia.org", "fandom.com", "wikia.org")
 
+# The catalogue, and the one host its pictures come from. Two tuples and not
+# one: the archive hands over an `art_url` it got from a search, and this end
+# is what decides whether it will go there. Same rule as everywhere else in
+# this file — the archive's copy of an allowlist is a courtesy to whoever is
+# pasting, and this copy is the rule.
+IGDB_API = "https://api.igdb.com/v4/games"
+IGDB_ART_HOSTS = ("images.igdb.com",)
+# A cover is tens of kilobytes. The cap is here so a redirect to something
+# else cannot become this worker's disk problem.
+POSTER_CAP = 8 << 20
+
+IGDB_FIELDS = ("name,slug,summary,first_release_date,game_type,"
+               "cover.image_id,platforms.abbreviation,url,total_rating_count")
+
+# `game_type`, and NOT the `category` this was first written against. category
+# is deprecated and simply stops being returned, which does not read as an
+# error — every row came back `None` and that looked exactly like "these are
+# all ordinary games". An absent field reads as a benign default, so a check
+# that trusts one is not a weak check, it is no check. Verified against live
+# answers: game_type reuses the old numbering.
+GAME_TYPE = {0: "main game", 1: "dlc", 2: "expansion", 3: "bundle",
+             4: "standalone expansion", 5: "mod", 6: "episode", 7: "season",
+             8: "remake", 9: "remaster", 10: "expanded", 11: "port",
+             12: "fork", 13: "pack", 14: "update"}
+
+# Cached, because an IGDB token is good for about sixty days and fetching one
+# per job would be a second use of the credential per tag for nothing. Not
+# trusted to an expiry though — a 401 clears it and the call is retried once,
+# which is correct whatever the server decides the lifetime is.
+_IGDB_TOK = {"tok": None, "at": 0.0}
+_IGDB_TOK_TTL = 12 * 3600
+
+
+def _fold(s: str) -> str:
+    """For deciding whether two NAMES are the same, and nothing else.
+
+    IGDB's `where name = "x"` is case-sensitive, so the tag `The World Ends
+    With You` missed the catalogue's `The World Ends with You` over one letter
+    and the answer came back labelled as a guess when it was the right row.
+    NFKD then drop the combining marks, so Pokemon and Pokémon compare equal
+    too.
+    """
+    d = unicodedata.normalize("NFKD", (s or "").casefold())
+    return "".join(c for c in d if not unicodedata.combining(c)).strip()
+
+
+def _igdb_token(config: dict, *, force: bool = False) -> str | None:
+    now_s = time.time()
+    if not force and _IGDB_TOK["tok"] and now_s - _IGDB_TOK["at"] < _IGDB_TOK_TTL:
+        return _IGDB_TOK["tok"]
+    # IGDB authenticates through Twitch, so this is the credential the recorder
+    # already holds and ls_common already knows how to exchange. No second
+    # account, and no second copy of the grant flow.
+    tok = ls_common.twitch_get_token(config)
+    if tok:
+        _IGDB_TOK.update(tok=tok, at=now_s)
+    return tok
+
+
+def _igdb(config: dict, body: str, *, retry: bool = True):
+    """One Apicalypse POST. The body IS the query language, not JSON."""
+    cid = config.get("igdb_client_id") or config.get("twitch_client_id")
+    tok = _igdb_token(config)
+    if not (cid and tok):
+        return None
+    req = urllib.request.Request(
+        IGDB_API, data=body.encode("utf-8"), method="POST",
+        headers={"user-agent": "ls-rec/jobs", "accept": "application/json",
+                 "Client-ID": cid, "Authorization": f"Bearer {tok}"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return json.loads(r.read(2 << 20).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and retry:
+            # The cached token has expired or been revoked. One forced refresh
+            # and one more go; a second 401 is a real answer.
+            _igdb_token(config, force=True)
+            return _igdb(config, body, retry=False)
+        logger.warning("igdb HTTP %s: %s", e.code,
+                       e.read().decode("utf-8", "replace")[:200] if hasattr(e, "read") else "")
+        return None
+    except Exception as e:
+        logger.warning("igdb %s: %s", type(e).__name__, str(e)[:160])
+        return None
+
 
 def _wiki_api(url: str):
     """(api.php, page title) for a MediaWiki article url, or None.
@@ -1077,14 +1164,162 @@ def _get_json(url: str, timeout: int = 30):
 
 
 def do_harvest(config: dict, job: dict):
-    """Read a wiki page for a tag. Returns (status, result_path, error, findings).
+    """Three errands on one kind. Returns (status, result_path, error, findings).
 
-    Nothing is decided here. The archive stores what comes back as `seeded`,
-    which is the row saying out loud that a machine wrote it and no human has
-    been over it — and the first hand edit clears that flag. This worker's job
-    is to be accurate about what the page said, not about whether it is right.
+    A harvest used to mean one thing — read a wiki page named by a url — and
+    it is three now, told apart by what the payload carries:
+
+        q        look this name up in the catalogue -> candidates
+        art_url  fetch this cover -> a file in the media tree
+        url      read this wiki article -> its lead paragraph
+
+    ONE KIND AND NOT THREE, deliberately. A new kind has to be added to
+    JOB_KINDS in the archive, to PI_KINDS in the archive, to PI_KINDS in
+    ls_archive.py, AND to `archive_job_kinds` in this machine's config — and
+    that last one is how a clip sat WAITING for ever while this worker
+    cheerfully took everything else. A kind that already travels cannot fall
+    into that.
+
+    Nothing here decides anything. A search returns what the catalogue said
+    and the archive parks it for a person to pick from; three different games
+    are called Summer Camp and no amount of matching tells you which one a
+    stream was about.
     """
     pay = job.get("payload") or {}
+    if str(pay.get("art_url") or "").strip():
+        return _harvest_art(config, pay)
+    if str(pay.get("q") or "").strip():
+        return _harvest_search(config, pay)
+    return _harvest_wiki(config, pay, job)
+
+
+def _harvest_search(config: dict, pay: dict):
+    """What the catalogue has under a name. Never a verdict, always a list."""
+    q = str(pay.get("q") or "").strip()[:120]
+    if not q:
+        return ("failed", None, "the job names nothing to look up", None)
+    if not (config.get("igdb_client_id") or config.get("twitch_client_id")):
+        return ("failed", None,
+                "no igdb credentials on this recorder — set igdb_client_id and "
+                "igdb_client_secret, or the twitch_ pair, in config.json", None)
+
+    esc = q.replace("\\", "\\\\").replace('"', '\\"')
+    rows = _igdb(config, f'fields {IGDB_FIELDS}; where name = "{esc}"; limit 5;')
+    if rows is None:
+        return ("failed", None, "the catalogue did not answer", None)
+    served_exact = bool(rows)
+    if not rows:
+        rows = _igdb(config, f'search "{esc}"; fields {IGDB_FIELDS}; limit 8;') or []
+
+    out = []
+    for g in rows:
+        img = (g.get("cover") or {}).get("image_id")
+        plats = ",".join(sorted({p.get("abbreviation") or "?"
+                                 for p in (g.get("platforms") or [])}))
+        ts = g.get("first_release_date")
+        yr = time.strftime("%Y", time.gmtime(ts)) if ts else "????"
+        gt = g.get("game_type")
+        out.append({
+            "name": g.get("name") or "",
+            # 1:1. IGDB's summary is a paragraph and a paragraph is what the
+            # tag card wants, so nothing here truncates it.
+            "summary": " ".join((g.get("summary") or "").split()),
+            "art": (f"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/"
+                    f"{img}.jpg") if img else None,
+            "url": g.get("url"),
+            "meta": (f"{yr} · {GAME_TYPE.get(gt, 'type ' + str(gt))}"
+                     f" · {g.get('total_rating_count') or 0} ratings"
+                     + (f" · {plats[:46]}" if plats else "")),
+            "_gt": gt if isinstance(gt, int) else 99,
+            "_rank": int(g.get("total_rating_count") or 0),
+            "same": _fold(g.get("name")) == _fold(q),
+        })
+
+    if not served_exact and out:
+        # Sorted HERE and not asked for: `sort` has no effect alongside
+        # `search`, and a client-side sort is right whatever the server does.
+        # Exact name, then MAIN GAMES above the rest — which only became
+        # possible once game_type started working, and which matters when a
+        # popular expansion out-rates the game it expands — then how many
+        # people rated it. Demoted, never dropped: a collab event is a thing
+        # somebody may well have streamed.
+        out.sort(key=lambda c: (not c["same"], c["_gt"] != 0, -c["_rank"]))
+
+    # How many carry EXACTLY this name. Three games are called Summer Camp, so
+    # a bare "exact" over the first of them is a picker choosing and not
+    # saying so.
+    twins = sum(1 for c in out if c["same"])
+    for c in out:
+        c["exact"] = served_exact or c["same"]
+        c["twins"] = twins
+        c.pop("_gt", None)
+        c.pop("_rank", None)
+
+    logger.info("harvest %r: %d candidate(s)%s", q, len(out),
+                " (exact)" if served_exact else "")
+    # `done` with an empty list is the right answer for a person's name. It is
+    # not a failure and the panel should not draw it as one.
+    return ("done", None, None, {"candidates": out, "q": q})
+
+
+def _harvest_art(config: dict, pay: dict):
+    """One cover, into the media tree at the name the archive minted."""
+    url = str(pay.get("art_url") or "").strip()
+    rel = str(pay.get("art_to") or "").strip()
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not url.lower().startswith("https://") or not any(
+            host == h or host.endswith("." + h) for h in IGDB_ART_HOSTS):
+        return ("failed", None, "this worker does not fetch pictures from there", None)
+    target = resolve_name(media_root(config), rel)
+    if not target or not re.fullmatch(r"posters/[0-9A-HJKMNP-TV-Z]{26}\.(jpg|png)", rel):
+        return ("failed", None, "the archive named a file this worker will not write", None)
+
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    part = target + ".part"
+    req = urllib.request.Request(url, headers={"user-agent": "ls-rec/jobs"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            blob = r.read(POSTER_CAP + 1)
+    except Exception as e:
+        return ("failed", None, f"could not fetch the cover: {type(e).__name__}", None)
+    if not blob:
+        return ("failed", None, "the cover came back empty", None)
+    if len(blob) > POSTER_CAP:
+        return ("failed", None, f"that cover is over {_mb(POSTER_CAP)}", None)
+    # The bytes decide, not the extension and not the content-type — both of
+    # those are things the sender says, and the archive will serve this file by
+    # the name it now holds.
+    if not (blob[:2] == b"\xff\xd8" or blob[:8] == b"\x89PNG\r\n\x1a\n"):
+        return ("failed", None, "that is not a JPEG or a PNG", None)
+    try:
+        with open(part, "wb") as fh:
+            fh.write(blob)
+        # Atomic, so the archive can never point a row at half a picture.
+        os.replace(part, target)
+    except OSError as e:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        return ("failed", None, f"could not store the cover: {e.strerror or e}", None)
+
+    logger.info("harvest art %s: %s", rel, _mb(len(blob)))
+    return ("done", rel, None, None)
+
+
+def _harvest_wiki(config: dict, pay: dict, job: dict):
+    """Read a wiki page for a tag.
+
+    Kept, and kept reachable, though the archive does not queue these yet: a
+    MediaWiki lead paragraph is the right description for a person and the
+    wrong one for a game, and `virtualyoutuber.fandom.com` is where the indie
+    VTubers are. Reachable rather than commented out because unreachable code
+    rots — a harvest carrying `url` still lands here today.
+
+    Nothing is decided here either. The archive stores what comes back as
+    `seeded`, which is the row saying out loud that a machine wrote it and no
+    human has been over it; the first hand edit clears that flag.
+    """
     url = str(pay.get("url") or job.get("url") or "").strip()
     if not url:
         return ("failed", None, "the job names no link", None)
@@ -1442,8 +1677,15 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
     # rescan reads the masters; it never writes to them.
     # music_fetch writes INTO the media tree rather than into quarantine — an
     # approved song is archive content and goes where the archive reads from.
-    need_media = bool({"promote", "purge", "rescan", "music_fetch"} & set(kinds))
-    need_q = bool({"promote", "fetch"} & set(kinds))
+    # `harvest` is in here now: it writes a tag's cover into posters/ under the
+    # media root, which it did not used to do because it never fetched art at
+    # all. `clip` is here for the same reason and was missed — it reads a
+    # master off the media root and writes the cut into quarantine, so
+    # `ls-jobs --kinds clip` used to pass preflight without checking either
+    # root and then fail on the job.
+    need_media = bool({"promote", "purge", "rescan", "music_fetch",
+                       "harvest", "clip"} & set(kinds))
+    need_q = bool({"promote", "fetch", "clip"} & set(kinds))
 
     for label, path, needed, why in (
             ("media root ", m, need_media,
@@ -1506,7 +1748,8 @@ def run(config: dict, *, kinds, once: bool = False, interval: int | None = None)
     worker = str(config.get("archive_worker_name") or socket.gethostname())[:64]
     idle = int(interval or setting(config, "archive_job_interval"))
     done = 0
-    logger.info(f"ls-jobs: {worker} polling for {','.join(kinds)} every {idle}s")
+    logger.info(f"ls-jobs: {worker} polling for {','.join(kinds)}, holding each "
+                f"claim open up to {min(idle, 25)}s")
     while not _stop:
         # Before claiming, not after: a spooled report is about a job whose
         # lease may be about to lapse, and saying it is finished is what stops
@@ -1515,11 +1758,27 @@ def run(config: dict, *, kinds, once: bool = False, interval: int | None = None)
         # One at a time. A fetch can run for minutes and the lease is five, so
         # claiming a handful would mean the ones waiting their turn lapse and
         # get handed out from under this worker.
-        jobs = ls_archive.claim_jobs(config, worker=worker, kinds=kinds, limit=1)
+        #
+        # `wait` asks the archive to hold the request open instead of answering
+        # "nothing" — so work starts when it is queued rather than up to
+        # `idle` seconds later. That matters for anything a person is sitting
+        # in front of: a clip cut, or looking a tag up in the catalogue.
+        #
+        # Bounded by `idle` so `--interval 5` still means "do not sit on a
+        # socket longer than five seconds", and by 25 because that is the
+        # ceiling the archive enforces anyway. `--once` waits for nothing: it
+        # is a single pass over what is already there.
+        hold = 0 if once else max(0, min(idle, 25))
+        jobs = ls_archive.claim_jobs(config, worker=worker, kinds=kinds, limit=1,
+                                     wait=hold)
         if not jobs:
             if once:
                 break
-            for _ in range(idle):
+            # Already waited inside the claim, so sleeping `idle` again on top
+            # of it would double the latency this is here to remove. A short
+            # breath instead, which is also what keeps a server that ignores
+            # `wait` from becoming a busy loop.
+            for _ in range(1 if hold else idle):
                 if _stop:
                     break
                 time.sleep(1)
