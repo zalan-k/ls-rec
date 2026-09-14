@@ -98,9 +98,27 @@ DEFAULTS = {
     # Its own caps, because these are not the same thing as a pasted clip. A
     # music video is three minutes and worth keeping at a decent size; the
     # generous byte ceiling is the point of the module, not an oversight.
-    "archive_music_max_s":     900,
-    "archive_music_max_mb":    500,
-    "archive_music_timeout_s": 1800,
+    #
+    # ZERO MEANS NO CEILING, for both of these, and the duration one ships at
+    # zero. A concert set is two hours and is exactly the thing this module is
+    # for, so a cap that admits one says nothing useful about a three-minute
+    # single: there is no number here that is right for both, which is why
+    # there is no number. The fifteen minutes this used to be refused every
+    # concert in the collection before a byte moved.
+    "archive_music_max_s":     0,
+    # Bytes stay a number, because bytes are the wall a mispasted twelve-hour
+    # stream actually hits. Raised with the duration cap rather than left
+    # behind it: two hours at 1080p is several GB, so 500 MB would have gone on
+    # refusing the same concerts with a different sentence.
+    "archive_music_max_mb":    8192,
+    # Wall-clock for the whole yt-dlp run, merge included, and NOT zeroable: a
+    # run with no timeout holds a lease it cannot renew, and the archive would
+    # hand the same job to the next worker while this one is still pulling.
+    # Well past the five-minute lease on purpose, for the same reason
+    # archive_fetch_timeout_s is — with one worker there is nobody to steal the
+    # job, and cutting a two-hour set short to satisfy a lease nobody is
+    # contending for is the wrong trade.
+    "archive_music_timeout_s": 7200,
     # THE FORMAT POLICY LIVES HERE, and that is deliberate: the archive names
     # an id and a verb and has never told a worker what to fetch. Change this
     # to `bestaudio/best` for an audio-only collection and nothing on the other
@@ -1274,7 +1292,19 @@ def _harvest_art(config: dict, pay: dict):
     if not target or not re.fullmatch(r"posters/[0-9A-HJKMNP-TV-Z]{26}\.(jpg|png)", rel):
         return ("failed", None, "the archive named a file this worker will not write", None)
 
-    os.makedirs(os.path.dirname(target), exist_ok=True)
+    # Named, and caught. Under `ProtectSystem=strict` the unit only gets to
+    # write the paths its ReadWritePaths lists, so a media root that is
+    # readable and a posters/ that is not is the likely shape of a failure
+    # here — and "Read-only file system" with a traceback is a much worse
+    # answer than the directory's own name. handle() would catch a raise and
+    # report it, but it would report it as a worker crash.
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+    except OSError as e:
+        return ("failed", None,
+                f"cannot write {os.path.dirname(target)}: {e.strerror or e} — if "
+                f"ls-jobs runs under ProtectSystem=strict, that directory needs "
+                f"a ReadWritePaths entry", None)
     part = target + ".part"
     req = urllib.request.Request(url, headers={"user-agent": "ls-rec/jobs"})
     try:
@@ -1499,8 +1529,11 @@ def do_music_fetch(config: dict, job: dict):
     url, vid, mdir, prefix = t
 
     rel = lambda name: f"{prefix}/{name}" if prefix else name
-    max_bytes = int(setting(config, "archive_music_max_mb")) * 1048576
-    max_s = int(setting(config, "archive_music_max_s"))
+    # Either cap set to zero is no cap at all, and the floor is there so a
+    # negative in somebody's config reads as "off" rather than as a ceiling
+    # that nothing can come in under.
+    max_bytes = max(0, int(setting(config, "archive_music_max_mb"))) * 1048576
+    max_s = max(0, int(setting(config, "archive_music_max_s")))
     timeout = int(setting(config, "archive_music_timeout_s"))
 
     try:
@@ -1523,11 +1556,14 @@ def do_music_fetch(config: dict, job: dict):
                  "thumb_path": rel(f"{vid}.jpg") if os.path.isfile(thumb) else None})
 
     # Asked before anything is pulled, because a duration is the one cap that
-    # can be checked without spending the bandwidth it is protecting.
-    secs = probe_duration(config, url)
-    if secs and secs > max_s:
-        return ("failed", None,
-                f"that is {_mmss(secs)} long; the cap is {_mmss(max_s)}", None)
+    # can be checked without spending the bandwidth it is protecting. Skipped
+    # entirely when there is no duration cap — a probe whose only reader is a
+    # comparison that cannot fail is a round trip for nothing.
+    if max_s:
+        secs = probe_duration(config, url)
+        if secs and secs > max_s:
+            return ("failed", None,
+                    f"that is {_mmss(secs)} long; the cap is {_mmss(max_s)}", None)
 
     # The part file sits in the music directory rather than in quarantine, so
     # the rename at the end is a rename(2) on one filesystem instead of a copy
@@ -1544,7 +1580,7 @@ def do_music_fetch(config: dict, job: dict):
             # second thing to fail, and the archive falls back to YouTube's own
             # thumbnail url until this lands anyway.
             "--write-thumbnail", "--convert-thumbnails", "jpg",
-            "--max-filesize", f"{max_bytes}",
+            *(["--max-filesize", f"{max_bytes}"] if max_bytes else []),
             "-o", stem + ".%(ext)s", url], timeout)
         if r.returncode != 0:
             return ("failed", None, _explain(
@@ -1555,8 +1591,11 @@ def do_music_fetch(config: dict, job: dict):
                      key=os.path.getsize, reverse=True)
         if not got:
             # --max-filesize aborts by writing nothing, which is otherwise
-            # indistinguishable from a silent success.
-            return ("failed", None, f"nothing came back — it may be over {_mb(max_bytes)}", None)
+            # indistinguishable from a silent success — so it is named as the
+            # likely reason only when it was a flag that went in.
+            return ("failed", None,
+                    (f"nothing came back — it may be over {_mb(max_bytes)}" if max_bytes
+                     else "nothing came back, and yt-dlp said it went fine"), None)
         media = got[0]
         for extra in got[1:]:
             try:
@@ -1568,7 +1607,7 @@ def do_music_fetch(config: dict, job: dict):
         size = os.path.getsize(media)
         if size == 0:
             return ("failed", None, "the file came back empty", None)
-        if size > max_bytes:
+        if max_bytes and size > max_bytes:
             return ("failed", None, f"it is {_mb(size)}; the cap is {_mb(max_bytes)}", None)
 
         name = f"{vid}{ext}"
@@ -1728,8 +1767,14 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
         d = music_dir(config)
         say(f"  music dir      {d}"
             + ("" if d and os.path.isdir(d) else "  WILL BE CREATED"))
-        say(f"  music caps     {_mmss(int(setting(config, 'archive_music_max_s')))}"
-            f", {setting(config, 'archive_music_max_mb')} MB")
+        # Printed as "no limit" rather than as 0:00 / 0 MB, because a cap of
+        # zero is the one this module ships with and a preflight that reads
+        # "0:00" looks like the reason nothing downloads.
+        m_s = max(0, int(setting(config, "archive_music_max_s")))
+        m_mb = max(0, int(setting(config, "archive_music_max_mb")))
+        say(f"  music caps     {_mmss(m_s) if m_s else 'no length limit'}"
+            f", {f'{m_mb} MB' if m_mb else 'no size limit'}"
+            f", gives up after {int(setting(config, 'archive_music_timeout_s')) // 60} min")
         say(f"  music format   {setting(config, 'archive_music_format')}")
     # Asked once for whichever kinds need it. It used to hang off `fetch`
     # alone, which would have let a music-only worker start up clean and then
