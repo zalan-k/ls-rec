@@ -89,6 +89,11 @@ DEFAULTS = {
         # reports as a failure carrying the host's own words, which is the
         # right answer for a link that has genuinely gone.
         "cdn.discordapp.com", "media.discordapp.net",
+        # Where a tweet's PICTURES live. `twitter.com` above gets a tweet's
+        # video through yt-dlp and can never get its images, because yt-dlp
+        # has no image support — so the image address is what gets pasted,
+        # and it is a plain file on a CDN like the two above it.
+        "pbs.twimg.com",
     ],
 
     # ── music ────────────────────────────────────────────────────────────
@@ -129,7 +134,15 @@ DEFAULTS = {
 
 # Fetched with a plain https GET rather than yt-dlp: these are direct file
 # urls, not pages with a video somewhere in them.
-DIRECT_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
+#
+# `pbs.twimg.com` joined them because a tweet is TWO different things behind
+# one link. yt-dlp handles the video ones and has no image support at all, so
+# an image-only post could never arrive however it was pasted — it came back
+# "No video could be found in this tweet", which is also what X says when it
+# is stonewalling a caller it does not recognise, so the failure read as rate
+# limiting rather than as "that post has pictures in it". The picture itself
+# is a plain file on a CDN, which is the case this branch already exists for.
+DIRECT_HOSTS = ("cdn.discordapp.com", "media.discordapp.net", "pbs.twimg.com")
 
 # The archive's own word for a transfer that has not finished. Its quarantine
 # view reads this prefix and shows such a file as `unfinished` rather than as
@@ -718,8 +731,10 @@ def _tail(text: str, n: int = 300) -> str:
 # is to say so and name the way round it: download it yourself and upload it.
 _EXPLAIN = (
     (r"No video could be found in this tweet",
-     "X did not hand over the video for that post — it does this to callers it "
-     "does not recognise. Save the file yourself and upload it instead."),
+     "there is no video on that post. If it is a picture you want, right-click "
+     "the image and copy the IMAGE address — a pbs.twimg.com link — and paste "
+     "that. If the post does have a video, X is stonewalling this recorder, and "
+     "saving the file yourself and uploading it is the way through."),
     (r"NSFW tweet requires authentication|Requires authentication",
      "that post is behind a sign-in wall this recorder's cookies did not get "
      "past. Save the file yourself and upload it instead."),
@@ -767,6 +782,36 @@ def file_duration(path: str) -> float | None:
         return float((r.stdout or "").strip()) if r.returncode == 0 else None
     except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
         return None
+
+
+def _direct_ext(url: str) -> str:
+    """What to call a directly-downloaded file, from the URL alone.
+
+    The archive names the file after the snippet using this extension, so a
+    wrong answer here is a wrong name on disk forever — which is why the old
+    one-liner's `.mp4` fallback mattered: it was right for Discord, where the
+    filename is in the path, and wrong for every host that does not put it
+    there.
+
+    `pbs.twimg.com` is that host. Twitter serves a picture from a path with no
+    extension at all and says what it is in the query string
+    (`/media/GxAbC?format=jpg&name=orig`), and from an older shape that puts
+    the size after a colon (`/media/GxAbC.jpg:large`) — which `splitext` reads
+    as the extension `.jpg:large`. Both are handled here rather than at the
+    call site, because "what is this file" is one question however the host
+    chooses to answer it.
+    """
+    u = urllib.parse.urlparse(url)
+    # `.jpg:large` -> `.jpg`. Harmless anywhere a colon does not appear.
+    ext = os.path.splitext(u.path)[1].lower().split(":")[0][:8]
+    if ext in KEEP_EXT:
+        return ext
+    # Nothing usable in the path: ask the query string.
+    fmt = (urllib.parse.parse_qs(u.query).get("format") or [""])[0].lower()
+    fmt = "." + re.sub(r"[^a-z0-9]", "", fmt)[:8]
+    if fmt == ".jpeg":
+        fmt = ".jpg"
+    return fmt if fmt in KEEP_EXT else ".mp4"
 
 
 def _direct_download(url: str, dest: str, max_bytes: int, timeout: int) -> str | None:
@@ -838,8 +883,7 @@ def do_fetch(config: dict, job: dict):
         if host in DIRECT_HOSTS:
             # No page to parse and no duration to ask for: the ceiling is
             # bytes, and the duration is checked once the file is here.
-            ext = os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()[:8] or ".mp4"
-            tmp = stem + (ext if ext in KEEP_EXT else ".mp4")
+            tmp = stem + _direct_ext(url)
             err = _direct_download(url, tmp, max_bytes, timeout)
             if err:
                 return ("failed", None, err)
