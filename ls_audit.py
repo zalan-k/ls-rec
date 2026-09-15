@@ -797,21 +797,26 @@ def _download_files(config: dict, missing: list[dict],
             any_success = True
 
         elif dl_type == "chat":
+            # Under the offline-pull name in both branches, which is beside any
+            # capture rather than over it. See ls_common.OFFLINE_PULL_TAG: a
+            # pull is one capture among however many the entry has, and the
+            # merge is what decides between them.
+            pull = ls_common.offline_pull_name(safe_title)
             tdl = config.get("twitch_downloader_cli")
             if platform == "twitch" and tdl and os.path.exists(tdl):
                 vod_id = url.rstrip("/").split("/")[-1]
                 subprocess.run([
                     tdl, "chatdownload", "--id", vod_id,
-                    "-o", os.path.join(nas_path, f"{safe_title}.json"),
+                    "-o", os.path.join(nas_path, pull),
                 ])
             else:
                 cmd = ls_common.ytdlp_chat_cmd(
                     config, url, f"{safe_title}.%(ext)s",
                 )
                 subprocess.run(cmd, cwd=nas_path)
-                # Rename .live_chat.json → .json
+                # Rename .live_chat.json → the pull name
                 lc = os.path.join(nas_path, f"{safe_title}.live_chat.json")
-                final = os.path.join(nas_path, f"{safe_title}.json")
+                final = os.path.join(nas_path, pull)
                 if os.path.exists(lc):
                     os.rename(lc, final)
             any_success = True
@@ -1130,6 +1135,12 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
 CHAT_SHORTFALL_MAX_SECS = 3600
 CHAT_SHORTFALL_FRACTION = 0.5
 
+#  How far a capture's own clock may sit outside the broadcast before the
+#  capture is suspected of belonging to a different stream. An hour, measured
+#  against the MEDIAN message time so one stray row cannot raise it -- this
+#  runs on every sweep, and a false alarm here offers a download every time.
+TW_ASSIGN_WINDOW_SECS = 3600
+
 
 def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
                        yt_id: str | None) -> dict | None:
@@ -1165,10 +1176,129 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
     if shortfall <= limit:
         return None
 
-    return {"chat_file": chat_file, "chat_path": chat_path, "video_id": yt_id,
+    return {"platform": "youtube", "why": ["short"],
+            "chat_file": chat_file, "chat_path": chat_path, "video_id": yt_id,
             "count": info["count"], "last_secs": last,
             "duration_secs": duration, "shortfall_secs": shortfall,
             "limit_secs": limit}
+
+
+def _tw_chat_shortfall(config: dict, cache: list[dict], nas: dict,
+                       tw_id: str | None, index: int) -> dict | None:
+    """
+    Return details if the Twitch capture is short, or is not this stream's, or
+    cannot be placed in time at all.
+
+    Not only a length check, and that is the point: the failures this has
+    actually had are four shapes with one remedy, which is to pull the VOD's
+    own chat and let the merge decide between them.
+
+      unreadable it does not parse as any chat format we know
+      short      chat that stops well before the video does — the same test
+                 and the same bar as YouTube
+      misplaced  a capture whose own clock sits an hour or more outside the
+                 broadcast. One stream's Twitch capture landing on another
+                 stream's row is a thing that has happened here.
+      no clock   no message carries an absolute time and the cache holds no
+                 start for this id either. This is the quiet one: the merge
+                 drops every such message, writes a file that then reads as
+                 finished, and the loss sticks. Every capture from before the
+                 recorder wrote `tmi_sent_ts` is in this state.
+      empty      a capture with no messages in it at all. Not the same as a
+                 missing chat, which `_identify_missing` already offers to
+                 fetch — this one exists, so nothing else notices it.
+
+    Read through ls_chat rather than analyze_chat_file, which reads `timestamp`
+    as a relative microsecond offset and is wrong about two of the three
+    spellings a Twitch capture can arrive in.
+    """
+    chat_file = nas.get("tw_chat")
+    if not chat_file:
+        return None
+    if chat_given_up(index, "twitch"):
+        return None                        # said once, by a person. Enough.
+    nas_root = config.get("nas_path", "")
+    chat_path = os.path.join(nas_root, chat_file)
+    if not os.path.exists(chat_path):
+        return None
+
+    try:
+        conv = ls_chat.convert_file(chat_path)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        # Unreadable is not nothing, and answering None here is how an entry
+        # created for a recording that never started stayed invisible: it HAS a
+        # chat file, so `_identify_missing` is satisfied, and it has no format,
+        # so everything downstream skipped it. Same remedy either way.
+        return {"platform": "twitch", "why": ["unreadable"],
+                "chat_file": chat_file, "chat_path": chat_path,
+                "video_id": tw_id, "count": 0, "placed": 0,
+                "last_secs": None, "duration_secs": None,
+                "shortfall_secs": None, "limit_secs": None,
+                "broadcast_ms": None, "median_ms": None, "error": str(e)}
+
+    msgs = conv.messages
+    placed = [m for m in msgs if m.abs_ms is not None]
+    cache_zero = _cache_zeros(cache, None, tw_id).get("twitch")
+    zero = conv.zero_ms or cache_zero
+    why: list[str] = []
+
+    if not msgs:
+        why.append("empty")
+    elif not placed and not cache_zero:
+        why.append("no clock")
+
+    # The recorder's own row is the best source for both of these: it wrote the
+    # start when it attached and filled the duration in when the stream ended.
+    # `find_vod`, not `find_confirmed_vod` — a broadcast row is exactly the row
+    # that knows, and refusing it here would throw the answer away.
+    vod = ls_common.find_vod(cache, tw_id, "twitch") if tw_id else None
+    duration = None
+    video_file = nas.get("tw_video")
+    if video_file:
+        vp = os.path.join(nas_root, video_file)
+        if os.path.exists(vp):
+            duration = analyze_video_file(vp).get("duration_secs")
+    if not duration and vod:
+        duration = vod.get("duration")
+
+    # Offsets the file states itself are the ones to measure by. A capture
+    # whose every offset is zero has none — it states absolute times only —
+    # so measure from those against the zero instead, and if there is no zero
+    # either then there is nothing to measure and "no clock" is the finding.
+    last_secs = None
+    if any(m.ts for m in msgs):
+        last_secs = max(m.ts for m in msgs) / 1000.0
+    elif placed and zero:
+        last_secs = (max(m.abs_ms for m in placed) - zero) / 1000.0
+
+    shortfall = limit = None
+    if last_secs is not None and duration and duration > 0:
+        shortfall = duration - last_secs
+        limit = min(CHAT_SHORTFALL_MAX_SECS, duration * CHAT_SHORTFALL_FRACTION)
+        if shortfall > limit:
+            why.append("short")
+
+    started = None
+    if vod:
+        started = (vod.get("record_start_epoch_ms")
+                   or vod.get("stream_start_epoch_ms"))
+    median_ms = None
+    if placed and started and duration:
+        mid = sorted(m.abs_ms for m in placed)
+        median_ms = mid[len(mid) // 2]
+        lo = started - TW_ASSIGN_WINDOW_SECS * 1000
+        hi = started + int((duration + TW_ASSIGN_WINDOW_SECS) * 1000)
+        if not lo <= median_ms <= hi:
+            why.append("misplaced")
+
+    if not why:
+        return None
+    return {"platform": "twitch", "why": why,
+            "chat_file": chat_file, "chat_path": chat_path, "video_id": tw_id,
+            "count": len(msgs), "placed": len(placed),
+            "last_secs": last_secs, "duration_secs": duration,
+            "shortfall_secs": shortfall, "limit_secs": limit,
+            "broadcast_ms": started, "median_ms": median_ms}
 
 
 def _backfill_yt_chat(config: dict, item: dict) -> bool:
@@ -1226,22 +1356,171 @@ def _backfill_yt_chat(config: dict, item: dict) -> bool:
     return False
 
 
+def _backfill_tw_chat(config: dict, item: dict) -> bool:
+    """
+    Pull the VOD's chat down BESIDE the capture already held.
+
+    Beside, not over. What a live IRC capture has and a VOD download cannot —
+    the messages that were deleted after being seen, and the record that they
+    were — is exactly what replacing it would throw away: Twitch's GQL keeps
+    the comments that survived, not the history of what was removed. So the
+    pull lands as a second capture and `--merge-chat` unions them, keeping
+    every message either source saw and the moderation history from the one
+    that has it.
+
+    Downloaded to a hidden temp first. The capture beside it may itself be an
+    earlier pull, and a failed download that truncated it in place would cost
+    more than it could possibly recover.
+    """
+    nas_path = config["nas_path"]
+    if not item.get("video_id"):
+        print("  ✗ No Twitch id on the capture; cannot pull.")
+        return False
+
+    tdl = config.get("twitch_downloader_cli")
+    if not (tdl and os.path.exists(tdl)):
+        print("  ✗ twitch_downloader_cli is not configured; cannot pull.")
+        return False
+
+    base = os.path.splitext(item["chat_file"])[0]
+    # The capture may itself be a pull from an earlier attempt. One tag is
+    # enough; two would read as a pull of a pull.
+    if base.endswith(ls_common.OFFLINE_PULL_TAG):
+        base = base[: -len(ls_common.OFFLINE_PULL_TAG)]
+    out = os.path.join(nas_path, ls_common.offline_pull_name(base))
+    tmp = os.path.join(nas_path, f".{base}.pull.tmp")
+
+    print(f"\n  ↓ VOD chat: {os.path.basename(out)}")
+    subprocess.run([tdl, "chatdownload", "--id", str(item["video_id"]),
+                    "-o", tmp])
+
+    if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        print("  ✗ Nothing came back. A broadcast id cannot be downloaded "
+              "from —\n    check `ls-audit --tw-ids` if this id starts with 3.")
+        return False
+
+    try:
+        got = ls_chat.convert_file(tmp)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        os.remove(tmp)
+        print(f"  ✗ The pull does not parse: {e}")
+        return False
+    if not got.messages:
+        os.remove(tmp)
+        print("  ✗ The pull has no messages in it; keeping what is held.")
+        return False
+
+    os.replace(tmp, out)
+    print(f"  ✔ {os.path.basename(out)} — {len(got.messages):,} messages")
+    print("    The merge will union it with the capture already held.")
+    return True
+
+
+# ── giving up on a capture ────────────────────────────────────────────────
+#
+# Some captures cannot be fixed. The VOD is years gone, there is no YouTube
+# side, the file is half a crash. The checks above will keep finding them true
+# every sweep for the rest of time, and the clock prompt will keep refusing to
+# merge without an answer nobody has — so an unfixable capture stops being a
+# gap in the archive and becomes a machine that prints.
+#
+# So there is a way to say "this one is lost, stop asking". It is by hand and
+# it is per entry and platform, because a blanket rule would swallow the ones
+# that are merely awkward along with the ones that are hopeless.
+#
+# Beside the cache, in the same shape as `.archive_pending_ids.json`: small,
+# local, greppable, and editable with a text editor when a decision turns out
+# to be wrong.
+GIVEUP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           ".chat_giveup.json")
+
+
+def _load_giveup() -> dict:
+    try:
+        with open(GIVEUP_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def chat_given_up(index: int, platform: str) -> dict | None:
+    """The note left when this entry's chat on this platform was let go."""
+    return _load_giveup().get(f"{int(index)}:{platform}")
+
+
+def cmd_give_up_chat(index: int, platform: str, why: str = "") -> None:
+    """Record that this entry's chat on this platform is not coming back."""
+    if platform not in ("twitch", "youtube"):
+        print(f"  ✗ unknown platform '{platform}' (want twitch or youtube)")
+        return
+    data = _load_giveup()
+    key = f"{int(index)}:{platform}"
+    if key in data:
+        print(f"  Already let go on {data[key].get('at', '?')}"
+              + (f" — {data[key]['why']}" if data[key].get("why") else ""))
+        return
+    data[key] = {"at": datetime.datetime.now().isoformat(timespec="seconds"),
+                 "why": why or "unrecoverable"}
+    tmp = GIVEUP_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, GIVEUP_PATH)
+    print(f"  ✔ #{index} {platform} chat let go. It will not be offered or "
+          f"waited for again.")
+    print(f"    Undo by deleting the entry from "
+          f"{os.path.basename(GIVEUP_PATH)}.")
+
+
+#  What each finding is called when a person has to read it. Ordered worst
+#  first, because a capture can be several of these at once and the first line
+#  should be the one that matters.
+_SHORTFALL_SAYS = {
+    "unreadable": "the capture does not parse as any chat format we know",
+    "empty":     "the capture is there but has no messages in it",
+    "no clock":  "no message in it carries an absolute time, and the cache "
+                 "has no start for this id either",
+    "misplaced": "its own clock sits outside the broadcast — this may be "
+                 "another stream's capture",
+    "short":     "the chat stops well before the video does",
+}
+
+
 def _offer_chat_backfill(config: dict, item: dict,
                          interactive: bool = True) -> bool:
-    print("\n  ⚠ YouTube chat looks truncated:")
-    print(f"      {item['count']:,} messages, ending at "
-          f"{_seconds_to_hhmmss(item['last_secs'])} of "
-          f"{_seconds_to_hhmmss(item['duration_secs'])}")
-    print(f"      short by {_seconds_to_hhmmss(item['shortfall_secs'])} "
-          f"(flags above {_seconds_to_hhmmss(item['limit_secs'])})")
+    plat = item.get("platform", "youtube")
+    label = "YouTube" if plat == "youtube" else "Twitch"
+    why = item.get("why") or ["short"]
 
+    print(f"\n  ⚠ {label} chat wants a second look:")
+    for w in [k for k in _SHORTFALL_SAYS if k in why]:
+        print(f"      • {_SHORTFALL_SAYS[w]}")
+    if item.get("count"):
+        line = f"      {item['count']:,} messages"
+        if item.get("placed") is not None and item["placed"] != item["count"]:
+            line += f" ({item['placed']:,} of them placeable in time)"
+        if item.get("last_secs") is not None and item.get("duration_secs"):
+            line += (f", ending at {_seconds_to_hhmmss(item['last_secs'])}"
+                     f" of {_seconds_to_hhmmss(item['duration_secs'])}")
+        print(line)
+    if item.get("shortfall_secs") and item.get("limit_secs"):
+        print(f"      short by {_seconds_to_hhmmss(item['shortfall_secs'])} "
+              f"(flags above {_seconds_to_hhmmss(item['limit_secs'])})")
+    if "misplaced" in why and item.get("median_ms") and item.get("broadcast_ms"):
+        print(f"      messages centre on {_clock(item['median_ms'])}, "
+              f"broadcast began {_clock(item['broadcast_ms'])}")
+
+    run = _backfill_yt_chat if plat == "youtube" else _backfill_tw_chat
+    ask = ("Download post-hoc chat and merge?" if plat == "youtube"
+           else "Pull the VOD's chat beside it?")
     if not interactive:
-        return _backfill_yt_chat(config, item)
-    if input("\n  Download post-hoc chat and merge? [y/N]: ").strip().lower() \
-            not in ("y", "yes"):
+        return run(config, item)
+    if input(f"\n  {ask} [y/N]: ").strip().lower() not in ("y", "yes"):
         print("  Skipped.")
         return False
-    return _backfill_yt_chat(config, item)
+    return run(config, item)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1267,6 +1546,100 @@ def _cache_zeros(cache: list[dict], yt_id: str | None,
         if vod.get("record_start_epoch_ms"):
             out["twitch"] = vod["record_start_epoch_ms"]
     return out
+
+
+# ── the clock a capture does not carry ────────────────────────────────────
+#
+# `merge` places every message by its absolute time and nothing else. A source
+# that has none contributes nothing: its messages are counted as `unplaced` and
+# omitted. That used to happen quietly, after which the merged file existed —
+# and `_pipeline` treats an entry with a merged file as finished, so the
+# omission was permanent and invisible.
+#
+# Every Twitch capture from before the recorder wrote `tmi_sent_ts` is in this
+# state, which is most of the back catalogue. So the answer cannot be to refuse
+# them: it has to be possible to say what the clock was.
+
+#  What the zero MEANS, which differs by platform and is the thing somebody
+#  supplying one has to get right.
+_ZERO_MEANS = {
+    "twitch": ("the moment the recorder attached to chat — a Twitch capture's "
+               "offsets\n      are measured from there, not from the "
+               "broadcast start"),
+    "youtube": ("the broadcast start — videoOffsetTimeMsec is measured from "
+                "there"),
+}
+
+#  Where to go and look for it, in the order they are worth trying.
+_ZERO_WHERE = (
+    "the vault entry's own start time, if the entry has one",
+    "the recording cache: `record_start_epoch_ms` on the Twitch row, "
+    "`stream_start_epoch_ms` on the YouTube one",
+    "the video file's own start — `ls-audit N --timings` prints it",
+)
+
+
+def _sources_without_zero(res: dict) -> list[dict]:
+    """Sources that carried messages and no clock to place them by."""
+    return [s for s in res["metadata"]["sources"]
+            if not s.get("zero_ms") and s.get("messages")]
+
+
+def _source_platforms(paths: list[str]) -> dict:
+    """platform -> filenames, from a bounded probe rather than a parse.
+
+    Needed for the case where the merge REFUSED outright: nothing has an
+    absolute reference, so there is no metadata to read the platforms off.
+    """
+    out: dict[str, list[str]] = {}
+    for p in paths:
+        cls = ls_chat.CONVERTERS.get(ls_chat.detect_format(p))
+        if cls:
+            out.setdefault(cls.platform, []).append(os.path.basename(p))
+    return out
+
+
+def _explain_missing_zero(groups: dict, fallback: dict) -> None:
+    """Say what is wrong, what it costs, and what would fix it."""
+    print("\n  ⚠ A capture has no clock, so its messages cannot be placed.")
+    for plat in sorted(groups):
+        files, dropped = groups[plat]
+        print(f"\n      {plat}: " + ", ".join(files))
+        if dropped:
+            print(f"      {dropped:,} messages would be dropped from the "
+                  f"merge and lost from the archive's view of this stream.")
+        print(f"      Its zero is {_ZERO_MEANS.get(plat, 'the reference')}.")
+        if fallback.get(plat):
+            print(f"      The cache offers {fallback[plat]} "
+                  f"({_clock(fallback[plat])}) — already tried, and the "
+                  f"capture still has none.")
+    print("\n      Accepted: epoch ms, epoch seconds, an ISO datetime "
+          "(local unless\n      it carries an offset), or +/-seconds from "
+          "the merge reference.")
+    print("      Where to find it:")
+    for w in _ZERO_WHERE:
+        print(f"        · {w}")
+
+
+def _ask_for_zeros(groups: dict) -> dict:
+    """Prompt per platform. Empty input skips that one; bad input re-asks."""
+    given: dict[str, str] = {}
+    for plat in sorted(groups):
+        while True:
+            raw = input(f"\n  Zero for {plat} (Enter to skip): ").strip()
+            if not raw:
+                break
+            try:
+                ms = ls_chat.parse_zero(raw) if raw[0] not in "+-" else None
+            except ValueError as e:
+                print(f"    ✗ {e}")
+                continue
+            if ms is not None:
+                print(f"    → {_clock(ms)} on "
+                      f"{datetime.datetime.fromtimestamp(ms / 1000):%Y-%m-%d}")
+            given[plat] = raw
+            break
+    return given
 
 
 MERGED_SUFFIXES = (".json.gz", ".json")
@@ -1408,6 +1781,10 @@ def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
             print(f"  ⚠ {src['file']}: contributed nothing — keeping")
             continue
         target = os.path.join(dest, src["file"])
+        # A re-merge now feeds the archived raws back in, so most of them ARE
+        # the target. Nothing to move and nothing wrong, so nothing said.
+        if os.path.abspath(path) == os.path.abspath(target):
+            continue
         if os.path.exists(target):
             print(f"  ⚠ {src['file']}: already in archive — keeping")
             continue
@@ -1423,7 +1800,7 @@ def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
 def cmd_merge_chat(config: dict, index: int, ref="youtube",
                    zeros: list | None = None, output: str | None = None,
                    dry_run: bool = False, keep_raw: bool = False,
-                   assets: bool = True):
+                   assets: bool = True, interactive: bool = True):
     """Merge this entry's chat captures into one origin-tagged file."""
     nas_root = config.get("nas_path", "")
     print(f"\n{'=' * 60}")
@@ -1443,6 +1820,27 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
                 print(f"  {label} chat : {filename}")
                 sources.append(path)
 
+    # Raws already in deep storage count too, and used not to. The merge is
+    # what put them there, so leaving them out is only ever invisible on an
+    # entry nobody re-merges -- but a REPAIR is exactly that: an offline pull
+    # dropped beside an entry whose original capture was archived months ago.
+    # Merging the drop alone and writing it over the good file would trade the
+    # whole chat for the piece that was missing.
+    #
+    # Appended rather than interleaved, so on every entry that already worked
+    # the order the duplicates are seen in -- and so which copy's fields win --
+    # is exactly what it was.
+    arch_dir = config.get("chat_archive_path")
+    if arch_dir:
+        arch_dir = os.path.join(nas_root, arch_dir)
+        for key, label in (("yt_chats_archived", "YT"),
+                           ("tw_chats_archived", "TW")):
+            for filename in nas.get(key) or []:
+                path = os.path.join(arch_dir, filename)
+                if os.path.exists(path):
+                    print(f"  {label} chat : {filename}  (archived)")
+                    sources.append(path)
+
     if not sources:
         print("\n  No chat files to merge.\n")
         return
@@ -1460,11 +1858,75 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
     print()
 
     try:
-        res = ls_chat.merge(sources, ref=ref,
-                            zeros=ls_chat.parse_zero_args(zeros),
-                            fallback_zeros=fallback)
-    except (ValueError, json.JSONDecodeError) as e:
+        given = ls_chat.parse_zero_args(zeros)
+    except ValueError as e:
         print(f"  ✗ {e}\n")
+        return
+
+    #  A source with no clock is not a merge that fails, it is a merge that
+    #  quietly holds less than it was given — and then the merged file exists,
+    #  so `_pipeline` calls the entry finished and the omission sticks. So the
+    #  clock gets asked for, and unattended the merge is not written at all.
+    res = None
+    while True:
+        try:
+            res = ls_chat.merge(sources, ref=ref, zeros=given,
+                                fallback_zeros=fallback)
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"  ✗ {e}\n")
+            # "no source has an absolute reference" is the same problem as one
+            # source missing one, and wants the same question. There is no
+            # metadata to read the platforms off, so probe the files.
+            groups = {p: (f, None) for p, f in _source_platforms(sources).items()}
+            if not groups or not interactive:
+                if groups:
+                    _explain_missing_zero(groups, fallback)
+                    print("\n  Nothing written. Re-run with "
+                          "--zero PLATFORM=<epoch|ISO> from the terminal.\n")
+                return
+            _explain_missing_zero(groups, fallback)
+            more = _ask_for_zeros(groups)
+            if not more:
+                print("  Nothing written.\n")
+                return
+            given.update(more)
+            continue
+
+        orphans = _sources_without_zero(res)
+        if not orphans:
+            break
+        groups = {}
+        for s in orphans:
+            files, dropped = groups.get(s["platform"], ([], 0))
+            groups[s["platform"]] = (files + [s["file"]],
+                                     dropped + s["messages"])
+        # A platform somebody has already given up on is not asked about
+        # again, and it does not hold the rest of the entry hostage: the merge
+        # goes ahead without it, which is the whole point of having said so.
+        letgo = {p for p in groups if chat_given_up(index, p)}
+        for p in sorted(letgo):
+            print(f"  ⚠ {p}: {groups[p][1]:,} messages left out — this chat "
+                  f"was let go ({os.path.basename(GIVEUP_PATH)})")
+        if letgo == set(groups):
+            break
+        for p in letgo:
+            groups.pop(p)
+
+        _explain_missing_zero(groups, fallback)
+        if not interactive:
+            print("\n  Nothing written. Re-run with "
+                  "--zero PLATFORM=<epoch|ISO> from the terminal,\n"
+                  "  or let this capture go: ls-audit "
+                  f"{index} --give-up-chat {sorted(groups)[0]}\n")
+            return
+        more = _ask_for_zeros(groups)
+        if more:
+            given.update(more)
+            continue
+        if input("\n  Write the merge without them anyway? [y/N]: ") \
+                .strip().lower() in ("y", "yes"):
+            break
+        print("  Nothing written.\n")
         return
 
     md = res["metadata"]
@@ -1568,6 +2030,15 @@ def _pipeline(config: dict, cache: list[dict], index: int,
         print("    no chats present — nothing to merge")
         return changed
 
+    # Everything here has been let go, so there is nothing left to try and
+    # nothing to say about it beyond one line. Without this an entry whose
+    # chat can never be placed re-runs the whole merge, and re-prints the
+    # whole clock prompt, on every sweep for the rest of time.
+    _plat = {"yt_chats": "youtube", "tw_chats": "twitch"}
+    if all(chat_given_up(index, _plat[k]) for k in chats):
+        print("    chat let go on every platform here — nothing to merge")
+        return changed
+
     # A truncated YouTube chat blocks the merge: merging now would archive
     # the raws with hours of chat still missing.
     yt_id = (ls_common.extract_video_id_from_filename(nas["yt_chat"])
@@ -1582,8 +2053,28 @@ def _pipeline(config: dict, cache: list[dict], index: int,
             print("    still short after repair — will retry")
             return changed
 
-    cmd_merge_chat(config, index)          # merges, then archives the raws
-    return True
+    # Twitch does not block, and the asymmetry is deliberate. A YouTube repair
+    # merges INTO the live file, so re-checking the shortfall is a meaningful
+    # test of whether it worked. A Twitch pull lands beside the capture, so the
+    # capture is exactly as short as it was and re-checking would always say so
+    # — the union happens in the merge, not here. And a pull that is declined
+    # or unavailable is no reason to hold the merge back: archived raws are
+    # merge sources now, so a later pull re-merges to the full thing.
+    tw_id = (ls_common.extract_video_id_from_filename(nas["tw_chat"])
+             if nas.get("tw_chat") else None)
+    tw_short = _tw_chat_shortfall(config, cache, nas, tw_id, index)
+    if tw_short and _offer_chat_backfill(config, tw_short,
+                                         interactive=interactive):
+        nas = scan_nas(config, index)      # the pull is a second capture now
+
+    # `True` only if a merge was actually written. The meta-sidecar step above
+    # already learned this lesson -- "only count it if a file actually
+    # appeared" -- and returning True unconditionally here made every sweep
+    # report work it had not done. It matters beyond the tidiness: `audit()`
+    # decides whether to rewrite the vault entry on this answer, and an
+    # unattended sweep over an entry whose chat can never be placed would
+    # otherwise claim progress on it forever.
+    return bool(cmd_merge_chat(config, index, interactive=interactive))
 
 
 def cmd_tw_ids(config: dict, apply_entries: bool = False):
@@ -2056,12 +2547,26 @@ def render_findings(findings: list[dict], *, verbose: bool = False) -> None:
         print("  · nothing to check")
         print()
         return
+    # Padded per COLUMN, across the platform rows, so the separators line up
+    # down the page. The verdicts are naturally different lengths — a YouTube
+    # id is eleven characters and a Twitch one is ten — and one character of
+    # drift is enough to stop two rows reading as a comparison, which is the
+    # only reason to put them one above the other.
+    rows = []
     for prefix in ("yt", "tw"):
         mine = [f for f in findings if f.get("platform") == prefix]
-        if not mine:
-            continue
-        print(f"[{prefix.upper()}] " + " | ".join(
-            f"{_MARK.get(f['level'], ' ')} {f['short']}" for f in mine))
+        if mine:
+            rows.append((prefix, [f"{_MARK.get(f['level'], ' ')} {f['short']}"
+                                  for f in mine]))
+    widths: dict[int, int] = {}
+    for _, cells in rows:
+        for i, c in enumerate(cells):
+            widths[i] = max(widths.get(i, 0), len(c))
+    for prefix, cells in rows:
+        line = " | ".join(c.ljust(widths[i]) for i, c in enumerate(cells))
+        # rstrip, or the last column pads into trailing whitespace on the
+        # shorter row and every line ends somewhere different.
+        print(f"[{prefix.upper()}] {line}".rstrip())
     loose = [f for f in findings if not f.get("platform")]
     for f in loose:
         print(f"     {_MARK.get(f['level'], ' ')} {f['message']}")
@@ -2627,6 +3132,12 @@ examples:
                         help="Write a timings sidecar for this entry")
     parser.add_argument("--merge-chat", action="store_true",
                         help="Merge this entry's chats into one tagged file")
+    parser.add_argument("--give-up-chat", metavar="PLATFORM",
+                        choices=("twitch", "youtube"),
+                        help="this entry's chat on PLATFORM is unrecoverable: "
+                             "stop offering to fix it and merge without it")
+    parser.add_argument("--why", default="",
+                        help="--give-up-chat: a note to your future self")
     parser.add_argument("--ref", default="youtube",
                         help="--merge-chat: reference timeline "
                              "(youtube | twitch | epoch ms)")
@@ -2678,6 +3189,10 @@ examples:
         return
     if args.index is None:
         parser.print_help()
+        return
+
+    if args.give_up_chat:
+        cmd_give_up_chat(args.index, args.give_up_chat, args.why)
         return
 
     if args.timings:

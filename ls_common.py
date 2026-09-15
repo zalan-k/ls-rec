@@ -558,6 +558,28 @@ def is_broadcast_row(v: dict) -> bool:
     return bool(v.get("record_start_epoch_ms")) and not v.get("url")
 
 
+# Where an offline chat pull goes: BESIDE the live capture, never over it.
+#
+# A live capture and a download of the same VOD are two captures of one video,
+# and `scan_nas` returns every capture it finds for a platform precisely so the
+# merge can union them. That union is the point: the VOD keeps messages the
+# live capture dropped, and the live capture keeps the two things the VOD
+# cannot have — messages deleted after being seen, and the record that they
+# were. Writing the pull to the canonical name threw one side away, and on
+# Twitch it was the irreplaceable side.
+#
+# The tag sits AFTER the `[id] @ stamp` that scan_nas reads, so the pull counts
+# as a capture of the same video, on the same entry, by the same rules. It also
+# says on the face of the file that its moderation history is missing, which is
+# true and worth being able to see in a folder listing.
+OFFLINE_PULL_TAG = " (offline pull)"
+
+
+def offline_pull_name(safe_title: str) -> str:
+    """Filename for an offline chat pull of `safe_title`'s video."""
+    return f"{safe_title}{OFFLINE_PULL_TAG}.json"
+
+
 def find_confirmed_vod(cache: list[dict], video_id: str,
                        platform: str | None = None) -> dict | None:
     """`find_vod`, but a broadcast row does not count as knowing the id.

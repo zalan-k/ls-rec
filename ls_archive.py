@@ -942,7 +942,16 @@ PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
             # fetch downloads a video and only ever follows a human saying yes.
             # A single kind would have to be either approved twice or trusted
             # once, and neither is what the archive means.
-            "music_probe", "music_fetch")
+            "music_probe", "music_fetch",
+            # The three checks `ls-audit <idx>` runs, asked for from the
+            # website instead of from a terminal on this machine. It could not
+            # live anywhere else: it reads the NAS, runs ffprobe, and asks
+            # Helix which VOD a broadcast became. What goes home is a PLAN —
+            # findings, and proposed field changes — which the archive turns
+            # into a changeset rather than applying, because reconciling a
+            # vault against a filesystem against two platforms produces
+            # disagreements whose wrong side cannot be known from here.
+            "audit")
 
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 

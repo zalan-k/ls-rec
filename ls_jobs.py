@@ -1701,10 +1701,83 @@ def do_music_fetch(config: dict, job: dict):
         _scraps(mdir, job["id"])
 
 
+def do_audit(config: dict, job: dict):
+    """Run the three checks over one entry. Returns (status, None, error, plan).
+
+    The same `inspect()` the terminal runs, which is the whole reason it was
+    pulled out of `audit()` in the first place: one implementation, three
+    callers, no chance of the website and the CLI disagreeing about what is
+    wrong with an entry.
+
+    Nothing is written anywhere. The plan goes home and the archive turns it
+    into an open changeset — so a person still decides, and the audit's opinion
+    lands in the same reviewable, attributable, undoable place as everybody
+    else's.
+
+    `ls_audit` is imported HERE rather than at module scope. It pulls in
+    ls_chat and ls_assets behind it, and the worker's other eight kinds have
+    no use for any of that — an import error in the audit path should not stop
+    a promote from running.
+    """
+    idx = job.get("payload", {}).get("idx")
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return ("failed", None, "the job does not name an entry to audit", None)
+
+    try:
+        import ls_audit
+    except Exception as e:
+        return ("failed", None, f"this worker cannot run audits: {e}", None)
+
+    try:
+        got = ls_audit.inspect(config, idx)
+    except Exception as e:
+        logger.exception("audit %s failed", idx)
+        return ("failed", None, f"{type(e).__name__}: {e}", None)
+    if not got.get("ok"):
+        return ("failed", None, got.get("reason") or "the entry could not be read", None)
+
+    # Per-platform captures, keyed by PLATFORM and remote_id and never by row
+    # id. The archive addresses its own rows; a worker that named them could
+    # point one at another stream's video.
+    caps = []
+    for cap in (got.get("captures") or []):
+        plat = ls_archive.PLATFORM.get(cap.get("platform"), cap.get("platform"))
+        out = {"platform": plat, "remote_id": cap.get("remote_id")}
+        for k in ("url", "title", "video_path", "chat_path", "duration_s",
+                  "broadcast_started_at", "record_started_at",
+                  "local_start_precision_s", "video_state", "chat_state"):
+            if cap.get(k) is not None:
+                out[k] = cap[k]
+        # The archive's column names, so `auditLanded` compares like with like
+        # instead of learning a second vocabulary for the same three clocks.
+        for src, dst in (("duration_s", "file_duration_s"),
+                         ("broadcast_started_at", "remote_start_wall"),
+                         ("record_started_at", "local_start_wall")):
+            if src in out:
+                out[dst] = out.pop(src)
+        caps.append(out)
+
+    plan = {
+        "idx": idx,
+        "worst": got.get("worst", "ok"),
+        # Trimmed to what a reader needs. The full finding carries a `detail`
+        # dict that is useful in a terminal and is noise in a log line.
+        "findings": [{"level": f["level"], "check": f["check"],
+                      "platform": f.get("platform"), "message": f["message"],
+                      "short": f.get("short")}
+                     for f in (got.get("findings") or [])],
+        "stream": got.get("stream_fields") or {},
+        "captures": caps,
+    }
+    return ("done", None, None, plan)
+
+
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
             "rescan": do_rescan, "harvest": do_harvest,
             "music_probe": do_music_probe, "music_fetch": do_music_fetch,
-            "clip": do_clip}
+            "clip": do_clip, "audit": do_audit}
 
 _stop = False
 

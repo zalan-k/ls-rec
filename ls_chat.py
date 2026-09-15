@@ -269,9 +269,10 @@ def peek_zero(path: str, max_lines: int = 20000) -> tuple[Optional[int], str]:
     Derive a capture's zero from the head of the file, without parsing it all.
 
     Returns (epoch_ms, source). The source says what the zero *means*:
-        yt:timestampUsec   broadcast start (videoOffsetTimeMsec is video-relative)
-        tdc:created_at     broadcast start (VOD start)
-        irc:tmi_sent_ts    record start (offsets are relative to the recorder)
+        yt:timestampUsec      broadcast start (videoOffsetTimeMsec is video-relative)
+        tdc:created_at        broadcast start (VOD start)
+        irc:tmi_sent_ts       record start (offsets are relative to the recorder)
+        irc:time_in_seconds   broadcast start (a chat-downloader VOD pull)
     """
     fmt = detect_format(path)
 
@@ -296,6 +297,7 @@ def peek_zero(path: str, max_lines: int = 20000) -> tuple[Optional[int], str]:
         return None, "none"
 
     deltas: list[int] = []
+    irc_src = "tmi_sent_ts"
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f):
@@ -309,9 +311,10 @@ def peek_zero(path: str, max_lines: int = 20000) -> tuple[Optional[int], str]:
                 except json.JSONDecodeError:
                     continue
                 if fmt == IRC:
-                    a = _irc_abs(obj)
-                    if a is not None:
-                        deltas.append(a - _irc_ts(obj))
+                    a, rel = _irc_abs(obj), _irc_rel(obj)
+                    if a is not None and rel is not None:
+                        deltas.append(a - rel)
+                        irc_src = _irc_zero_src(obj)
                 else:
                     ts = YtdlpConverter._ts(obj)
                     # Post-hoc clamps videoOffsetTimeMsec to 0 for everything
@@ -335,7 +338,7 @@ def peek_zero(path: str, max_lines: int = 20000) -> tuple[Optional[int], str]:
     if not deltas:
         return None, "none"
     return (int(statistics.median(deltas)),
-            "irc:tmi_sent_ts" if fmt == IRC else "yt:timestampUsec")
+            f"irc:{irc_src}" if fmt == IRC else "yt:timestampUsec")
 
 
 # ── base ──────────────────────────────────────────────────────────────────
@@ -452,20 +455,77 @@ class Converter:
 
 # ── irc capture (ls_common.record_twitch_chat) ────────────────────────────
 
+# The recorder's own rows are the shape chat-downloader emits, because that is
+# what they were modelled on -- but the two do not agree on where the ABSOLUTE
+# send time lives, and the merge places messages by nothing else. Three
+# spellings are in circulation:
+#
+#   tmi_sent_ts          the recorder, milliseconds
+#   original_timestamp   microseconds, with `timestamp` rebased to an offset
+#   timestamp            microseconds, not rebased -- what chat-downloader
+#                        writes today, from the VOD comment's createdAt or
+#                        from tmi-sent-ts on a live pull
+#
+# Reading all three is what makes an offline rescue pull merge instead of being
+# dropped whole for having no absolute time.
+
+# A relative offset would have to run 31 years to reach this; an absolute one
+# has been past it since 2001. Nothing real sits in between, so one constant
+# separates the two readings of a field different tools fill differently.
+ABS_US_FLOOR = 1_000_000_000_000_000
+
+
+def _irc_rel(item: dict) -> Optional[int]:
+    """
+    Offset from the capture's zero in ms, or None where the file states none.
+
+    None is not zero. An unrebased capture HAS no offset, and answering 0 for
+    every row would hand _derive_zero the median of the message times and call
+    it a record start. A VOD pull is the good case: `time_in_seconds` is the
+    real content offset, so its zero comes out as the VOD start.
+    """
+    secs = item.get("time_in_seconds")
+    if secs is not None:
+        try:
+            return int(float(secs) * 1000)
+        except (TypeError, ValueError):
+            pass
+    try:
+        us = int(item["timestamp"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None if us >= ABS_US_FLOOR else us // 1000
+
+
+def _irc_zero_src(item: dict) -> str:
+    """What a derived zero MEANS, which differs by where the offset came from:
+    a content offset is measured from the broadcast, a recorder offset from
+    the moment recording started."""
+    return ("time_in_seconds" if item.get("time_in_seconds") is not None
+            else "tmi_sent_ts")
+
+
 def _irc_ts(item: dict) -> int:
     """Recorder writes microseconds; schema is milliseconds."""
-    try:
-        return int(item.get("timestamp", 0)) // 1000
-    except (TypeError, ValueError):
-        return 0
+    rel = _irc_rel(item)
+    return 0 if rel is None else rel
 
 
 def _irc_abs(item: dict) -> Optional[int]:
     v = item.get("tmi_sent_ts")
-    try:
-        return int(v) if v is not None else None
-    except (TypeError, ValueError):
-        return None
+    if v is not None:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    for key in ("original_timestamp", "timestamp"):
+        try:
+            us = int(item[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if us >= ABS_US_FLOOR:
+            return us // 1000
+    return None
 
 
 class IrcConverter(Converter):
@@ -513,34 +573,34 @@ class IrcConverter(Converter):
                 if not line or line in ("[", "]"):
                     continue
                 try:
-                    item = json.loads(line)
+                    out.append(json.loads(line))
                 except json.JSONDecodeError:
                     self.skipped += 1
-                    continue
-                if not isinstance(item, dict):
-                    self.skipped += 1
-                    continue
-                out.append(item)
         return out
 
     def _derive_zero(self, items):
-        deltas = []
+        deltas, src = [], "tmi_sent_ts"
         for it in items:
-            a = _irc_abs(it)
-            if a is None:
+            a, rel = _irc_abs(it), _irc_rel(it)
+            # A row with no offset of its own says nothing about the zero.
+            if a is None or rel is None:
                 continue
-            deltas.append(a - _irc_ts(it))
+            deltas.append(a - rel)
+            src = _irc_zero_src(it)
             if len(deltas) >= ZERO_SAMPLES:
                 break
         if deltas:
             self.zero_ms = int(statistics.median(deltas))
-            self.zero_src = "tmi_sent_ts"
+            self.zero_src = src
 
     def _author(self, it) -> dict:
         a = it.get("author") or {}
         d = {"id": str(a.get("id", "")),
              "name": a.get("display_name") or a.get("name") or ""}
-        c = it.get("colour") or it.get("color")
+        # A live row carries the IRC `color` tag at the top level; a VOD
+        # comment's commenter carries it nested, under either spelling.
+        c = (it.get("colour") or it.get("color")
+             or a.get("colour") or a.get("color"))
         if c:
             d["color"] = c
         return d
@@ -806,11 +866,6 @@ class YtdlpConverter(Converter):
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
-                    self.skipped += 1
-                    continue
-                # One object per line is the norm, but a bare string or list
-                # parses fine and then crashes every accessor below.
-                if not isinstance(obj, dict):
                     self.skipped += 1
                     continue
                 ts = self._ts(obj)
@@ -1169,17 +1224,11 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
     mixed = {p for p, f in fmts.items() if len(f) > 1}
 
     out, seen, dupes, unplaced = [], set(), 0, 0
-    # Per source. A global count cannot distinguish a few odd messages from
-    # an entire capture being dropped, and those need different responses.
-    placed_by_file: dict[str, int] = {}
-    unplaced_by_file: dict[str, int] = {}
     said = {}                    # (platform, author, text) -> [abs_ms, ...]
-    for path, c in zip(paths, convs):
-        fname = os.path.basename(path)
+    for c in convs:
         for m in c.messages:
             if m.abs_ms is None:
                 unplaced += 1
-                unplaced_by_file[fname] = unplaced_by_file.get(fname, 0) + 1
                 continue
             if m.id and (c.platform, m.id) in seen:
                 dupes += 1
@@ -1203,7 +1252,6 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             d.pop("ts", None)
             d.pop("id", None)
             out.append(d)
-            placed_by_file[fname] = placed_by_file.get(fname, 0) + 1
     out.sort(key=lambda d: d["abs_ms"])
 
     emotes: dict[str, dict] = {}
@@ -1270,9 +1318,7 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             "sources": [{"file": os.path.basename(p), "platform": c.platform,
                          "format": c.fmt, "messages": len(c.messages),
                          "zero_ms": c.zero_ms, "zero_source": c.zero_src,
-                         "skipped_lines": c.skipped,
-                         "placed": placed_by_file.get(os.path.basename(p), 0),
-                         "unplaced": unplaced_by_file.get(os.path.basename(p), 0)}
+                         "skipped_lines": c.skipped}
                         for p, c in zip(paths, convs)],
             "emotes": emotes,
             "badges": badges,

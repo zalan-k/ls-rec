@@ -2409,8 +2409,14 @@ def cmd_mando(args):
         tdl = config.get("twitch_downloader_cli")
         if platform == "twitch" and tdl and os.path.exists(tdl):
             vod_id = url.rstrip("/").split("/")[-1]
-            chat_out = os.path.join(nas_path, f"{safe_title}.json")
+            # Beside the live capture, not over it. See ls_common for why.
+            chat_out = os.path.join(nas_path,
+                                    ls_common.offline_pull_name(safe_title))
             subprocess.run([tdl, "chatdownload", "--id", vod_id, "-o", chat_out])
+            if os.path.exists(chat_out):
+                print(f"  ✔ Chat: {os.path.basename(chat_out)}")
+                print("    Union it with whatever else is held: "
+                      "ls-audit N --merge-chat")
         else:
             # Pull posthoc to a distinct name so it can't clobber a live capture.
             cmd = ls_common.ytdlp_chat_cmd(
@@ -2425,7 +2431,17 @@ def cmd_mando(args):
             if platform == "youtube":
                 _merge_posthoc_chat(nas_path, video_id, posthoc)
             elif os.path.exists(posthoc):
-                os.replace(posthoc, os.path.join(nas_path, f"{safe_title}.json"))
+                # This used to replace the canonical name, which on Twitch
+                # meant the live IRC capture -- the only copy of the deletions
+                # and the moderation record -- was overwritten by a VOD
+                # download that by construction has neither. Now it lands
+                # beside it and `--merge-chat` unions the two.
+                landed = os.path.join(nas_path,
+                                      ls_common.offline_pull_name(safe_title))
+                os.replace(posthoc, landed)
+                print(f"  ✔ Chat: {os.path.basename(landed)}")
+                print("    Union it with whatever else is held: "
+                      "ls-audit N --merge-chat")
 
     # Update cache
     cache = ls_common.load_cache()
