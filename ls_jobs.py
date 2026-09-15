@@ -1859,6 +1859,13 @@ def run(config: dict, *, kinds, once: bool = False, interval: int | None = None)
         # lease may be about to lapse, and saying it is finished is what stops
         # the archive handing it out again.
         ls_archive.flush_reports(config)
+        # And any Twitch VOD that had not been published when its broadcast
+        # ended. Rate-limited inside to one Helix round trip per five minutes,
+        # so putting it on a twenty-second loop costs nothing.
+        try:
+            ls_archive.flush_pending_ids(config)
+        except Exception as e:      # never worth stopping the worker over
+            logger.debug(f"pending vod ids: {e}")
         # One at a time. A fetch can run for minutes and the lease is five, so
         # claiming a handful would mean the ones waiting their turn lapse and
         # get handed out from under this worker.

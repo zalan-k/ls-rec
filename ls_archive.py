@@ -39,9 +39,22 @@ logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTBOX_PATH = os.path.join(SCRIPT_DIR, ".archive_outbox.json")
+# Broadcasts still waiting for Twitch to publish their VOD. A different problem
+# from the outbox, which holds packets the ARCHIVE could not be told: these
+# are packets that cannot be WRITTEN yet, because the number in them does not
+# exist. Same file shape, separate file, so a stalled archive and a slow VOD
+# cannot block each other.
+PENDING_PATH = os.path.join(SCRIPT_DIR, ".archive_pending_ids.json")
 
 TIMEOUT = 6          # seconds; the archive is never worth waiting on
 OUTBOX_MAX = 500     # packets; beyond this something is wrong, not backlogged
+# How long to keep asking Twitch for a VOD before deciding there will not be
+# one. Minutes is the normal wait; six hours covers a slow publish, and past
+# that the honest answer is that the broadcast had no VOD — she turned them
+# off, it was muted into oblivion, or it was deleted. Asking forever would
+# mean a file that only ever grows.
+PENDING_GIVE_UP_S = 6 * 3600
+PENDING_EVERY_S = 300    # one Helix round trip per five minutes, not per tick
 
 PLATFORM = {"youtube": "YT", "twitch": "TW"}
 
@@ -212,6 +225,125 @@ def flush(config: dict) -> int:
     return sent
 
 
+# ── the id Twitch has not minted yet ──────────────────────────────────────
+#
+# The recorder knows the broadcast id and nothing else, because at the moment
+# it is recording nothing else exists. The VOD is numbered when the broadcast
+# ends, usually within minutes — but "usually within minutes" is not "by the
+# time the wrapup runs", which is why entries #700 to #736 all carry a watch
+# link built from the wrong number.
+#
+# So the wrapup asks once, and if the answer is not there yet the question is
+# written down and asked again on the job worker's own poll loop until it is
+# answered or until asking stops being reasonable. No new daemon, no new
+# schedule: `flush_pending_ids` sits next to `flush` in the loop that already
+# runs every twenty seconds.
+
+def _load_pending() -> list[dict]:
+    try:
+        with open(PENDING_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning(f"archive pending-id list unreadable, starting fresh: {e}")
+        return []
+
+
+def _save_pending(items: list[dict]) -> None:
+    try:
+        if not items:
+            if os.path.exists(PENDING_PATH):
+                os.remove(PENDING_PATH)
+            return
+        tmp = PENDING_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, PENDING_PATH)
+    except Exception as e:
+        logger.warning(f"could not write the archive pending-id list: {e}")
+
+
+def resolve_twitch_vod(config: dict, broadcast_id: str, *,
+                       refresh: bool = True) -> str | None:
+    """The VOD id this broadcast became, or None if Twitch has not said yet.
+
+    Imported here rather than at module scope because ls_common imports this
+    module; the cycle is real and only this one function needs the other side.
+    """
+    if not broadcast_id:
+        return None
+    try:
+        import ls_common
+        cache = ls_common.load_cache()
+        vod = ls_common.find_vod_by_stream_id(cache, broadcast_id)
+        if vod:
+            return str(vod["id"])
+        if not refresh:
+            return None
+        if ls_common.refresh_twitch_cache(config, cache):
+            ls_common.save_cache(cache)
+            vod = ls_common.find_vod_by_stream_id(cache, broadcast_id)
+            if vod:
+                return str(vod["id"])
+    except Exception as e:
+        logger.warning(f"could not ask Twitch which VOD {broadcast_id} became: {e}")
+    return None
+
+
+def defer_twitch_id(broadcast_id: str, body: dict) -> None:
+    """Ask again later. Idempotent on the broadcast id."""
+    items = [i for i in _load_pending() if i.get("broadcast_id") != str(broadcast_id)]
+    items.append({"broadcast_id": str(broadcast_id),
+                  "body": body,
+                  "first_seen": int(datetime.datetime.now().timestamp()),
+                  "last_try": 0})
+    _save_pending(items)
+    logger.info(f"archive: twitch has not published the VOD for {broadcast_id} "
+                f"yet; will keep asking")
+
+
+def flush_pending_ids(config: dict) -> int:
+    """Re-ask Twitch for any VOD id still outstanding. Safe on every tick."""
+    if not enabled(config):
+        return 0
+    items = _load_pending()
+    if not items:
+        return 0
+    now_s = int(datetime.datetime.now().timestamp())
+    keep, sent = [], 0
+    # At most one Helix round trip per pass however many are waiting: they all
+    # read the same refreshed cache, so asking once answers all of them.
+    refreshed = False
+    for it in items:
+        if now_s - int(it.get("last_try") or 0) < PENDING_EVERY_S:
+            keep.append(it)
+            continue
+        vod = resolve_twitch_vod(config, it["broadcast_id"], refresh=not refreshed)
+        refreshed = True
+        if vod:
+            body = dict(it.get("body") or {})
+            body["final_remote_id"] = vod
+            if _send(config, body, queue_on_failure=True) is not None:
+                sent += 1
+                logger.info(f"archive: {it['broadcast_id']} became VOD {vod}")
+                continue
+            # The archive is down, not Twitch. The OUTBOX has it now, so this
+            # entry's work is done either way.
+            sent += 1
+            continue
+        if now_s - int(it.get("first_seen") or now_s) > PENDING_GIVE_UP_S:
+            logger.warning(f"archive: giving up on a VOD for {it['broadcast_id']} "
+                           f"— none published in "
+                           f"{PENDING_GIVE_UP_S // 3600}h")
+            continue
+        it["last_try"] = now_s
+        keep.append(it)
+    _save_pending(keep)
+    return sent
+
+
 # ── the two packets ───────────────────────────────────────────────────────
 
 def post_start(config: dict, *, platform: str, video_id: str, title: str,
@@ -256,18 +388,39 @@ def post_done(config: dict, *, platform: str, video_id: str,
               duration_seconds: float | None = None,
               video_ext: str = ".mp4",
               have_video: bool = False,
-              have_chat: bool = False) -> dict | None:
+              have_chat: bool = False,
+              final_remote_id: str | None = None,
+              video_state: str | None = None,
+              chat_state: str | None = None) -> dict | None:
     """The wrapup finished. Sends only what is now true.
 
     Called even when nothing was uploaded — a broadcast that happened and has no
     file is the case the archive most wants to hear about, and it is exactly the
     case that used to send nothing at all. With no paths, recompute() marks the
     capture unverified rather than present, which is the honest answer.
+
+    `final_remote_id` is the id this capture ENDED UP with, which on Twitch is
+    not the one it started under: the recorder catches the channel live and
+    yt-dlp hands it the broadcast id, then the VOD is minted at the end with a
+    different number entirely. Both are real. Sending the second one here is
+    what makes that a succession the archive records, rather than something
+    ls-audit repairs afterwards out of a cache — which is how entries #700 to
+    #736 ended up holding watch links that 404.
+
+    `video_state` / `chat_state` are why there is no local copy, for the case
+    the answer is "we chose not to keep it". Both platforms get recorded and
+    one master is usually enough; without a word for that, the archive reads a
+    deliberate deletion as a loss.
     """
     body = {
         "platform": PLATFORM.get(platform, platform.upper()[:2]),
         "remote_id": video_id,
     }
+    if final_remote_id and str(final_remote_id) != str(video_id):
+        body["final_remote_id"] = str(final_remote_id)
+    for key, val in (("video_state", video_state), ("chat_state", chat_state)):
+        if val:
+            body[key] = str(val)
     if stream_title:
         prefix = _media_prefix(config)
         ext = video_ext if video_ext.startswith(".") else f".{video_ext or 'mp4'}"
@@ -277,10 +430,25 @@ def post_done(config: dict, *, platform: str, video_id: str,
             body["chat_path"] = f"{prefix}{stream_title}.json"
     if duration_seconds:
         body["duration_s"] = int(duration_seconds)
+
+    # Twitch, and only when the caller did not already know the answer: ask
+    # once now, and if the VOD is not minted yet write the question down. The
+    # packet goes either way — the duration and the paths are true regardless
+    # of what the video ends up being called.
+    if (body["platform"] == "TW" and "final_remote_id" not in body
+            and enabled(config)):
+        found = resolve_twitch_vod(config, video_id)
+        if found and found != str(video_id):
+            body["final_remote_id"] = found
+        elif not found:
+            defer_twitch_id(video_id, dict(body))
+
     r = _send(config, body)
     if r:
+        moved = r.get("succeeded") or {}
         logger.info(f"archive: wrapped #{r.get('index')} "
-                    f"vod={r.get('vod_state')} chat={r.get('chat_state')}")
+                    f"vod={r.get('vod_state')} chat={r.get('chat_state')}"
+                    + (f" (id {moved.get('from')} → {moved.get('to')})" if moved else ""))
     return r
 
 
@@ -412,6 +580,11 @@ _CAP_COLUMN = {
     "duration_s": "file_duration_s",
     "broadcast_started_at": "remote_start_wall",
     "record_started_at": "local_start_wall",
+    # Why there is no local copy. In the plan like everything else, so the
+    # first run that carries a vault `.×` across shows it as a change a person
+    # can see and refuse, rather than silently rewriting a state column on
+    # several hundred entries.
+    "video_state": "video_state", "chat_state": "chat_state",
 }
 _CLOCK_PRECISION = {"record_started_at": "local_start_precision_s"}
 
@@ -454,6 +627,13 @@ def _classify(field, before, after, *, stored_prec=None, want_prec=None):
     """new | same | refine | downgrade-noise | collision."""
     if after is None or after == "":
         return None                      # nothing to say about this field
+    # `unverified` IS nothing. The archive sends it in place of a NULL state so
+    # a reader has one vocabulary instead of a vocabulary plus an absence —
+    # which is right there and wrong here, because it would make the first run
+    # that carries a vault `.×` across look like a collision on every entry and
+    # ask a human about several hundred of them.
+    if field in ("video_state", "chat_state") and before == "unverified":
+        before = None
     if before is None or before == "":
         return "new"
 

@@ -385,14 +385,52 @@ def resolve_id(config: dict, cache: list[dict], platform: str,
     return vid, src
 
 
-def unpublished_vod(cache: list[dict], platform: str, video_id: str | None) -> bool:
-    """Is this id one we KNOW is a broadcast whose VOD we could not find?
+def _helix_floor_ms(cache: list[dict]) -> int | None:
+    """The oldest Twitch VOD Helix has actually shown us, in epoch ms.
 
-    Positive evidence, not absence of it: the id has a broadcast row in the
-    cache and `resolve_id` already tried and failed to correct it. An id we
-    simply have never heard of is not this — a hand-written /videos/ link from
-    2024 is older than anything Helix will still list, and refusing to trust it
-    would break every old entry to fix a new one.
+    Helix lists a bounded window of recent videos — there is no way to ask for
+    all of them — so the cache's knowledge has a floor, and that floor is the
+    only honest boundary for "we would have seen it if it existed".
+
+    None when no row carries `stream_id`, which means no refresh has ever run
+    against this cache since that field was added. That is not a small caveat:
+    on the live Pi, 261 of 261 Twitch rows were in exactly that state, so the
+    join every correction depends on was empty and no amount of guard-fixing
+    could have helped until one refresh had run.
+    """
+    best = None
+    for v in cache:
+        if v.get("platform") != "twitch" or not v.get("stream_id"):
+            continue
+        raw = str(v.get("start_time") or "")
+        if not raw:
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        ms = int(dt.timestamp() * 1000)
+        best = ms if best is None else min(best, ms)
+    return best
+
+
+def unpublished_vod(cache: list[dict], platform: str, video_id: str | None) -> bool:
+    """Is this id a broadcast whose VOD we looked for and can say is not there?
+
+    Three conditions, and the last two are what stop this from quietly blanking
+    a link on every old entry in the vault:
+
+      1. the id has a BROADCAST row — positive evidence, not absence of it;
+      2. the cache has been refreshed at least once since Helix's `stream_id`
+         started being kept, or there is no join to have failed and therefore
+         nothing to conclude;
+      3. the broadcast is INSIDE the window Helix showed us. A stream from
+         last year is not missing from a listing of the last two hundred
+         videos, it is simply older than the listing — and suppressing its
+         link would be this function inventing a fact rather than reporting
+         one.
 
     What it is for: Twitch mints the VOD minutes AFTER the broadcast ends, so
     auditing a stream the evening it happened lands here every time. Building
@@ -404,7 +442,13 @@ def unpublished_vod(cache: list[dict], platform: str, video_id: str | None) -> b
     if platform != "twitch" or not video_id:
         return False
     row = ls_common.find_vod(cache, video_id, "twitch")
-    return bool(row and ls_common.is_broadcast_row(row))
+    if not row or not ls_common.is_broadcast_row(row):
+        return False
+    floor = _helix_floor_ms(cache)
+    started = row.get("record_start_epoch_ms") or row.get("stream_start_epoch_ms")
+    if floor is None or not started:
+        return False
+    return int(started) >= floor
 
 
 def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
@@ -1660,6 +1704,268 @@ def cmd_sweep(config: dict, count: int = 5, interactive: bool = False):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  THE CORE — what an audit KNOWS, with nothing printed and nothing asked
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# This used to be the top half of `audit()`, interleaved with prints. Pulling
+# it out is what lets the same three checks answer a terminal, a job report and
+# a test without three copies of them — and it is what makes the tool a
+# VERIFIER rather than a builder. Rebuilding the Obsidian line was never the
+# point; it was the cheapest way to deal with a markdown file whose formatting
+# could not be trusted, and the block below is now one output among several
+# rather than the purpose.
+#
+# Three checks, and only the first one is about this machine:
+#
+#   disk        is the file here, and is it the one the record names
+#   platform    does the id name something that exists, and does it still
+#   assignment  is this capture attached to the RIGHT broadcast
+#
+# The third is the one nothing has ever asked, and it is the one that bites:
+# a Twitch capture landing on the wrong stream's row is invisible to every
+# other check, because every file is present and every link resolves.
+
+# level     meaning
+# 'ok'      checked, and it is fine — kept so a quiet run can say what it read
+# 'note'    true and worth knowing, not a problem (a copy declined on purpose)
+# 'warn'    probably wrong, and a person should look
+# 'bad'     wrong, or unanswerable when it should be answerable
+LEVELS = ("ok", "note", "warn", "bad")
+_RANK = {lvl: i for i, lvl in enumerate(LEVELS)}
+
+# How far a capture's own start may sit from the entry's before the assignment
+# is in doubt. Generous on purpose: a vault date is typed to the minute by a
+# person, and the two platforms genuinely start minutes apart. Past an hour,
+# though, they are not the same broadcast.
+ASSIGN_WINDOW_S = 3600
+
+
+def _finding(level: str, check: str, message: str, *,
+             platform: str | None = None, **detail) -> dict:
+    return {"level": level, "check": check, "platform": platform,
+            "message": message, "detail": detail}
+
+
+def _disk_findings(config: dict, nas: dict, entry: dict) -> list[dict]:
+    """Is the file here, and if not, is that a decision or a loss?"""
+    out = []
+    for prefix, label in (("yt", "YouTube"), ("tw", "Twitch")):
+        if entry.get(f"no_{prefix}"):
+            continue
+        # VIDEO. The `.×` in the vault is a person saying "I did not keep
+        # this" — both platforms get recorded and one master is usually
+        # enough — and until the archive had a word for it, every audit
+        # reported it as missing. It is a note, not a warning.
+        if nas.get(f"{prefix}_video"):
+            out.append(_finding("ok", "disk", f"{label} video on disk",
+                                platform=prefix, file=nas[f"{prefix}_video"]))
+        elif entry.get(f"{prefix}_video_x"):
+            out.append(_finding("note", "disk", f"{label} video deliberately not kept",
+                                platform=prefix, state="declined"))
+        else:
+            out.append(_finding("warn", "disk", f"{label} video missing",
+                                platform=prefix, state="lost"))
+
+        # CHAT. Deep storage counts as present: the merge folded it in and
+        # moved it on purpose, and calling that missing is the single most
+        # alarming line the old output produced for the one outcome that went
+        # entirely right.
+        if nas.get(f"{prefix}_chat"):
+            out.append(_finding("ok", "disk", f"{label} chat on disk",
+                                platform=prefix, file=nas[f"{prefix}_chat"]))
+        elif _chat_accounted(nas, prefix):
+            out.append(_finding("ok", "disk", f"{label} chat folded into the merged file",
+                                platform=prefix, state="kept"))
+        elif entry.get(f"{prefix}_chat_x"):
+            out.append(_finding("note", "disk", f"{label} chat deliberately not kept",
+                                platform=prefix, state="declined"))
+        else:
+            out.append(_finding("warn", "disk", f"{label} chat missing",
+                                platform=prefix, state="lost"))
+    return out
+
+
+def _platform_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
+    """Does this id name something that exists?
+
+    Answered from the cache rather than from the network. That is not a
+    shortcut — the cache is fed by Helix and yt-dlp and is refreshed by the id
+    resolution that just ran, so it holds the platform's own answer. What it
+    buys is an audit that can be run over two hundred entries without two
+    hundred round trips, and an offline one that still says something useful.
+    `--probe` is the door to a live check when the cached answer is doubted.
+    """
+    out = []
+    for prefix, platform, label in (("yt", "youtube", "YouTube"),
+                                    ("tw", "twitch", "Twitch")):
+        if entry.get(f"no_{prefix}"):
+            continue
+        vid = (ids.get(platform) or (None, None))[0]
+        if not vid:
+            out.append(_finding("warn", "platform", f"no {label} id could be resolved",
+                                platform=prefix))
+            continue
+        row = ls_common.find_vod(cache, vid, platform)
+        if row is None:
+            # Not necessarily wrong: Helix lists a bounded window and an old
+            # entry falls out of it. Worth a word, not an alarm.
+            out.append(_finding("note", "platform",
+                                f"{label} {vid} is not in the cache — too old to list, "
+                                f"or never confirmed", platform=prefix, id=vid))
+        elif ls_common.is_broadcast_row(row):
+            # The whole #736 failure in one line: this id is the BROADCAST,
+            # and a watch link built from it is a 404.
+            out.append(_finding("bad", "platform",
+                                f"{label} {vid} is a broadcast id, not a video — "
+                                f"its VOD has not been published or not been found",
+                                platform=prefix, id=vid))
+        else:
+            out.append(_finding("ok", "platform", f"{label} {vid} is a known video",
+                                platform=prefix, id=vid,
+                                title=row.get("title")))
+    return out
+
+
+def _assignment_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
+    """Is this capture on the RIGHT broadcast?
+
+    The check nothing has performed, and the one that catches the failure that
+    actually happened: one stream's Twitch capture filed against another
+    stream's row. Every other check passes in that state — the file is there,
+    the link resolves — because nothing compares the video's OWN start against
+    the entry's.
+    """
+    out = []
+    want = entry.get("date_obj")
+    if not want:
+        return [_finding("bad", "assignment", "the entry has no parseable date, so "
+                         "nothing can be checked against it")]
+    # THROUGH `_vault_epoch`, and the first version of this did not: the vault
+    # writes a wall-clock reading with its offset beside it (`GMT-5`), while
+    # Helix answers in UTC. Comparing the naive datetime directly made every
+    # Twitch capture look five hours out of place — a check that fires on every
+    # row is worse than no check, because it is the one people turn off.
+    want_ms = (_vault_epoch(want, _tz_offset_min(entry.get("tz_str"))) or 0) * 1000
+    for prefix, platform, label in (("yt", "youtube", "YouTube"),
+                                    ("tw", "twitch", "Twitch")):
+        if entry.get(f"no_{prefix}"):
+            continue
+        vid = (ids.get(platform) or (None, None))[0]
+        if not vid:
+            continue
+        row = ls_common.find_vod(cache, vid, platform) or {}
+        got_ms = row.get("stream_start_epoch_ms") or row.get("record_start_epoch_ms")
+        if not got_ms:
+            raw = str(row.get("start_time") or "")
+            try:
+                dt = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.astimezone()
+                got_ms = int(dt.timestamp() * 1000)
+            except ValueError:
+                got_ms = None
+        if not got_ms:
+            out.append(_finding("note", "assignment",
+                                f"nothing says when {label} {vid} started, so its "
+                                f"assignment cannot be checked", platform=prefix, id=vid))
+            continue
+        off = abs(got_ms - want_ms) // 1000
+        if off <= ASSIGN_WINDOW_S:
+            out.append(_finding("ok", "assignment",
+                                f"{label} starts within {off // 60}m of the entry",
+                                platform=prefix, id=vid, off_s=off))
+        else:
+            out.append(_finding("bad", "assignment",
+                                f"{label} {vid} starts {off // 3600}h{(off % 3600) // 60:02d}m "
+                                f"from this entry — it may belong to another stream",
+                                platform=prefix, id=vid, off_s=off))
+    return out
+
+
+_MARK = {"ok": "✓", "note": "·", "warn": "!", "bad": "✗"}
+
+
+def render_findings(findings: list[dict], *, verbose: bool = False) -> None:
+    """The findings, as few lines as honesty allows.
+
+    Quiet means quiet: everything that is FINE collapses to one line saying
+    how many things were checked, because a list of twelve ticks is a list
+    nobody reads and therefore a list that hides the one cross in it. Notes
+    and above print in full. `-v` prints everything, which is what the old
+    output did for every run.
+    """
+    loud = [f for f in findings if f["level"] != "ok"]
+    fine = [f for f in findings if f["level"] == "ok"]
+    for f in (findings if verbose else loud):
+        tag = f"[{f['platform'].upper()}] " if f.get("platform") else ""
+        print(f"  {_MARK.get(f['level'], ' ')} {tag}{f['message']}")
+    if fine and not verbose:
+        checks = sorted({f["check"] for f in fine})
+        print(f"  ✓ {len(fine)} checks passed ({', '.join(checks)})")
+    if not findings:
+        print("  · nothing to check")
+    print()
+
+
+def worst(findings: list[dict]) -> str:
+    """The loudest level present, or 'ok' for nothing at all."""
+    return max((f["level"] for f in findings), key=lambda l: _RANK.get(l, 0),
+               default="ok")
+
+
+def inspect(config: dict, index: int, *,
+            yt_override: str | None = None,
+            tw_override: str | None = None,
+            cache: list[dict] | None = None) -> dict:
+    """Everything an audit knows about one entry. Prints nothing, asks nothing.
+
+    The return value is the whole of what the CLI renders, what a job report
+    would carry, and what a test asserts against — which is the point of it
+    existing separately.
+    """
+    out = {"index": int(index), "ok": False, "reason": None, "findings": [],
+           "entry": None, "nas": None, "ids": {}, "block": None,
+           "stream_fields": None, "captures": None}
+
+    entry = ls_common.obsidian_parse_entry(config, index)
+    if not entry["found"]:
+        out["reason"] = f"entry #{index} not found"
+        return out
+    entry["_index"] = index
+    out["entry"] = entry
+    if not entry["date_obj"]:
+        out["reason"] = f"cannot parse the date for #{index}"
+        out["findings"].append(_finding("bad", "assignment", out["reason"],
+                                        raw=entry.get("date_str")))
+        return out
+
+    cache = ls_common.load_cache() if cache is None else cache
+    nas = scan_nas(config, index)
+    out["nas"] = nas
+
+    ids = {}
+    if not entry.get("no_yt"):
+        ids["youtube"] = resolve_id(config, cache, "youtube", entry, nas, yt_override)
+    if not entry.get("no_tw"):
+        ids["twitch"] = resolve_id(config, cache, "twitch", entry, nas, tw_override)
+    out["ids"] = ids
+
+    out["findings"] = (_disk_findings(config, nas, entry)
+                       + _platform_findings(cache, ids, entry)
+                       + _assignment_findings(cache, ids, entry))
+
+    yt_id = (ids.get("youtube") or (None, None))[0]
+    tw_id = (ids.get("twitch") or (None, None))[0]
+    out["block"] = build_entry(config, cache, index, entry, nas, yt_id, tw_id)
+    out["stream_fields"], out["captures"] = _archive_inputs(
+        config, cache, entry, nas, index, yt_id, tw_id)
+    out["cache"] = cache
+    out["ok"] = True
+    out["worst"] = worst(out["findings"])
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  AUDIT
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1667,9 +1973,11 @@ def audit(config: dict, index: int,
           yt_override: str | None = None,
           tw_override: str | None = None,
           push_archive: bool = True,
-          interactive: bool = True):
+          interactive: bool = True,
+          verbose: bool = False,
+          show_block: bool = False):
     """
-    Reconstruct entry #index.
+    Verify entry #index, and repair the vault line while it is here.
 
     1. Parse Obsidian entry → checkbox, date, notes, existing IDs
     2. Scan NAS → existing files
@@ -1682,73 +1990,61 @@ def audit(config: dict, index: int,
     print(f"  Auditing entry #{index}")
     print(f"{'=' * 60}\n")
 
-    # 1. Parse
-    entry = ls_common.obsidian_parse_entry(config, index)
-    if not entry["found"]:
-        print(f"  ✗ Entry #{index} not found.")
+    # 1-4. Everything the audit knows, in one call and with nothing printed.
+    got = inspect(config, index, yt_override=yt_override, tw_override=tw_override)
+    if not got["ok"]:
+        print(f"  ✗ {got['reason']}")
+        if got.get("entry") and got["entry"].get("date_str"):
+            print(f"    Raw: {got['entry']['date_str']}")
         return
-    if not entry["date_obj"]:
-        print(f"  ✗ Cannot parse date for #{index}")
-        if entry["date_str"]:
-            print(f"    Raw: {entry['date_str']}")
-        return
+    entry, nas, cache = got["entry"], got["nas"], got["cache"]
+    yt_id = (got["ids"].get("youtube") or (None, None))[0]
+    tw_id = (got["ids"].get("twitch") or (None, None))[0]
+    block = got["block"]
 
-    # Stash index for cache-by-index lookup in resolve_id
-    entry["_index"] = index
-
-    print(f"  Date     : {entry['date_str']} {entry.get('tz_str') or ''}")
-    print(f"  Checkbox : {entry['checkbox']}")
-    if entry["no_yt"]:
-        print("  YouTube  : ✗ (no stream)")
-    if entry["no_tw"]:
-        print("  Twitch   : ✗ (no stream)")
+    print(f"  {entry['date_str']} {entry.get('tz_str') or ''}"
+          f"   {entry['checkbox']}"
+          + (f"   [YT] {yt_id}" if yt_id else "")
+          + (f"   [TW] {tw_id}" if tw_id else ""))
     print()
-
-    # 2. NAS scan
-    print("  Archive scan:")
-    nas = scan_nas(config, index)
-    for key, label in [("yt_video", "YT video"), ("yt_chat", "YT chat"),
-                       ("tw_video", "TW video"), ("tw_chat", "TW chat")]:
-        status = f"✓ {nas[key]}" if nas[key] else "✗ not found"
-        print(f"    {status}")
-    print()
-
-    # 2b. Media analysis (duration + chat stats)
-    _print_media_analysis(config, nas)
-
-    # 3. Resolve IDs
-    cache = ls_common.load_cache()
-
-    yt_id, yt_src = ((None, None) if entry["no_yt"]
-                     else resolve_id(config, cache, "youtube", entry, nas, yt_override))
-    tw_id, tw_src = ((None, None) if entry["no_tw"]
-                     else resolve_id(config, cache, "twitch", entry, nas, tw_override))
-
-    print("  IDs:")
-    if not entry["no_yt"]:
-        print(f"    [YT] {yt_id or '—'}")
-    if not entry["no_tw"]:
-        print(f"    [TW] {tw_id or '—'}")
-    print()
-
-    # 4. Build entry
-    block = build_entry(config, cache, index, entry, nas, yt_id, tw_id)
-    print("  ┌─ Reconstructed ────────────────────────────────────")
-    for line in block:
-        print(f"  │ {line}")
-    print("  └────────────────────────────────────────────────────\n")
+    render_findings(got["findings"], verbose=verbose)
+    if verbose:
+        _print_media_analysis(config, nas)
 
     # 5. Write
     # Headless runs write without asking. The reconstruction is deterministic
     # and the vault is in git; a timer that stops to ask a question nobody is
     # there to answer just never runs at all, which is what --sweep did.
-    if not interactive or input("  Write to Obsidian? (y/n): ").strip().lower() == "y":
-        if ls_common.obsidian_write_entry(config, index, block):
-            print("  ✓ Written.")
+    #
+    # The BLOCK is not printed by default. It is one markdown line per platform
+    # and most of it is percent-encoded obsidian:// URLs six hundred characters
+    # long — reading it was never how anybody checked anything, the findings
+    # above are. `--show` prints it; `-v` implies it.
+    if show_block or verbose:
+        print("  ┌─ Reconstructed ────────────────────")
+        for line in block:
+            print(f"  │ {line}")
+        print("  └───────────────────────────────────\n")
+
+    # ONE question, asked here and ANSWERED here — but the write itself waits
+    # until the end of the run. It used to ask twice, once now and once after
+    # the merge, about the same file, with the second answer quietly
+    # overwriting the first; the only way to say "yes, but not that one" was
+    # to not notice you had been asked twice. Deferring the write means the
+    # line that lands is built from what the run actually did, which is what
+    # the second prompt was really for.
+    may_write = (not interactive
+                 or input("  Write to Obsidian? (y/n): ").strip().lower() == "y")
+    if not may_write:
+        print("  Obsidian left alone.")
+
+    def _write_vault(lines):
+        if not may_write:
+            return
+        if ls_common.obsidian_write_entry(config, index, lines):
+            print("  ✓ Obsidian entry written.")
         else:
-            print("  ✗ Write failed.")
-    else:
-        print("  Skipped.")
+            print("  ✗ Obsidian write failed.")
     print()
 
     # 6. Missing files → download
@@ -1779,6 +2075,7 @@ def audit(config: dict, index: int,
         nas = scan_nas(config, index)
 
     if not changed:
+        _write_vault(block)
         # Save cache (may have been updated by title lookups)
         ls_common.save_cache(cache)
         if push_archive:
@@ -1808,16 +2105,14 @@ def audit(config: dict, index: int,
     _print_media_analysis(config, nas)
 
     block = build_entry(config, cache, index, entry, nas, yt_id, tw_id)
-    print("  ┌─ Updated ──────────────────────────────────────────")
-    for line in block:
-        print(f"  │ {line}")
-    print("  └────────────────────────────────────────────────────\n")
+    if show_block or verbose:
+        print("  ┌─ Updated ──────────────────────────────────────────")
+        for line in block:
+            print(f"  │ {line}")
+        print("  └────────────────────────────────────────────────────\n")
 
-    if not interactive or input("  Write to Obsidian? (y/n): ").strip().lower() == "y":
-        if ls_common.obsidian_write_entry(config, index, block):
-            print("  ✔ Written.")
-        else:
-            print("  ✗ Write failed.")
+    # The rebuilt line, using the answer already given.
+    _write_vault(block)
 
     ls_common.save_cache(cache)
 
@@ -1978,6 +2273,22 @@ def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
         # in place and there is nothing to forget.
         if merged_rel and not nas[f"{prefix}_chat"]:
             cap["clear"] = ["chat_path"]
+
+        # ── why there is no local copy ───────────────────────────────────
+        # The `.×` in an Obsidian line is a person saying "I did not keep
+        # this", and it is the only record of that decision anywhere. The
+        # archive was never told, so it read every deliberate deletion as a
+        # loss — which is most of them, because both platforms get recorded
+        # and one master is usually enough. Sending it here is what carries
+        # that decision out of the markdown before the markdown goes away.
+        if nas[f"{prefix}_video"]:
+            cap["video_state"] = "kept"
+        elif entry.get(f"{prefix}_video_x"):
+            cap["video_state"] = "declined"
+        if nas[f"{prefix}_chat"] or _chat_accounted(nas, prefix):
+            cap["chat_state"] = "kept"
+        elif entry.get(f"{prefix}_chat_x"):
+            cap["chat_state"] = "declined"
         if t.get("duration_secs"):
             cap["duration_s"] = int(t["duration_secs"])
         if t.get("stream_start_epoch_ms"):
@@ -2115,6 +2426,10 @@ examples:
                         help="Entry index to audit")
     parser.add_argument("--yt-id", help="Override YouTube video ID")
     parser.add_argument("--tw-id", help="Override Twitch video ID")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Every check and every file, as it used to print")
+    parser.add_argument("--show", action="store_true",
+                        help="Print the reconstructed Obsidian line as well")
     parser.add_argument("--refresh", nargs="?", const="all",
                         choices=["all", "youtube", "twitch"],
                         help="Refresh VOD cache")
@@ -2203,7 +2518,8 @@ examples:
         return
 
     audit(config, args.index, yt_override=args.yt_id, tw_override=args.tw_id,
-          push_archive=not args.no_archive, interactive=not args.yes)
+          push_archive=not args.no_archive, interactive=not args.yes,
+          verbose=args.verbose, show_block=args.show)
 
 
 if __name__ == "__main__":
