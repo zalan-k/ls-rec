@@ -374,13 +374,33 @@ def twitch_get_token(config: dict) -> str | None:
         return None
 
 
+# Why the last Helix call came back with nothing. None means it went fine.
+#
+# This exists because every failure below used to be indistinguishable from
+# "she has no VODs": no credentials, no user id and an HTTP error all returned
+# an empty list in silence. Downstream, ls-audit read that as "Twitch has not
+# published the VOD yet" and quietly kept a broadcast id — so an entry showed a
+# watch link that 404s and nothing anywhere said the archive had never
+# successfully asked. On the live Pi NOT ONE of 261 Twitch rows carried a
+# `stream_id`, which is what a refresh that has never worked looks like.
+twitch_last_error: str | None = None
+
+
 def twitch_list_vods(config: dict, limit: int = 100) -> list[dict]:
-    """Fetch recent VODs via Twitch Helix API."""
+    """Fetch recent VODs via Twitch Helix API. Sets `twitch_last_error`."""
+    global twitch_last_error
+    twitch_last_error = None
+    if not (config.get("twitch_client_id") and config.get("twitch_client_secret")):
+        twitch_last_error = "twitch_client_id / twitch_client_secret are not set"
+        return []
     token = twitch_get_token(config)
     if not token:
+        twitch_last_error = ("Twitch refused the client credentials — the id or "
+                             "secret is wrong, or has been rotated")
         return []
     user_id = config.get("twitch_user_id")
     if not user_id:
+        twitch_last_error = "twitch_user_id is not set, so there is no channel to ask about"
         return []
     headers = {
         "Client-ID": config["twitch_client_id"],
@@ -399,7 +419,11 @@ def twitch_list_vods(config: dict, limit: int = 100) -> list[dict]:
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read())
-        except Exception:
+        except Exception as e:
+            # Named, and only when nothing at all came back: a failure on page
+            # three of four is a short answer, not a broken one.
+            if not vods:
+                twitch_last_error = f"Helix did not answer: {e}"
             break
         videos = data.get("data", [])
         if not videos:
@@ -515,11 +539,23 @@ def is_broadcast_row(v: dict) -> bool:
         return False
     if v.get("id_is") == "stream":
         return True
-    # Rows written before `id_is`. A VOD from Helix always arrives carrying a
-    # duration and a url; the recorder's row has neither, and has the record
-    # clock that only it can know.
-    return (bool(v.get("record_start_epoch_ms"))
-            and not (v.get("url") or v.get("duration")))
+    # Rows written before `id_is` existed, which is every row already in a
+    # cache the day this shipped.
+    #
+    # `record_start_epoch_ms` is the whole test, and it is exact: only the
+    # recorder can know when IT started writing, and `refresh_twitch_cache`
+    # has never written that key. `url` is the belt to its braces — Helix
+    # always sends one — and it matters only if a Helix refresh ever lands on
+    # the same id, which it cannot today because a VOD and its broadcast are
+    # numbered differently.
+    #
+    # DURATION IS NOT PART OF THIS, and an earlier version of this function
+    # said it was. The recorder fills `duration` in on its own row when the
+    # stream ends, so every one of the thirty broadcast rows in the live cache
+    # carried one and every one of them answered "not a broadcast" — the fix
+    # shipped and changed nothing. Measured against the real file, not
+    # reasoned about.
+    return bool(v.get("record_start_epoch_ms")) and not v.get("url")
 
 
 def find_confirmed_vod(cache: list[dict], video_id: str,

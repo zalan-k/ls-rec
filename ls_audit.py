@@ -1748,9 +1748,19 @@ ASSIGN_WINDOW_S = 3600
 
 
 def _finding(level: str, check: str, message: str, *,
-             platform: str | None = None, **detail) -> dict:
+             platform: str | None = None, short: str | None = None,
+             **detail) -> dict:
+    """One thing that was checked.
+
+    `message` is the sentence, `short` the two or three words that go on the
+    per-platform summary line. Both, rather than one derived from the other:
+    the summary has to stay short enough to sit four-across, and a problem has
+    to stay long enough to say what to do about it — "could not ask Twitch:
+    twitch_user_id is not set" is the whole value of that finding and there is
+    no shortening of it that keeps that.
+    """
     return {"level": level, "check": check, "platform": platform,
-            "message": message, "detail": detail}
+            "message": message, "short": short or message, "detail": detail}
 
 
 def _disk_findings(config: dict, nas: dict, entry: dict) -> list[dict]:
@@ -1765,13 +1775,16 @@ def _disk_findings(config: dict, nas: dict, entry: dict) -> list[dict]:
         # reported it as missing. It is a note, not a warning.
         if nas.get(f"{prefix}_video"):
             out.append(_finding("ok", "disk", f"{label} video on disk",
-                                platform=prefix, file=nas[f"{prefix}_video"]))
+                                platform=prefix, short="video on disk",
+                                file=nas[f"{prefix}_video"]))
         elif entry.get(f"{prefix}_video_x"):
             out.append(_finding("note", "disk", f"{label} video deliberately not kept",
-                                platform=prefix, state="declined"))
+                                platform=prefix, short="video not kept",
+                                state="declined"))
         else:
             out.append(_finding("warn", "disk", f"{label} video missing",
-                                platform=prefix, state="lost"))
+                                platform=prefix, short="video MISSING",
+                                state="lost"))
 
         # CHAT. Deep storage counts as present: the merge folded it in and
         # moved it on purpose, and calling that missing is the single most
@@ -1779,16 +1792,19 @@ def _disk_findings(config: dict, nas: dict, entry: dict) -> list[dict]:
         # entirely right.
         if nas.get(f"{prefix}_chat"):
             out.append(_finding("ok", "disk", f"{label} chat on disk",
-                                platform=prefix, file=nas[f"{prefix}_chat"]))
+                                platform=prefix, short="chat on disk",
+                                file=nas[f"{prefix}_chat"]))
         elif _chat_accounted(nas, prefix):
             out.append(_finding("ok", "disk", f"{label} chat folded into the merged file",
-                                platform=prefix, state="kept"))
+                                platform=prefix, short="chat merged", state="kept"))
         elif entry.get(f"{prefix}_chat_x"):
             out.append(_finding("note", "disk", f"{label} chat deliberately not kept",
-                                platform=prefix, state="declined"))
+                                platform=prefix, short="chat not kept",
+                                state="declined"))
         else:
             out.append(_finding("warn", "disk", f"{label} chat missing",
-                                platform=prefix, state="lost"))
+                                platform=prefix, short="chat MISSING",
+                                state="lost"))
     return out
 
 
@@ -1810,7 +1826,7 @@ def _platform_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
         vid = (ids.get(platform) or (None, None))[0]
         if not vid:
             out.append(_finding("warn", "platform", f"no {label} id could be resolved",
-                                platform=prefix))
+                                platform=prefix, short="no id"))
             continue
         row = ls_common.find_vod(cache, vid, platform)
         if row is None:
@@ -1818,17 +1834,29 @@ def _platform_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
             # entry falls out of it. Worth a word, not an alarm.
             out.append(_finding("note", "platform",
                                 f"{label} {vid} is not in the cache — too old to list, "
-                                f"or never confirmed", platform=prefix, id=vid))
+                                f"or never confirmed", platform=prefix, id=vid,
+                                short=f"{vid} unconfirmed"))
         elif ls_common.is_broadcast_row(row):
             # The whole #736 failure in one line: this id is the BROADCAST,
             # and a watch link built from it is a 404.
+            #
+            # And WHY, which is the part that was missing. `resolve_id` asks
+            # Helix for the VOD; every way that ask can fail used to return an
+            # empty list in silence, so "Twitch has not published it yet" and
+            # "this archive has never once been able to reach Twitch" produced
+            # the same line. The second is the likelier one — nothing in the
+            # live cache carries a `stream_id` — and it is the one with an
+            # answer a person can act on.
+            why = ls_common.twitch_last_error
             out.append(_finding("bad", "platform",
                                 f"{label} {vid} is a broadcast id, not a video — "
-                                f"its VOD has not been published or not been found",
-                                platform=prefix, id=vid))
+                                + (f"could not ask Twitch: {why}" if why
+                                   else "no VOD published for it yet"),
+                                platform=prefix, id=vid, reason=why,
+                                short=f"{vid} is a BROADCAST id"))
         else:
             out.append(_finding("ok", "platform", f"{label} {vid} is a known video",
-                                platform=prefix, id=vid,
+                                platform=prefix, id=vid, short=f"{vid} exists",
                                 title=row.get("title")))
     return out
 
@@ -1874,18 +1902,21 @@ def _assignment_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict
         if not got_ms:
             out.append(_finding("note", "assignment",
                                 f"nothing says when {label} {vid} started, so its "
-                                f"assignment cannot be checked", platform=prefix, id=vid))
+                                f"assignment cannot be checked", platform=prefix, id=vid,
+                                short="offset unknown"))
             continue
         off = abs(got_ms - want_ms) // 1000
         if off <= ASSIGN_WINDOW_S:
             out.append(_finding("ok", "assignment",
                                 f"{label} starts within {off // 60}m of the entry",
-                                platform=prefix, id=vid, off_s=off))
+                                platform=prefix, id=vid, off_s=off,
+                                short=f"offset={off // 60}m"))
         else:
             out.append(_finding("bad", "assignment",
                                 f"{label} {vid} starts {off // 3600}h{(off % 3600) // 60:02d}m "
                                 f"from this entry — it may belong to another stream",
-                                platform=prefix, id=vid, off_s=off))
+                                platform=prefix, id=vid, off_s=off,
+                                short=f"offset={off // 3600}h{(off % 3600) // 60:02d}m"))
     return out
 
 
@@ -1900,37 +1931,43 @@ def _clock(ms) -> str:
 
 
 def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
-    """The measurements, two lines per platform.
+    """The measurements, aligned into columns, two lines per platform.
 
-    These are the numbers an audit exists to confirm and the first version of
+    These are the numbers an audit exists to confirm, and the first version of
     the quiet output dropped all of them — which traded one problem for the
     opposite one. A run that says "8 checks passed" and nothing else is not a
-    report, it is a receipt: there is no way to see that a duration is
-    plausible, that the two platforms started together, or that a chat covers
-    the whole broadcast.
+    report, it is a receipt: nothing in it shows that a duration is plausible,
+    that the two platforms started together, or that a chat covers the
+    broadcast.
 
-    So: the start the platform reported, the moment the recorder began, the
-    duration, and the chat's count and span. `-v` adds where each clock came
-    from and how well it is known, which is the part that is genuinely only
-    interesting when a number looks wrong.
+    `-v` adds where each clock came from and how well it is known, which is
+    genuinely only interesting once a number looks wrong.
     """
     nas_root = config.get("nas_path", "")
     nas, timings = got["nas"], got.get("timings") or {}
+
+    # The broadcast's own zero, which is what every offset below is measured
+    # from. Earliest measured platform start, matching how `_archive_inputs`
+    # decides the stream's `started_at` — so the audit and the archive are
+    # reading the same instant.
+    zeros = [t["stream_start_epoch_ms"] for t in timings.values()
+             if t.get("stream_start_epoch_ms")]
+    zero_ms = min(zeros) if zeros else None
+
     for prefix, label in (("yt", "YT"), ("tw", "TW")):
         vid = (got["ids"].get("youtube" if prefix == "yt" else "twitch")
                or (None, None))[0]
         t = timings.get(prefix)
         if not vid and not t:
             continue
-        # `—` rather than `_seconds_to_hhmmss`'s "UNKNOWN": the other two
-        # columns on this line already spell an absent number that way, and
-        # one row reading `start — rec — UNKNOWN` says the same thing three
-        # different ways.
+        # `—` rather than `_seconds_to_hhmmss`'s "UNKNOWN": the other columns
+        # on this line already spell an absent number that way, and one row
+        # reading `start — | rec — | UNKNOWN` says the same thing three ways.
         dur = (_seconds_to_hhmmss(t.get("duration_secs"))
                if t and t.get("duration_secs") else "—")
-        print(f"  {label}  {(vid or '—'):<14} "
-              f"start {_clock((t or {}).get('stream_start_epoch_ms'))}   "
-              f"rec {_clock((t or {}).get('record_start_epoch_ms'))}   {dur}")
+        print(f"  {label}  {(vid or '—'):<14} |  "
+              f"start {_clock((t or {}).get('stream_start_epoch_ms')):<8} |  "
+              f"rec {_clock((t or {}).get('record_start_epoch_ms')):<8} |  {dur}")
         if verbose and t:
             # Provenance, which matters exactly when a clock looks wrong: a
             # number off a filename is a minute-accurate guess, one off a chat
@@ -1940,66 +1977,102 @@ def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
                 if src:
                     print(f"      {which.replace('_', ' '):<13}"
                           f"{src}  ±{t.get(f'{which}_accuracy') or '?'}")
-        # The raw chat, while it is still a raw chat.
         raw = nas.get(f"{prefix}_chat")
         if raw:
             info = analyze_chat_file(os.path.join(nas_root, raw))
             count = info["count"]
             span = (f"   ({info['first_ts']} → {info['last_ts']})"
                     if info["first_ts"] != "UNKNOWN" else "")
-            print(f"      chat  "
+            print("      chat  "
                   + (f"{count:,} msgs" if isinstance(count, int) else "unreadable")
                   + span)
             if verbose:
                 print(f"            {raw}")
         elif _chat_accounted(nas, prefix):
-            print("      chat  folded into the merged file")
+            print("      chat log merged")
         else:
             print("      chat  —")
 
-    # And the merged file, which is the one the site actually plays. Its
-    # absence used to be reported as "no chats present — nothing to merge",
-    # which is the same sentence for "there is nothing here" and "everything
-    # here is already done".
+    # The merged file, which is the one the site actually plays, on its own
+    # block: it is a property of the broadcast rather than of either platform,
+    # and hanging it off the last platform's lines read as if it belonged to
+    # that one.
     merged = got.get("merged")
-    if merged:
-        meta = _merged_chat_meta(os.path.join(nas_root, merged)) or {}
-        n_arch = (len(nas.get("yt_chats_archived", []))
-                  + len(nas.get("tw_chats_archived", [])))
-        bits = []
-        if meta.get("chat_messages"):
-            bits.append(f"{meta['chat_messages']:,} msgs")
-        # WALL times, not offsets. The merged file's span is absolute — it has
-        # to be, since it holds two platforms whose zeros differ — so showing
-        # it as an offset would mean picking one of them to be right.
-        if meta.get("chat_first_ms") and meta.get("chat_last_ms"):
-            bits.append(f"({_clock(meta['chat_first_ms'])}"
-                        f" → {_clock(meta['chat_last_ms'])})")
-        if meta.get("chat_sources"):
-            bits.append(str(meta["chat_sources"]))
-        if n_arch:
-            bits.append(f"{n_arch} raw{'s' if n_arch != 1 else ''} in deep storage")
-        print(f"  merged  {merged}" + (f"   {'   '.join(bits)}" if bits else ""))
-    else:
-        print("  merged  none yet")
+    print()
+    if not merged:
+        print("CHAT  not merged yet")
+        print()
+        return
+    meta = _merged_chat_meta(os.path.join(nas_root, merged)) or {}
+    n_arch = (len(nas.get("yt_chats_archived", []))
+              + len(nas.get("tw_chats_archived", [])))
+    print(f"CHAT merged  {merged}"
+          + (f"   {meta['chat_sources']}" if meta.get("chat_sources") else ""))
+    line2 = []
+    if meta.get("chat_messages"):
+        line2.append(f"{meta['chat_messages']:,} msgs")
+    # OFFSETS from the broadcast start, not wall clock. The stored numbers are
+    # absolute — they have to be, holding two platforms whose zeros differ —
+    # and rendering them as wall times made a correct 11h36m span read as
+    # nonsense on a two-hour stream. It is not nonsense: YouTube's chat opens
+    # with the waiting room hours before she goes live, so the span really does
+    # begin nine hours early. Said as an offset it reads as what it is, and it
+    # matches the raw chat lines above rather than inventing a second
+    # convention. Wall clock is under -v for anyone who wants the clock.
+    if meta.get("chat_first_ms") and meta.get("chat_last_ms"):
+        if zero_ms:
+            line2.append(
+                f"({_seconds_to_hhmmss((meta['chat_first_ms'] - zero_ms) // 1000)}"
+                f" → {_seconds_to_hhmmss((meta['chat_last_ms'] - zero_ms) // 1000)})")
+        else:
+            line2.append(f"({_clock(meta['chat_first_ms'])}"
+                         f" → {_clock(meta['chat_last_ms'])})")
+    if line2:
+        print(f"             {'   '.join(line2)}")
+    if verbose and meta.get("chat_first_ms"):
+        print(f"             wall {_clock(meta['chat_first_ms'])}"
+              f" → {_clock(meta['chat_last_ms'])}")
+    if n_arch:
+        print(f"             {n_arch} raw{'s' if n_arch != 1 else ''} in deep storage")
     print()
 
 
 def render_findings(findings: list[dict], *, verbose: bool = False) -> None:
-    """Every check, one line each.
+    """One line per platform, then the full sentence for anything not ok.
 
-    They were collapsed to "8 checks passed" for a version, on the grounds
-    that a list of ticks hides the one cross in it. That was the wrong trade:
-    eight short lines are readable at a glance, and a summary count tells you
-    that something was checked without telling you WHAT — so a check that
-    silently stopped running would look identical to one that passed. The
-    count is a worse claim than the list it replaces.
+    Two passes rather than one, and both are needed. The summary line is what
+    makes a clean entry readable at a glance — four short verdicts across,
+    aligned with its neighbour so the two platforms can be compared by eye.
+    But a problem's whole value is in its sentence: "could not ask Twitch:
+    twitch_user_id is not set" tells you what to do and `318648037478 is a
+    BROADCAST id` does not.
+
+    So: everything on the summary, and then the ones that need saying said
+    properly underneath. A collapsed count was tried and dropped — it told you
+    that something had been checked without telling you what, so a check that
+    silently stopped running looked exactly like one that passed.
     """
-    for f in findings:
-        tag = f"[{f['platform'].upper()}] " if f.get("platform") else ""
-        print(f"  {_MARK.get(f['level'], ' ')} {tag}{f['message']}")
     if not findings:
         print("  · nothing to check")
+        print()
+        return
+    for prefix in ("yt", "tw"):
+        mine = [f for f in findings if f.get("platform") == prefix]
+        if not mine:
+            continue
+        print(f"[{prefix.upper()}] " + " | ".join(
+            f"{_MARK.get(f['level'], ' ')} {f['short']}" for f in mine))
+    loose = [f for f in findings if not f.get("platform")]
+    for f in loose:
+        print(f"     {_MARK.get(f['level'], ' ')} {f['message']}")
+    # And the detail, for whatever is not fine.
+    bad = [f for f in findings if f["level"] in ("warn", "bad")
+           and f.get("platform")]
+    if bad:
+        print()
+        for f in bad:
+            print(f"  {_MARK.get(f['level'], ' ')} [{f['platform'].upper()}] "
+                  f"{f['message']}")
     print()
 
 
@@ -2094,12 +2167,17 @@ def audit(config: dict, index: int,
     5. Write to Obsidian
     6. Offer downloads for missing files
     """
-    print(f"\n{'=' * 60}")
-    print(f"  Auditing entry #{index}")
-    print(f"{'=' * 60}\n")
-
+    # The banner is printed AFTER the inspection rather than before, so the
+    # date can go in it. One heading instead of a heading and a line under it.
     # 1-4. Everything the audit knows, in one call and with nothing printed.
     got = inspect(config, index, yt_override=yt_override, tw_override=tw_override)
+    when = ((got.get("entry") or {}).get("date_str") or "").strip()
+    tz = ((got.get("entry") or {}).get("tz_str") or "").strip()
+    head = f"  Auditing entry #{index}" + (f" - {when} {tz}".rstrip() if when else "")
+    print(f"\n{'=' * 60}")
+    print(head)
+    print(f"{'=' * 60}\n")
+
     if not got["ok"]:
         print(f"  ✗ {got['reason']}")
         if got.get("entry") and got["entry"].get("date_str"):
@@ -2110,11 +2188,9 @@ def audit(config: dict, index: int,
     tw_id = (got["ids"].get("twitch") or (None, None))[0]
     block = got["block"]
 
-    # The ids moved down into the media block, where they sit beside the
-    # numbers they belong to instead of being repeated in a header.
-    print(f"  {entry['date_str']} {entry.get('tz_str') or ''}"
-          f"   {entry['checkbox']}")
-    print()
+    # The date is in the banner and the ids are in the media block, beside the
+    # numbers they belong to. Only the checkbox is left, and it goes with the
+    # thing it is about rather than on a line of its own.
     render_media(config, got, verbose=verbose)
     render_findings(got["findings"], verbose=verbose)
 
