@@ -1539,7 +1539,14 @@ def _pipeline(config: dict, cache: list[dict], index: int,
     """
     nas_root = config.get("nas_path", "")
     nas = scan_nas(config, index)
-    merged = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
+    # THROUGH `find_merged_chat`, which knows both spellings. This line used to
+    # build the plain `.json` name by hand, and everything merged since the
+    # merge started compressing is `.json.gz` — so the "already merged" check
+    # below missed every recent entry. On #736 it fell through to "no chats
+    # present" about an entry that HAS a merged chat, and with
+    # `chat_archive_path` unset — raws left in place rather than moved — it
+    # would have re-merged an already-merged entry on every single run.
+    merged_name = find_merged_chat(nas_root, index)
     changed = False
 
     # 1. Meta sidecar, ensured first and independently of the merge: it reads
@@ -1553,7 +1560,7 @@ def _pipeline(config: dict, cache: list[dict], index: int,
         # every sweep report work it did not do.
         changed = bool(glob.glob(meta_glob))
 
-    if os.path.exists(merged):
+    if merged_name:
         return changed                     # chat side already finished
 
     chats = [k for k in ("yt_chats", "tw_chats") if nas.get(k)]
@@ -1885,23 +1892,112 @@ def _assignment_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict
 _MARK = {"ok": "✓", "note": "·", "warn": "!", "bad": "✗"}
 
 
-def render_findings(findings: list[dict], *, verbose: bool = False) -> None:
-    """The findings, as few lines as honesty allows.
+def _clock(ms) -> str:
+    """Wall time, to the second, in whatever zone this machine is in."""
+    if not ms:
+        return "—"
+    return datetime.datetime.fromtimestamp(int(ms) / 1000).strftime("%H:%M:%S")
 
-    Quiet means quiet: everything that is FINE collapses to one line saying
-    how many things were checked, because a list of twelve ticks is a list
-    nobody reads and therefore a list that hides the one cross in it. Notes
-    and above print in full. `-v` prints everything, which is what the old
-    output did for every run.
+
+def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
+    """The measurements, two lines per platform.
+
+    These are the numbers an audit exists to confirm and the first version of
+    the quiet output dropped all of them — which traded one problem for the
+    opposite one. A run that says "8 checks passed" and nothing else is not a
+    report, it is a receipt: there is no way to see that a duration is
+    plausible, that the two platforms started together, or that a chat covers
+    the whole broadcast.
+
+    So: the start the platform reported, the moment the recorder began, the
+    duration, and the chat's count and span. `-v` adds where each clock came
+    from and how well it is known, which is the part that is genuinely only
+    interesting when a number looks wrong.
     """
-    loud = [f for f in findings if f["level"] != "ok"]
-    fine = [f for f in findings if f["level"] == "ok"]
-    for f in (findings if verbose else loud):
+    nas_root = config.get("nas_path", "")
+    nas, timings = got["nas"], got.get("timings") or {}
+    for prefix, label in (("yt", "YT"), ("tw", "TW")):
+        vid = (got["ids"].get("youtube" if prefix == "yt" else "twitch")
+               or (None, None))[0]
+        t = timings.get(prefix)
+        if not vid and not t:
+            continue
+        # `—` rather than `_seconds_to_hhmmss`'s "UNKNOWN": the other two
+        # columns on this line already spell an absent number that way, and
+        # one row reading `start — rec — UNKNOWN` says the same thing three
+        # different ways.
+        dur = (_seconds_to_hhmmss(t.get("duration_secs"))
+               if t and t.get("duration_secs") else "—")
+        print(f"  {label}  {(vid or '—'):<14} "
+              f"start {_clock((t or {}).get('stream_start_epoch_ms'))}   "
+              f"rec {_clock((t or {}).get('record_start_epoch_ms'))}   {dur}")
+        if verbose and t:
+            # Provenance, which matters exactly when a clock looks wrong: a
+            # number off a filename is a minute-accurate guess, one off a chat
+            # file is the real thing.
+            for which in ("stream_start", "record_start"):
+                src = t.get(f"{which}_source")
+                if src:
+                    print(f"      {which.replace('_', ' '):<13}"
+                          f"{src}  ±{t.get(f'{which}_accuracy') or '?'}")
+        # The raw chat, while it is still a raw chat.
+        raw = nas.get(f"{prefix}_chat")
+        if raw:
+            info = analyze_chat_file(os.path.join(nas_root, raw))
+            count = info["count"]
+            span = (f"   ({info['first_ts']} → {info['last_ts']})"
+                    if info["first_ts"] != "UNKNOWN" else "")
+            print(f"      chat  "
+                  + (f"{count:,} msgs" if isinstance(count, int) else "unreadable")
+                  + span)
+            if verbose:
+                print(f"            {raw}")
+        elif _chat_accounted(nas, prefix):
+            print("      chat  folded into the merged file")
+        else:
+            print("      chat  —")
+
+    # And the merged file, which is the one the site actually plays. Its
+    # absence used to be reported as "no chats present — nothing to merge",
+    # which is the same sentence for "there is nothing here" and "everything
+    # here is already done".
+    merged = got.get("merged")
+    if merged:
+        meta = _merged_chat_meta(os.path.join(nas_root, merged)) or {}
+        n_arch = (len(nas.get("yt_chats_archived", []))
+                  + len(nas.get("tw_chats_archived", [])))
+        bits = []
+        if meta.get("chat_messages"):
+            bits.append(f"{meta['chat_messages']:,} msgs")
+        # WALL times, not offsets. The merged file's span is absolute — it has
+        # to be, since it holds two platforms whose zeros differ — so showing
+        # it as an offset would mean picking one of them to be right.
+        if meta.get("chat_first_ms") and meta.get("chat_last_ms"):
+            bits.append(f"({_clock(meta['chat_first_ms'])}"
+                        f" → {_clock(meta['chat_last_ms'])})")
+        if meta.get("chat_sources"):
+            bits.append(str(meta["chat_sources"]))
+        if n_arch:
+            bits.append(f"{n_arch} raw{'s' if n_arch != 1 else ''} in deep storage")
+        print(f"  merged  {merged}" + (f"   {'   '.join(bits)}" if bits else ""))
+    else:
+        print("  merged  none yet")
+    print()
+
+
+def render_findings(findings: list[dict], *, verbose: bool = False) -> None:
+    """Every check, one line each.
+
+    They were collapsed to "8 checks passed" for a version, on the grounds
+    that a list of ticks hides the one cross in it. That was the wrong trade:
+    eight short lines are readable at a glance, and a summary count tells you
+    that something was checked without telling you WHAT — so a check that
+    silently stopped running would look identical to one that passed. The
+    count is a worse claim than the list it replaces.
+    """
+    for f in findings:
         tag = f"[{f['platform'].upper()}] " if f.get("platform") else ""
         print(f"  {_MARK.get(f['level'], ' ')} {tag}{f['message']}")
-    if fine and not verbose:
-        checks = sorted({f["check"] for f in fine})
-        print(f"  ✓ {len(fine)} checks passed ({', '.join(checks)})")
     if not findings:
         print("  · nothing to check")
     print()
@@ -1954,6 +2050,18 @@ def inspect(config: dict, index: int, *,
                        + _platform_findings(cache, ids, entry)
                        + _assignment_findings(cache, ids, entry))
 
+    # The measurements, kept so the renderer does not have to re-derive them.
+    # `_platform_timings` reads chat files and shells out to ffprobe; asking it
+    # twice for one entry would double the slowest part of an audit.
+    out["timings"] = {}
+    for prefix, platform in (("yt", "youtube"), ("tw", "twitch")):
+        if entry.get(f"no_{prefix}"):
+            continue
+        t = _platform_timings(config, cache, nas, prefix, platform)
+        if t:
+            out["timings"][prefix] = t
+    out["merged"] = find_merged_chat(config.get("nas_path", ""), index)
+
     yt_id = (ids.get("youtube") or (None, None))[0]
     tw_id = (ids.get("twitch") or (None, None))[0]
     out["block"] = build_entry(config, cache, index, entry, nas, yt_id, tw_id)
@@ -2002,14 +2110,13 @@ def audit(config: dict, index: int,
     tw_id = (got["ids"].get("twitch") or (None, None))[0]
     block = got["block"]
 
+    # The ids moved down into the media block, where they sit beside the
+    # numbers they belong to instead of being repeated in a header.
     print(f"  {entry['date_str']} {entry.get('tz_str') or ''}"
-          f"   {entry['checkbox']}"
-          + (f"   [YT] {yt_id}" if yt_id else "")
-          + (f"   [TW] {tw_id}" if tw_id else ""))
+          f"   {entry['checkbox']}")
     print()
+    render_media(config, got, verbose=verbose)
     render_findings(got["findings"], verbose=verbose)
-    if verbose:
-        _print_media_analysis(config, nas)
 
     # 5. Write
     # Headless runs write without asking. The reconstruction is deterministic
