@@ -653,6 +653,16 @@ def confirm_plan(plan: dict, *, interactive: bool = True) -> dict:
     print("\n  Collisions — the archive already holds a different value:\n")
     for it in clashes:
         print(_line(it))
+        # IN FULL, above the prompt. `_line` elides at 46 characters, which is
+        # right for scanning a plan and wrong for the one moment somebody is
+        # being asked to approve a specific value: two long titles differing
+        # past the cut, or a url whose id is the whole of what changed, both
+        # render as identical ellipses. Printed only when something was
+        # actually hidden, so the common short case stays one line.
+        for lbl, val in (("was", it.get("before")), ("now", it.get("after"))):
+            s = "—" if val in (None, "") else str(val)
+            if len(s) > 46:
+                print(f"        {lbl}: {s}")
         ans = input("      overwrite? (y/N): ").strip().lower()
         it["accepted"] = ans == "y"
     return plan

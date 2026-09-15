@@ -37,7 +37,7 @@ a player shows) and the second is the offset into the captured file. The `!`
 is a queue marker for a later pass that cuts the clip and clears it.
 """
 
-import os, re, glob, json, time, shlex, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common, ls_archive
+import os, re, glob, time, shlex, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common, ls_archive
 from collections import deque
 from pathlib import Path
 from yt_dlp.utils import sanitize_filename
@@ -494,12 +494,6 @@ class LivestreamRecorder:
     # ── command dispatch ──────────────────────────────────────────────────
 
     def handle_command(self, command: str) -> str:
-        # clipjob carries JSON, so it is read before shlex gets near it: shlex
-        # would tear `{"at": 1, "name": "two words"}` into tokens and leave
-        # nothing that parses. Every other command is words, and words are
-        # what shlex is for.
-        if command.startswith("clipjob "):
-            return self._cmd_clipjob(command[len("clipjob "):])
         # shlex, not split(): a quoted datetime ("2026.08.20 21:42") and a
         # multi-word --name have to survive the trip over the socket intact.
         try:
@@ -981,6 +975,20 @@ class LivestreamRecorder:
             # rather than a misleading zero.
             "record_start_epoch_ms": int(record_start.timestamp() * 1000),
             "stream_start_epoch_ms": stream_start * 1000 if stream_start else None,
+            # ── what this id IS ──────────────────────────────────────────
+            # On Twitch yt-dlp gives us the BROADCAST id, because that is the
+            # only id in existence while she is live; the VOD is minted at the
+            # end and numbered separately. So this row is keyed by an id that
+            # will never be a video, and ls-audit has to be able to tell.
+            # Without the mark `find_vod` matched it like any other row, the
+            # "do I need to ask Helix" guard said "no, I know that id", and the
+            # correction that turns a broadcast into its VOD never ran — the
+            # entry kept a /videos/<stream id> url that 404s.
+            #
+            # YouTube gets no mark: there the live id and the VOD id are one
+            # number, so the recorder's row IS the video's row. upsert_vod
+            # drops None, so that costs no key.
+            "id_is": "stream" if platform == "twitch" else None,
         })
         ls_common.save_cache(cache)
 
@@ -1271,17 +1279,8 @@ class LivestreamRecorder:
             return
 
         if rc == 0:
-            # Measured BEFORE any probe. Three probe timeouts plus their
-            # backoffs run ~130s, which scored a 2-second "already downloaded"
-            # exit as a healthy part and made the guard below unreachable.
-            elapsed = time.time() - stream.get("_part_started_ts", 0)
-
-            # A rotate needs a POSITIVE answer. Assuming "still live" from an
-            # inconclusive probe is how a finished broadcast gets a live-edge
-            # part that re-downloads the entire VOD; an early completion is
-            # recoverable by re-running the audit, a duplicated concat is not.
-            if (not self.manual_termination_in_progress
-                    and self._source_still_live(stream, default=False)):
+            if not self.manual_termination_in_progress and self._source_still_live(stream):
+                elapsed = time.time() - stream.get("_part_started_ts", 0)
                 if elapsed < 30:
                     # Pathological: rc=0 within seconds while still live = the
                     # 642 "already downloaded" loop. Charge the budget and back
@@ -1869,80 +1868,6 @@ class LivestreamRecorder:
             lines.append(f"    note     {n}")
         lines += ["", "  (cutting in background — see the daemon log)", ""]
         return "\n".join(lines)
-
-    # ── the machine door ──────────────────────────────────────────────────
-    #
-    #  The archive's Clip/Rip Studio comes in here. It is a second front door
-    #  onto _plan_clip and _cut, not a second implementation: which part file
-    #  is open, what wall time its frame 0 is, and how close the live edge has
-    #  crept are all in _part_history, which lives in this process's memory and
-    #  nowhere else. Asking is the only way, and asking means a clip from the
-    #  browser and one typed at `ls-rec clip` cannot drift apart.
-    #
-    #  Why it exists at all rather than reusing _cmd_clip: that one answers in
-    #  prose for a human to read, and starts its cut on a background thread, so
-    #  a caller that has to go and find the finished file afterwards has nothing
-    #  to go on. This returns the plan.
-
-    def _cmd_clipjob(self, raw: str) -> str:
-        """One line of JSON in, one line of JSON out. Never raises.
-
-        A caller on the other end of a socket cannot read a traceback, so every
-        failure here is `{"ok": false, "error": "..."}` with a sentence in it.
-        """
-        def bad(msg: str) -> str:
-            return json.dumps({"ok": False, "error": str(msg).rstrip(". ")})
-
-        try:
-            req = json.loads(raw)
-        except (ValueError, TypeError):
-            return bad("clipjob takes one json object")
-        if not isinstance(req, dict):
-            return bad("clipjob takes one json object")
-
-        # The archive speaks in its own two-letter platform codes.
-        plat = {"TW": "twitch", "YT": "youtube"}.get(
-            str(req.get("platform") or "").upper())
-        try:
-            at = float(req["at"])
-            length = float(req["length"])
-            lead = float(req.get("lead", self.config.get("clip_lead_s", 60)))
-        except (KeyError, TypeError, ValueError):
-            return bad("clipjob wants at, length and lead as numbers")
-        if length <= 0 or lead < 0:
-            return bad("that is not a range")
-
-        stream, err = self._pick_stream(plat)
-        if stream is None:
-            return bad(err)
-        if not stream.get("_part_history"):
-            return bad("that recording has not written anything yet")
-
-        label = req.get("name")
-        plan, err = self._plan_clip(stream, at, length, lead,
-                                    str(label) if label else None, time.time())
-        if plan is None:
-            return bad(err)
-
-        threading.Thread(target=self._cut,
-                         args=(plan["sources"], plan["offset"],
-                               plan["length"], plan["out"]),
-                         daemon=True).start()
-        return json.dumps({
-            "ok":       True,
-            "out":      plan["out"],
-            "start":    int(plan["start"]),
-            "offset":   round(plan["offset"], 3),
-            # What it will BE, beside what was asked for. _plan_clip trims at
-            # the live edge and at a part boundary, and a caller that reported
-            # the requested length would be describing a file that does not
-            # exist. The archive turns the difference into a sentence.
-            "length":   round(plan["length"], 3),
-            "asked":    round(length, 3),
-            "part":     plan["part"],
-            "platform": stream["platform"],
-            "notes":    plan["notes"],
-        })
 
     def _plan_clip(self, stream: dict, epoch: float, length: float,
                    lead: float, label: str | None,

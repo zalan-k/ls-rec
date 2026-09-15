@@ -195,7 +195,14 @@ def _print_media_analysis(config: dict, nas: dict):
     for key, label in rows:
         filename = nas.get(key)
         if not filename:
-            print(f"    {label} : —")
+            # `—` on a chat row after a merge reads as data loss, which is the
+            # opposite of what happened: the raw was folded into the merged
+            # file and moved to deep storage deliberately. Say which nothing
+            # this is.
+            if key.endswith("_chat") and _chat_accounted(nas, key[:2]):
+                print(f"    {label} : in the merged file")
+            else:
+                print(f"    {label} : —")
             continue
         filepath = os.path.join(nas_root, filename)
         if not os.path.exists(filepath):
@@ -360,7 +367,14 @@ def resolve_id(config: dict, cache: list[dict], platform: str,
     # Neither a VOD we know nor a broadcast we know. That is what a cache too
     # old to have seen this stream looks like, so ask Helix once and re-try.
     # An id that survives this really is a VOD id we simply have not cached.
-    if not ls_common.find_vod(cache, vid, "twitch") and not _TW_REFRESHED:
+    #
+    # `find_confirmed_vod` and not `find_vod`, which is the whole of why this
+    # refresh never ran for a stream recorded the same day: the recorder writes
+    # its own cache row keyed by the BROADCAST id, so the plain lookup found
+    # that row, concluded the id was a VOD it already knew, and skipped the one
+    # call that could have learned otherwise. The row that makes the id wrong
+    # cannot be the row that vouches for it.
+    if not ls_common.find_confirmed_vod(cache, vid, "twitch") and not _TW_REFRESHED:
         _TW_REFRESHED = True
         print("  ⌛ Refreshing twitch cache (unknown id)...")
         if ls_common.refresh_twitch_cache(config, cache, full=True):
@@ -369,6 +383,28 @@ def resolve_id(config: dict, cache: list[dict], platform: str,
             if corrected:
                 return fixed, f"{src} → vod (was a stream id)"
     return vid, src
+
+
+def unpublished_vod(cache: list[dict], platform: str, video_id: str | None) -> bool:
+    """Is this id one we KNOW is a broadcast whose VOD we could not find?
+
+    Positive evidence, not absence of it: the id has a broadcast row in the
+    cache and `resolve_id` already tried and failed to correct it. An id we
+    simply have never heard of is not this — a hand-written /videos/ link from
+    2024 is older than anything Helix will still list, and refusing to trust it
+    would break every old entry to fix a new one.
+
+    What it is for: Twitch mints the VOD minutes AFTER the broadcast ends, so
+    auditing a stream the evening it happened lands here every time. Building
+    `twitch.tv/videos/<broadcast id>` from that is a link that 404s — and it
+    went on to overwrite a working channel URL in the archive, with a
+    truncated confirmation prompt as the only thing in its way. There is a
+    right answer and it arrives on its own: run the audit again later.
+    """
+    if platform != "twitch" or not video_id:
+        return False
+    row = ls_common.find_vod(cache, video_id, "twitch")
+    return bool(row and ls_common.is_broadcast_row(row))
 
 
 def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
@@ -502,7 +538,8 @@ def _build_platform_line(config: dict, tag: str, video_id: str | None,
                          video_file: str | None,
                          chat_file: str | None,
                          video_x: bool = False,
-                         chat_x: bool = False) -> str:
+                         chat_x: bool = False,
+                         no_url: bool = False) -> str:
     if video_file:
         vid_link = f"[📁]({ls_common.build_shell_cmd(config, video_file)})"
     elif video_x or chat_file:        # explicit, or implied (chat but no video)
@@ -518,7 +555,13 @@ def _build_platform_line(config: dict, tag: str, video_id: str | None,
         chat_link = "[📄]()"
 
     display = title or "untitled"
-    url = ls_common.build_stream_url(config, platform, video_id) if video_id else ""
+    # `no_url` is the vault's half of the rule the archive push follows: a
+    # broadcast whose VOD has not been minted has no watch link yet, and an
+    # empty target is honest where `/videos/<broadcast id>` is a dead link
+    # that reads like a live one. The entry keeps everything else and the next
+    # run fills it in.
+    url = ("" if (no_url or not video_id)
+           else ls_common.build_stream_url(config, platform, video_id))
     return f"\t`{tag}` {vid_link} {chat_link} [ {display} ]({url})"
 
 
@@ -548,10 +591,12 @@ def build_entry(config: dict, cache: list[dict], index: int,
 
         vod = ls_common.find_vod(cache, vid_id, plat) if vid_id else None
         if measured:
-            # Read ffprobe, never write it back. A duplicated concat measures
-            # twice the broadcast, and persisting that made the bad number
-            # outlive the bad file -- deleting the video no longer cleared it.
             durations.append(measured)
+            if vod and abs((vod.get("duration") or 0) - measured) > 5:
+                print(f"    duration corrected from cache "
+                      f"{_seconds_to_hhmmss(vod.get('duration') or 0)} → "
+                      f"{_seconds_to_hhmmss(measured)} ({prefix})")
+                vod["duration"] = int(measured)
         elif vod and vod.get("duration"):
             durations.append(vod["duration"])
     if durations:
@@ -593,6 +638,7 @@ def build_entry(config: dict, cache: list[dict], index: int,
             nas["tw_video"], _chat_link_target(nas, "tw"),
             video_x=entry.get("tw_video_x", False),
             chat_x=entry.get("tw_chat_x", False),
+            no_url=unpublished_vod(cache, "twitch", tw_id),
         ))
 
     # User notes (preserved verbatim)
@@ -1039,9 +1085,6 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
 
 CHAT_SHORTFALL_MAX_SECS = 3600
 CHAT_SHORTFALL_FRACTION = 0.5
-# A video this much longer than the broadcast is a duplicated concat, not a
-# long stream. Comparing chat against it blames the chat for the video's fault.
-DUPLICATE_VIDEO_RATIO   = 1.8
 
 
 def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
@@ -1059,40 +1102,18 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
     if last is None or not isinstance(info["count"], int) or not info["count"]:
         return None
 
-    # Measure the file actually held. No cached fallback: with no video there
-    # is nothing to compare against, and a remembered length is how a stale
-    # number kept flagging an entry whose bad file had already been deleted.
-    def _probe(prefix):
-        f = nas.get(f"{prefix}_video")
-        if not f:
-            return None
-        vp = os.path.join(config.get("nas_path", ""), f)
-        return analyze_video_file(vp).get("duration_secs") if os.path.exists(vp) else None
-
-    duration = _probe("yt")
-    dur_src = "yt video"
+    # ffprobe first: it measures the file actually held, whereas the cache
+    # holds the published length.
+    duration = None
+    video_file = nas.get("yt_video")
+    if video_file:
+        vp = os.path.join(config.get("nas_path", ""), video_file)
+        if os.path.exists(vp):
+            duration = analyze_video_file(vp).get("duration_secs")
+    if not duration and yt_id:
+        vod = ls_common.find_vod(cache, yt_id, "youtube") or {}
+        duration = vod.get("duration")
     if not duration or duration <= 0:
-        # No YouTube video is not "no verdict" when the other half of a
-        # simulcast is sitting right there: it is the same broadcast, so its
-        # length is what the chat should have covered. Without this, a missing
-        # VOD silently disabled the repair offer for the chat too.
-        duration, dur_src = _probe("tw"), "tw video (same broadcast)"
-    if not duration or duration <= 0:
-        return None                     # nothing to compare against
-
-    # A duplicated concat measures twice the broadcast, which inverts this
-    # check: the chat looks half-missing when the video is double length.
-    # The chat's own span and the other platform agree with each other and
-    # only the video disagrees, so cross-check before blaming the chat.
-    # The other platform's video ONLY. The chat's own span cannot serve here:
-    # "video doubled" and "chat truncated" look identical against it, and
-    # using it turned every genuinely short chat into a phantom duplicate --
-    # suppressing the very repair offer this check exists to trigger.
-    ref = _probe("tw")
-    if ref and duration >= ref * DUPLICATE_VIDEO_RATIO:
-        print(f"    ⚠ YT video is {duration / ref:.1f}x the broadcast "
-              f"({_seconds_to_hhmmss(duration)} vs {_seconds_to_hhmmss(ref)}) — "
-              f"likely a duplicated concat; skipping the chat coverage check")
         return None
 
     shortfall = duration - last
@@ -1101,7 +1122,6 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
         return None
 
     return {"chat_file": chat_file, "chat_path": chat_path, "video_id": yt_id,
-            "duration_source": dur_src,
             "count": info["count"], "last_secs": last,
             "duration_secs": duration, "shortfall_secs": shortfall,
             "limit_secs": limit}
@@ -1167,8 +1187,7 @@ def _offer_chat_backfill(config: dict, item: dict,
     print("\n  ⚠ YouTube chat looks truncated:")
     print(f"      {item['count']:,} messages, ending at "
           f"{_seconds_to_hhmmss(item['last_secs'])} of "
-          f"{_seconds_to_hhmmss(item['duration_secs'])}"
-          f"  [{item.get('duration_source', 'yt video')}]")
+          f"{_seconds_to_hhmmss(item['duration_secs'])}")
     print(f"      short by {_seconds_to_hhmmss(item['shortfall_secs'])} "
           f"(flags above {_seconds_to_hhmmss(item['limit_secs'])})")
 
@@ -1360,13 +1379,8 @@ def _archive_raw_chats(config: dict, sources: list[str], res: dict) -> set[str]:
 def cmd_merge_chat(config: dict, index: int, ref="youtube",
                    zeros: list | None = None, output: str | None = None,
                    dry_run: bool = False, keep_raw: bool = False,
-                   assets: bool = True, allow_partial: bool = False):
-    """Merge this entry's chat captures into one origin-tagged file.
-
-    Returns {"merged": path, "moved": platforms} on success, or None when
-    nothing was written -- including a refusal to write a merge that is
-    missing a whole capture.
-    """
+                   assets: bool = True):
+    """Merge this entry's chat captures into one origin-tagged file."""
     nas_root = config.get("nas_path", "")
     print(f"\n{'=' * 60}")
     print(f"  Merging chat for entry #{index}")
@@ -1419,38 +1433,13 @@ def cmd_merge_chat(config: dict, index: int, ref="youtube",
           f"{datetime.datetime.fromtimestamp(md['zero_epoch_ms'] / 1000):%Y-%m-%d %H:%M:%S}")
     if md["duplicates_removed"]:
         print(f"  dupes    {md['duplicates_removed']:,}")
-    # A source that landed NOTHING is not a warning, it is a failed merge.
-    # Writing the file anyway is the dangerous part: merged-chat.json existing
-    # is what marks an entry finished, so a sweep would never look at it again
-    # and a whole platform's chat would quietly cease to exist.
-    dropped = [x for x in md["sources"] if not x.get("placed")]
-    if dropped:
-        print()
-        print("  " + "!" * 62)
-        print("  !!  MERGE INCOMPLETE — a capture contributed nothing")
-        for x in dropped:
-            print(f"  !!    {x['platform']:<8} {x['unplaced']:>6,} messages dropped"
-                  f"  (zero: {x['zero_source']})")
-            print(f"  !!    {x['file']}")
-        print("  !!")
-        print("  !!  These captures have no absolute timestamps, so nothing can")
-        print("  !!  place them on the timeline. Give one explicitly:")
-        for x in dropped:
-            print(f"  !!    ls-audit {int(index)} --merge-chat "
-                  f"--zero {x['platform']}=<epoch|ISO|+secs>")
-        print("  " + "!" * 62)
-        if not allow_partial:
-            print("\n  Nothing written; the raw captures are untouched.")
-            print("  Use --allow-partial to write a merge that is missing them.\n")
-            return None
-        print("\n  --allow-partial: writing anyway.")
-    elif md["unplaced_no_abs"]:
+    if md["unplaced_no_abs"]:
         print(f"  ⚠ {md['unplaced_no_abs']:,} messages had no absolute time and "
               f"were omitted.\n    Supply a zero with --zero PLATFORM=<epoch|ISO|+secs>")
 
     if dry_run:
         print("\n  --dry-run: nothing written.\n")
-        return None
+        return
 
     if not output:
         output = os.path.join(nas_root, f"{int(index):03d}_merged-chat.json")
@@ -1542,10 +1531,8 @@ def _pipeline(config: dict, cache: list[dict], index: int,
             print("    still short after repair — will retry")
             return changed
 
-    # A refused merge (a capture with no absolute time) returns None. Report
-    # nothing done, so the entry stays unfinished and a later sweep retries it
-    # once a zero has been supplied.
-    return bool(cmd_merge_chat(config, index))
+    cmd_merge_chat(config, index)          # merges, then archives the raws
+    return True
 
 
 def cmd_tw_ids(config: dict, apply_entries: bool = False):
@@ -1803,8 +1790,18 @@ def audit(config: dict, index: int,
     print("\n  Re-scanning NAS...")
     nas = scan_nas(config, index)
     for key in ("yt_video", "yt_chat", "tw_video", "tw_chat"):
-        status = f"✔ {nas[key]}" if nas[key] else "✗ still missing"
-        print(f"    {status}")
+        if nas[key]:
+            print(f"    ✔ {nas[key]}")
+            continue
+        # A raw chat the merge just folded in and moved to deep storage is
+        # NOT missing, and saying so about a file this very run archived on
+        # purpose is the most alarming line in the output for the one outcome
+        # that went right. `_chat_accounted` has always known the difference;
+        # this loop was the one place that did not ask it.
+        if key.endswith("_chat") and _chat_accounted(nas, key[:2]):
+            print("    ✔ raw chat in deep storage — the merged file holds it")
+        else:
+            print("    ✗ still missing")
     print()
 
     # Re-run media analysis on freshly downloaded files
@@ -1958,11 +1955,22 @@ def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
         cap = {
             "platform": platform,
             "remote_id": vid,
-            "url": ls_common.build_stream_url(config, platform, vid),
             "title": _get_title(config, cache, vid, platform, nas[f"{prefix}_video"]),
             "video_path": ls_archive.archive_path(config, nas[f"{prefix}_video"]),
             "chat_path": ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
         }
+        # The url is OMITTED rather than guessed when the id is a broadcast
+        # whose VOD has not appeared. `remote_id` still goes — it is how the
+        # packet addresses the capture and the archive already holds it — but
+        # a watch link built from a broadcast id is a 404, and sending one
+        # replaces whatever the archive had with something worse. Leaving the
+        # field out leaves the archive's own value alone; the next run, once
+        # Twitch has published, sends the real one.
+        if unpublished_vod(cache, platform, vid):
+            print(f"  ⏳ {prefix.upper()} VOD not published yet — leaving its "
+                  f"link alone (re-run later)")
+        else:
+            cap["url"] = ls_common.build_stream_url(config, platform, vid)
         # Once the merge holds this platform's messages the raw goes to deep
         # storage, and the archive is told to stop pointing at it rather than
         # left holding a path that now reads `lost`. Only when the raw is
@@ -2057,10 +2065,18 @@ def cmd_archive(config: dict, index: int, *, entry: dict | None = None,
             return False
 
         results = ls_archive.push_plan(config, plan)
-        for r in results:
-            print(f"  ✔ #{r.get('index')} "
-                  f"vod={r.get('vod_state')} chat={r.get('chat_state')}"
-                  + ("  (created)" if r.get("created") else ""))
+        # ONE line. `push_plan` sends a packet per capture and every packet
+        # comes back with the same STREAM-level answer, so printing per result
+        # said the identical sentence twice and read like a double push. The
+        # count is what actually differs between them, so that is what is
+        # added. The last result is the one read because the first may be the
+        # one that created the stream, and only after it is there an index.
+        if results:
+            last = results[-1]
+            print(f"  ✔ #{last.get('index')} "
+                  f"vod={last.get('vod_state')} chat={last.get('chat_state')}"
+                  + ("  (created)" if any(r.get("created") for r in results) else "")
+                  + (f"  · {len(results)} captures" if len(results) > 1 else ""))
         print()
         return bool(results)
     except Exception as e:
@@ -2123,9 +2139,6 @@ examples:
                         help="--merge-chat: output path")
     parser.add_argument("--dry-run", action="store_true",
                         help="--merge-chat: report without writing")
-    parser.add_argument("--allow-partial", action="store_true",
-                        help="--merge-chat: write even if a capture could not "
-                             "be placed on the timeline")
     parser.add_argument("--no-assets", action="store_true",
                         help="--merge-chat: skip fetching emote and badge "
                              "pictures")
@@ -2178,8 +2191,7 @@ examples:
         ref = int(args.ref) if args.ref.lstrip("-").isdigit() else args.ref
         cmd_merge_chat(config, args.index, ref=ref, zeros=args.zero,
                        output=args.output, dry_run=args.dry_run,
-                       assets=not args.no_assets,
-                       allow_partial=args.allow_partial)
+                       assets=not args.no_assets)
         return
 
     if args.archive:

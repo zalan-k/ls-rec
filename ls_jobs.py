@@ -164,6 +164,18 @@ KEEP_EXT = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".gif",
             ".m4a", ".mp3", ".opus", ".ogg", ".wav", ".flac",
             ".png", ".jpg", ".jpeg", ".webp"}
 
+# What a SONG may be, which is not the same question.
+#
+# `do_music_fetch` asks yt-dlp for the audio and its cover in one pass, then
+# picks the largest file it kept and DELETES the rest. While KEEP_EXT was
+# media-only that was right. Adding the image extensions to it — correct for
+# the fetch route, where a linked meme really is a .png — silently broke this:
+# the cover became a candidate, so every music fetch deleted the JPEG it had
+# just asked for, and a cover that happened to outweigh a short song was
+# picked as the song itself. Two consumers, two questions, two lists.
+MUSIC_EXT = {".mp4", ".mkv", ".webm", ".mov", ".m4v",
+             ".m4a", ".mp3", ".opus", ".ogg", ".wav", ".flac"}
+
 
 def setting(config: dict, key: str):
     v = config.get(key)
@@ -1585,9 +1597,12 @@ def do_music_fetch(config: dict, job: dict):
     except OSError as e:
         return ("failed", None, f"cannot make {mdir}: {e.strerror or e}", None)
 
+    # MUSIC_EXT, so the cover sitting beside the song is not mistaken for it.
+    # Sorted, so `.jpg` came first and a re-run of a song that HAD a cover
+    # reported the cover as the song's own path.
     existing = sorted(glob.glob(os.path.join(mdir, f"{vid}.*")))
     existing = [f for f in existing
-                if os.path.splitext(f)[1].lower() in KEEP_EXT and os.path.getsize(f) > 0]
+                if os.path.splitext(f)[1].lower() in MUSIC_EXT and os.path.getsize(f) > 0]
     if existing:
         # Already here. The job ran and its report was what went missing —
         # promote answers a repeat the same way, and for the same reason.
@@ -1631,7 +1646,7 @@ def do_music_fetch(config: dict, job: dict):
                 _tail(r.stderr) or _tail(r.stdout) or f"yt-dlp exited {r.returncode}"), None)
 
         got = sorted((f for f in glob.glob(stem + ".*")
-                      if os.path.splitext(f)[1].lower() in KEEP_EXT),
+                      if os.path.splitext(f)[1].lower() in MUSIC_EXT),
                      key=os.path.getsize, reverse=True)
         if not got:
             # --max-filesize aborts by writing nothing, which is otherwise

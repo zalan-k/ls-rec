@@ -496,6 +496,44 @@ def find_vod(cache: list[dict], video_id: str,
     return None
 
 
+def is_broadcast_row(v: dict) -> bool:
+    """Is this cache row a live BROADCAST rather than a published video?
+
+    Only Twitch can answer yes. There, the recorder catches the channel live
+    and yt-dlp hands it the stream id, so the row it writes is keyed by an id
+    that will never be a VOD — the VOD is minted when the broadcast ends and
+    carries a different number. On YouTube the live video and the VOD are one
+    id and one row, so nothing there is ever a broadcast row.
+
+    This exists because `find_vod` matches on the id alone, which made the
+    recorder's own row indistinguishable from a real VOD — and that is the row
+    that most needs correcting. It is asked at READ time rather than fixed by
+    a migration, so a cache written before the mark existed answers correctly
+    without anybody running anything.
+    """
+    if str(v.get("platform")) != "twitch":
+        return False
+    if v.get("id_is") == "stream":
+        return True
+    # Rows written before `id_is`. A VOD from Helix always arrives carrying a
+    # duration and a url; the recorder's row has neither, and has the record
+    # clock that only it can know.
+    return (bool(v.get("record_start_epoch_ms"))
+            and not (v.get("url") or v.get("duration")))
+
+
+def find_confirmed_vod(cache: list[dict], video_id: str,
+                       platform: str | None = None) -> dict | None:
+    """`find_vod`, but a broadcast row does not count as knowing the id.
+
+    The difference matters in exactly one place and it is load-bearing there:
+    "do we already know this id, or should we ask Helix" must not be answered
+    yes by the row that made the id wrong in the first place.
+    """
+    v = find_vod(cache, video_id, platform)
+    return None if (v is not None and is_broadcast_row(v)) else v
+
+
 def find_vod_by_date(cache: list[dict], platform: str,
                      target_date: datetime.datetime,
                      window_hours: float = 1,
