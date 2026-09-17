@@ -357,7 +357,17 @@ def _clip_live(config: dict, job: dict, pay: dict, q: str, rel: str):
     try:
         reply = _ask_recorder(config, "clipjob " + json.dumps(req))
     except Exception as e:
-        return ("failed", None, f"could not reach the recorder: {type(e).__name__}")
+        # The MESSAGE, falling back to the class name only when there is none.
+        # This line used to report `type(e).__name__` alone, which threw away
+        # the one sentence that mattered: the raise above says "the recorder is
+        # not running", and what reached the archive was the bare word
+        # `FileNotFoundError`. That cost an evening of looking in the wrong
+        # place — the socket was missing because this worker's systemd unit has
+        # PrivateTmp=yes and therefore its own /tmp, which no amount of reading
+        # either file would have suggested. Every other refusal in this module
+        # is a sentence; this one is now too.
+        why = str(e).strip() or type(e).__name__
+        return ("failed", None, f"could not reach the recorder: {why}")
     try:
         ans = json.loads(reply)
     except ValueError:

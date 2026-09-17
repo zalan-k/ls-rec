@@ -37,7 +37,7 @@ a player shows) and the second is the offset into the captured file. The `!`
 is a queue marker for a later pass that cuts the clip and clears it.
 """
 
-import os, re, glob, time, shlex, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common, ls_archive
+import os, re, glob, json, time, shlex, logging, subprocess, datetime, sys, signal, threading, socket, argparse, ls_common, ls_archive
 from collections import deque
 from pathlib import Path
 from yt_dlp.utils import sanitize_filename
@@ -520,6 +520,13 @@ class LivestreamRecorder:
             return self._cmd_mark(parts[1:])
         if cmd == "clip":
             return self._cmd_clip(parts[1:])
+        if cmd == "clipjob":
+            # The RAW line, not `parts` — shlex has already eaten the JSON's
+            # quotes by here. See _cmd_clipjob.
+            return self._cmd_clipjob(command)
+        # `clipjob` is deliberately absent from the usage line below: it is the
+        # archive's verb, not a human's, and this string is what somebody gets
+        # when they typo at the CLI.
         return ("Commands: status | tail [YT|TW] | check [youtube|twitch] | "
                 "record <url> | watch <url> | unwatch [url|N] | "
                 "mark <text> | clip <when> [length]")
@@ -1868,6 +1875,130 @@ class LivestreamRecorder:
             lines.append(f"    note     {n}")
         lines += ["", "  (cutting in background — see the daemon log)", ""]
         return "\n".join(lines)
+
+    # ── the archive's live cut ─────────────────────────────────────────────
+
+    #: What the archive calls the two platforms, and what this file calls them.
+    #: The archive's vocabulary is 'YT' / 'TW' — it is what `capture.platform`
+    #: stores and what liveRecFor() returns — and the daemon's is the long name
+    #: yt-dlp uses. A pass-through asks _pick_stream for an active "YT"
+    #: recording and is told there is none, which is a confusing way to say
+    #: "your two halves disagree about a two-value enum".
+    #:
+    #: DERIVED from ls_archive.PLATFORM, not typed out again. That table is the
+    #: translation this project already had — five call sites on the outbound
+    #: HTTP path use it, which is why the live badges in the browser have always
+    #: said the right thing. The socket was simply a boundary nobody had crossed
+    #: yet, so it never reached for it. Building the inbound direction from the
+    #: outbound one means a third platform is added in one place: retyping a
+    #: vocabulary is how db.js once refiled every tag in the archive as
+    #: 'unknown', and the rule that came out of it applies here too.
+    _PLATFORM_ALIASES = {
+        **{long: long for long in ls_archive.PLATFORM},
+        **{short.lower(): long for long, short in ls_archive.PLATFORM.items()},
+    }
+
+    def _cmd_clipjob(self, raw: str) -> str:
+        """`ls-rec clip` for a machine: JSON in, JSON out.
+
+        The archive's live-cut path ends here, and it is a thin verb over
+        _plan_clip and _cut on purpose. The promise ls_jobs._clip_live makes on
+        the other side is that "a clip from the browser is the same cut as one
+        typed at `ls-rec clip`" — two planners would drift, and the one thing a
+        clip must not be is a different two seconds depending on who asked.
+
+        THE RAW LINE, not handle_command's `parts`. That dispatcher shlex-splits
+        before reaching here and shlex eats quotes, so
+        `clipjob {"at": 1, "name": "a b"}` arrives as
+        ['clipjob', '{"at":', '1,', '"name":', 'a b}'] — the payload shredded
+        before the handler sees it. The VERB is matched on the split form, where
+        it is one bare word; the PAYLOAD comes off the original string.
+
+        Every answer is JSON, refusals included, because the caller json.loads()
+        it and reports anything else as "the recorder said: <text>". Not
+        hypothetical: until this verb existed the dispatcher's human usage
+        string came back, and that is exactly how it read from the far end.
+
+        One thing this does NOT check: that the recording it picks is the
+        broadcast the archive meant. The payload carries no stream id — the
+        archive verified liveRecFor(stream) before enqueueing, so the only
+        window is a stream ending and another starting between enqueue and
+        execution, bounded by the five-minute lease. Recorded rather than
+        guarded, because closing it means sending an id the daemon has no
+        vocabulary for.
+        """
+        def no(why: str) -> str:
+            return json.dumps({"ok": False, "error": why})
+
+        bits = raw.split(None, 1)
+        if len(bits) < 2:
+            return no("the clip request carried no payload")
+        try:
+            req = json.loads(bits[1])
+        except ValueError:
+            return no("the clip request was not readable json")
+        if not isinstance(req, dict):
+            return no("the clip request was not an object")
+
+        try:
+            at = float(req["at"])
+            length = float(req["length"])
+        except (KeyError, TypeError, ValueError):
+            return no("the request did not name a moment and a length")
+        if length <= 0:
+            return no("that is not a length")
+        try:
+            lead = (float(self.config.get("clip_lead_s", 60))
+                    if req.get("lead") is None else float(req["lead"]))
+        except (TypeError, ValueError):
+            return no("that is not a lead")
+        if lead < 0:
+            return no("that is not a lead")
+
+        asked = req.get("platform")
+        platform = None
+        if asked is not None:
+            platform = self._PLATFORM_ALIASES.get(str(asked).strip().lower())
+            if platform is None:
+                return no(f"no such platform: {asked}")
+
+        stream, err = self._pick_stream(platform)
+        if stream is None:
+            return no(err.rstrip(".").lower())
+        if not stream.get("_part_history"):
+            return no("that recording has not written anything yet")
+
+        label = req.get("name")
+        label = str(label)[:60] if label else None
+        plan, err = self._plan_clip(stream, at, length, lead, label, time.time())
+        if plan is None:
+            return no(err)
+
+        # Same thread launch as the CLI verb, so the daemon answers the socket
+        # immediately and the caller waits on the FILE — which is what
+        # _clip_live does, because ffmpeg writes the moov atom last and
+        # +faststart rewrites the file to move it to the front.
+        threading.Thread(target=self._cut,
+                         args=(plan["sources"], plan["offset"],
+                               plan["length"], plan["out"]),
+                         daemon=True).start()
+        logger.info(f"clipjob: part {plan['part']:02d} @ {_fmt_hms(plan['offset'])}"
+                    f" for {_fmt_dur(plan['length'])} -> {plan['out']}")
+        return json.dumps({
+            "ok":       True,
+            "out":      plan["out"],
+            "part":     plan["part"],
+            "offset":   plan["offset"],
+            "start":    plan["start"],
+            # `asked` is what was requested and `length` what the plan actually
+            # cut — they differ whenever _plan_clip clamped at the live edge or
+            # a part boundary, and the archive says so rather than handing over
+            # a short file without comment.
+            "asked":    length,
+            "length":   plan["length"],
+            "platform": stream["platform"],
+            "notes":    plan["notes"],
+        })
 
     def _plan_clip(self, stream: dict, epoch: float, length: float,
                    lead: float, label: str | None,
