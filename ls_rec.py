@@ -53,6 +53,25 @@ BITRATE_PROBE_MIN_MB = 30     # ffprobe once file reaches this size
 RESTART_MAX          = 10     # bounded restart attempts per stream
 RESTART_DELAY_S      = 15     # backoff between restart attempts
 
+# ── when the liveness probe cannot answer ─────────────────────────────────
+#
+# 17 Sep, from a real incident. A bot-check at 06:04 put the YouTube probe on
+# cookies for 24h, after which every probe TIMED OUT — about thirty in a row.
+# Each round of three concluded "inconclusive; assuming still live", so the
+# recorder chased a broadcast that had ended at 10:33: part 01 restarted twice,
+# then part 02, then downloaded until it was killed by hand. Nothing was lost
+# (part 01 held the whole 4h32m and chat seg 001 produced the lot) but the
+# YouTube side never wrapped, because _handle_completion never ran.
+#
+# The probe failing open is right for a blip and wrong for an outage, and the
+# difference is how long it lasts. So an assumed-live answer is now BOUNDED
+# rather than either trusted or refused: a stream nobody can probe rotates a
+# couple of times and then completes.
+CHAT_IDLE_CAP        = 2      # empty chat segments before chat gives up
+BLIND_ROUNDS_LOUD    = 2      # inconclusive rounds before saying so once, loudly
+ASSUMED_ROTATE_MAX   = 2      # rotations allowed while liveness is only ASSUMED
+PARTNER_END_WINDOW_S = 900    # how long a sibling's clean end stays evidence
+
 # ── Clipping constants ────────────────────────────────────────────────────
 CLIP_TAIL_GUARD_S    = 5      # never cut closer than this to the live edge
 CLIP_TIMEOUT_S       = 900    # ffmpeg wall-clock ceiling for one cut
@@ -416,6 +435,14 @@ class LivestreamRecorder:
         self.was_streaming = False
         self.monitoring_cooldown_until = None
         self.manual_termination_in_progress = False
+        # obsidian_index -> (when, platform) for a capture that ended CLEANLY.
+        # A dual-stream's two halves share an index, so one side finishing rc=0
+        # is evidence the BROADCAST finished — which is the only signal
+        # available when the other side's probe has gone blind. Only a clean
+        # end counts: a partner that crashed or burned its restart budget says
+        # nothing about whether she is still streaming, and one platform
+        # falling over must not drag the other down with it.
+        self._ended_clean: dict[int, tuple[float, str]] = {}
         self.last_check_time: dict[str, datetime.datetime | None] = {
             "youtube": None, "twitch": None,
         }
@@ -1038,6 +1065,11 @@ class LivestreamRecorder:
             "_bitrate_bps":        None,
             "_watchdog_triggered": False,
             "_restart_count":      0,
+            # Two more budgets, kept apart from _restart_count on purpose.
+            # That one counts a process that keeps dying; these count how far
+            # we will follow a GUESS about whether she is still streaming.
+            "_blind_rounds":       0,   # consecutive unprobeable liveness rounds
+            "_assumed_rotations":  0,   # rotations taken on an assumed-live source
             # Recording lifecycle
             "_from_start":       (platform == "youtube"),
             "_part_num":         0,      # Twitch: incremented per part. from-start: pinned to 1.
@@ -1162,8 +1194,14 @@ class LivestreamRecorder:
                         logger.error(f"Chat fold failed ({segbase}): {e}")
                     return True
 
+                # Two, not five. The five empties in the 17 Sep incident were
+                # all AFTER the broadcast ended — correct answers to a question
+                # that had stopped making sense — and each one is another
+                # yt-dlp hit at exactly the wrong moment, since the reason the
+                # probe went blind in the first place was a bot-check. Two
+                # still tells "briefly empty" from "gone".
                 seg, idle = 0, 0
-                IDLE_CAP = 5
+                IDLE_CAP = CHAT_IDLE_CAP
                 while not stop_event.is_set() and idle < IDLE_CAP:
                     seg += 1
                     log_path = os.path.join(
@@ -1233,7 +1271,7 @@ class LivestreamRecorder:
     # ── monitor / watchdog ────────────────────────────────────────────────
 
     def _source_still_live(self, stream: dict, attempts: int = 3,
-                           default: bool = True) -> bool:
+                           default: bool = True, with_confidence: bool = False):
         """
         Only believe "ended" when a probe actually says so.
 
@@ -1247,19 +1285,70 @@ class LivestreamRecorder:
         by caller: the chat loop keeps capturing (cheap), the video rotate does
         not (a live-edge part against an ended stream re-downloads the VOD).
         """
+        def answer(live: bool, conf: str):
+            """`with_confidence` tells the caller WHY, not just what.
+
+            The rotation decision needs the difference — an observed "still
+            live" may rotate freely, an assumed one may not — and a bool
+            cannot carry it. Off by default so the three cheap callers are
+            unchanged.
+            """
+            return (live, conf) if with_confidence else live
+
         for i in range(attempts):
             data, reason = ls_common.ytdlp_probe(
                 self.config, stream["url"], playlist_items="1", with_reason=True)
             if data and data.get("id") == stream["identifier"]:
-                return bool(data.get("is_live"))
+                stream["_blind_rounds"] = 0
+                return answer(bool(data.get("is_live")), "confirmed")
             if reason == "offline":
-                return False                    # the platform said so
+                stream["_blind_rounds"] = 0
+                return answer(False, "offline")   # the platform said so
             if i < attempts - 1:
                 time.sleep(20)
-        logger.warning(f"Liveness probe inconclusive x{attempts} for "
-                       f"{stream['stream_title']}; assuming "
-                       f"{'still live' if default else 'ended'}")
-        return default
+
+        # Inconclusive. Said ONCE, loudly, rather than every round: the real
+        # incident logged this same line ten times over eighteen minutes, which
+        # reads as noise and buries the one fact that matters — the probe is
+        # not inconclusive any more, it is UNAVAILABLE, and a bot-check is the
+        # usual reason.
+        blind = stream["_blind_rounds"] = stream.get("_blind_rounds", 0) + 1
+        if blind == BLIND_ROUNDS_LOUD:
+            logger.error(
+                f"Liveness probe has failed {blind} rounds running for "
+                f"{stream['stream_title']} — treating it as UNAVAILABLE, not "
+                f"inconclusive. Usually a bot-check (see the cookie warning "
+                f"earlier); rotations are now bounded at {ASSUMED_ROTATE_MAX}.")
+        elif blind < BLIND_ROUNDS_LOUD:
+            logger.warning(f"Liveness probe inconclusive x{attempts} for "
+                           f"{stream['stream_title']}; assuming "
+                           f"{'still live' if default else 'ended'}")
+        return answer(default, "assumed")
+
+    def _partner_ended_clean(self, stream: dict) -> bool:
+        """Did the OTHER half of this dual-stream finish of its own accord?
+
+        Three conditions, and each one is there to stop a false positive:
+
+          · a shared `obsidian_index`, which is what makes two captures one
+            broadcast rather than two coincidences;
+          · a DIFFERENT platform, so a stream cannot read its own completion
+            back as corroboration;
+          · recently, because an index is reused across a re-record and a
+            month-old end is not news.
+
+        And the writer only records rc=0 natural ends, which is the constraint
+        that matters: Twitch crashing must not drag YouTube down with it.
+        """
+        idx = stream.get("obsidian_index")
+        if idx is None:
+            return False
+        rec = self._ended_clean.get(idx)
+        if not rec:
+            return False
+        when, platform = rec
+        return (platform != stream.get("platform")
+                and (time.time() - when) <= PARTNER_END_WINDOW_S)
 
     def _video_monitor(self, stream_key, process, log_fh, title, part_num):
         """Wait for yt-dlp exit, then classify: superseded / natural-end / failure."""
@@ -1286,7 +1375,23 @@ class LivestreamRecorder:
             return
 
         if rc == 0:
-            if not self.manual_termination_in_progress and self._source_still_live(stream):
+            if self.manual_termination_in_progress:
+                live, conf = False, "manual"
+            else:
+                live, conf = self._source_still_live(stream, with_confidence=True)
+                # A dual partner that ended CLEANLY is the only outside
+                # evidence available once the probe has gone blind, and it is
+                # good evidence: the two halves share an index because they are
+                # one broadcast. Only consulted when the answer is ASSUMED — a
+                # confirmed live stream needs no corroboration, and a partner's
+                # clean end must never override an observation.
+                if live and conf == "assumed" and self._partner_ended_clean(stream):
+                    logger.warning(
+                        f"Part {part_num:02d} rc=0, liveness unprobeable, but the "
+                        f"other half of #{stream.get('obsidian_index')} ended "
+                        f"cleanly — treating the broadcast as over: {title}")
+                    live = False
+            if live:
                 elapsed = time.time() - stream.get("_part_started_ts", 0)
                 if elapsed < 30:
                     # Pathological: rc=0 within seconds while still live = the
@@ -1302,15 +1407,45 @@ class LivestreamRecorder:
                 else:
                     # Healthy-length part that ended while still live: genuine
                     # resume, reset the budget.
+                    #
+                    # ...unless "still live" is an ASSUMPTION. Then the rotation
+                    # gets its own budget, separate from `_restart_count`,
+                    # because the two failures are different: that one counts a
+                    # process that keeps dying, this one counts how far we are
+                    # willing to follow a guess. Spend it and complete —
+                    # a blip survives two rotations, an ended-and-unprobeable
+                    # broadcast stops instead of downloading until somebody
+                    # notices. Reset on any CONFIRMED answer, so a long stream
+                    # that goes briefly blind does not accumulate toward this.
+                    if conf == "assumed":
+                        spent = stream["_assumed_rotations"] = \
+                            stream.get("_assumed_rotations", 0) + 1
+                        if spent > ASSUMED_ROTATE_MAX:
+                            logger.error(
+                                f"Part {part_num:02d} rc=0 and liveness still "
+                                f"unprobeable after {ASSUMED_ROTATE_MAX} "
+                                f"rotations; completing rather than chasing it: "
+                                f"{title}")
+                            self._handle_completion(stream_key)
+                            return
+                        logger.warning(
+                            f"Part {part_num:02d} ended rc=0, liveness ASSUMED "
+                            f"(probe blind); rotating {spent}/"
+                            f"{ASSUMED_ROTATE_MAX}: {title}")
+                    else:
+                        stream["_assumed_rotations"] = 0
+                        logger.warning(f"Part {part_num:02d} ended rc=0 but {title} still live; rotating to live-edge")
                     stream["_from_start"] = False
                     stream["_restart_count"] = 0
-                    logger.warning(f"Part {part_num:02d} ended rc=0 but {title} still live; rotating to live-edge")
                     time.sleep(3)
                 if stream_key in self.active_streams and not self.manual_termination_in_progress:
                     self._record_video(stream_key)
                 return
             logger.info(f"Part {part_num:02d} complete (rc=0): {title}")
-            self._handle_completion(stream_key)
+            # `clean_end`: this is the ONE path that means the broadcast ended
+            # of its own accord. It is what the other half of a dual-stream is
+            # allowed to read as evidence — see _partner_ended_clean.
+            self._handle_completion(stream_key, clean_end=True)
             return
         
         # Non-zero: restart within the same recording session if budget allows
@@ -2186,8 +2321,15 @@ class LivestreamRecorder:
         logger.info(f"Video abandoned, {reason}; completing: {title}")
         self._handle_completion(stream_key)     # sets chat_stop_event
 
-    def _handle_completion(self, stream_key: str, upload: bool = True):
-        """Stop chat, merge parts, upload, write final metadata."""
+    def _handle_completion(self, stream_key: str, upload: bool = True,
+                           clean_end: bool = False):
+        """Stop chat, merge parts, upload, write final metadata.
+
+        `clean_end` means the broadcast ended by itself — rc=0 with the source
+        confirmed or believed gone — as opposed to a manual stop, an exhausted
+        restart budget, or a rotation we declined to follow. Only that case is
+        published for the other half of a dual-stream to read.
+        """
         if stream_key not in self.active_streams:
             return
         stream   = self.active_streams[stream_key]
@@ -2195,6 +2337,11 @@ class LivestreamRecorder:
         platform = stream["platform"]
         obs_idx  = stream.get("obsidian_index")
         logger.info(f"Completing: {title}")
+        # Recorded BEFORE the work below, which uploads and can take minutes:
+        # the partner's monitor may be deciding whether to rotate right now,
+        # and evidence that arrives after it has already guessed is no use.
+        if clean_end and obs_idx is not None:
+            self._ended_clean[obs_idx] = (time.time(), platform)
 
         # Tracked out here because every `return` below is a real outcome the
         # archive wants: no parts, merge failed, upload failed, upload=False.
