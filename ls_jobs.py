@@ -236,6 +236,31 @@ def music_dir(config: dict) -> str | None:
     return os.path.join(m, *rel.split("/")) if rel else m
 
 
+def clips_dir(config: dict) -> str | None:
+    """Where the DAEMON writes a cut, which this worker then moves out of.
+
+    The same rule as `ls_rec._clips_dir`, deliberately duplicated rather than
+    imported — importing the recorder here would pull in yt-dlp and a logging
+    setup this worker has no use for, which is the same reason `RECORDER_SOCKET`
+    is a second copy of a path.
+
+    This worker never CHOOSES this directory: `_clip_live` is handed `out` by
+    the daemon in its reply. That is why it needs its own resolver — the answer
+    lives in the recorder's config key, so nothing about reading this file tells
+    you which directories the worker must be able to write. A live clip is
+    moved with `os.replace`, which unlinks the source name and therefore needs
+    write permission on the SOURCE directory as much as the destination. A
+    systemd unit with `ProtectSystem=strict` and no `ReadWritePaths=` entry for
+    this path fails every live clip with "Read-only file system" while the
+    destination is perfectly writable and every check from a shell says so too.
+    """
+    explicit = str(config.get("clips_dir") or "").strip()
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    out = str(config.get("output") or "").strip()
+    return os.path.join(os.path.abspath(os.path.expanduser(out)), "clips") if out else None
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  NAMES THE ARCHIVE MAY SAY
 # ══════════════════════════════════════════════════════════════════════════
@@ -426,7 +451,17 @@ def _clip_live(config: dict, job: dict, pay: dict, q: str, rel: str):
             os.remove(tmp)
         except OSError:
             pass
-        return ("failed", None, f"could not move the clip: {e.strerror or e}")
+        # BOTH paths, because a move has two directories and only one of them
+        # is ever the problem. This said "could not move the clip: Read-only
+        # file system" and nothing else, and the destination is the one a
+        # reader checks first — so an hour went on quarantine, which was
+        # writable, while the source directory was the read-only one. A move
+        # unlinks the source name, so it needs write permission on the
+        # SOURCE's directory too; see `clips_dir`. Same lesson as the socket
+        # error a hundred lines up: name the thing, not just the errno.
+        return ("failed", None,
+                f"could not move the clip: {e.strerror or e}"
+                f" (from {os.path.dirname(out)} to {os.path.dirname(dst)})")
 
     got = file_duration(dst)
     asked = float(ans.get("asked") or 0)
@@ -1867,12 +1902,36 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
     need_media = bool({"promote", "purge", "rescan", "music_fetch",
                        "harvest", "clip"} & set(kinds))
     need_q = bool({"promote", "fetch", "clip"} & set(kinds))
+    # A clip has a THIRD root and this check only knew two of them, so the bug
+    # the `clip` entries above were added to prevent happened again one root
+    # over: `--kinds clip` passed preflight and then died on the job with
+    # "could not move the clip: Read-only file system". The cut is written by
+    # the daemon into `clips_dir` and MOVED out of there, and a move unlinks
+    # the source — so this worker needs write permission on a directory it
+    # never names. See `clips_dir` for why it cannot be inferred from here.
+    c = clips_dir(config)
+    need_clips = "clip" in set(kinds)
+    # The daemon mkdirs the clips dir on demand, so a fresh install has none
+    # and refusing to take ANY work over that would be worse than the bug this
+    # check exists for. Made here instead — idempotent, the same call the
+    # daemon makes — so the write probe below has something to probe. A
+    # creation that fails carries the answer in its errno, so it is kept and
+    # reported rather than swallowed: EROFS here IS the missing
+    # `ReadWritePaths=` entry, named before a job dies on it.
+    clips_note = ""
+    if need_clips and c and not os.path.isdir(c):
+        try:
+            os.makedirs(c, exist_ok=True)
+        except OSError as e:
+            clips_note = f"  CANNOT BE CREATED ({e.strerror or e})"
 
     for label, path, needed, why in (
             ("media root ", m, need_media,
              "set archive_media_root, or check that nas_path ends with archive_media_prefix"),
             ("quarantine ", q, need_q,
-             "set archive_quarantine_dir")):
+             "set archive_quarantine_dir"),
+            ("clips dir  ", c, need_clips,
+             "set clips_dir, or output — the recorder writes a live cut there")):
         if not needed:
             say(f"  {label}    (not needed for {','.join(kinds)})")
             continue
@@ -1881,7 +1940,9 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
             ok = False
             continue
         note = ""
-        if not os.path.isdir(path):
+        if path == c and clips_note:
+            note, ok = clips_note, False
+        elif not os.path.isdir(path):
             note, ok = "  MISSING", False
         else:
             probe = os.path.join(path, f"{PART}preflight-{os.getpid()}")

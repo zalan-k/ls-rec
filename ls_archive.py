@@ -683,6 +683,25 @@ def build_plan(config: dict, *, idx: int, stream_fields: dict,
 
     # Stream-level.
     for field, after in stream_fields.items():
+        # The stream's TITLE is editorial, and ls-audit does not own it.
+        #
+        # `_archive_inputs` derives it with `next(c["title"] for c in caps)`,
+        # and caps is built yt-then-tw, so it is always YouTube's when a
+        # YouTube capture exists — an ordering, not a rule anybody chose. The
+        # recorder files a title at record time, usually Twitch's because
+        # Twitch goes live first, so the two disagreed and collided on every
+        # single sweep, forever, asking about it every time.
+        #
+        # Per-platform truth already has a home: `capture.title`, which this
+        # same plan carries, and which the site draws as the alt-title chip
+        # precisely because the two platforms name a broadcast differently.
+        # What the stream is CALLED is a decision a person makes.
+        #
+        # So it is offered while the stream is being created — where there is
+        # nothing to overwrite and a name is better than no name — and never
+        # again. Changing it afterwards is an edit, and an edit has a route.
+        if field == "title" and not plan["creating"]:
+            continue
         kind = _classify(field, stream.get(field), after)
         if kind in (None, "same"):
             continue

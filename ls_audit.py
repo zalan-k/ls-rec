@@ -1046,11 +1046,24 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
         if stream_ms is None or abs(fname_ms - stream_ms) > 60_000:
             record_ms, record_src = fname_ms, "filename (minute)"
 
-    duration = vod.get("duration")
+    # Two different facts have always shared this one field, and nothing said
+    # which one you were holding. The cache's number is what the PLATFORM says
+    # the broadcast ran for; ffprobe's is how long the FILE is. They disagree
+    # legitimately — a VOD trimmed at the far end, a capture that started late
+    # or died early — and the disagreement is a finding rather than noise.
+    #
+    # Worse, which one you got depended on whether a file happened to be on
+    # disk, so a declined capture's broadcast length and a kept one's file
+    # length were compared as though they were the same measurement. Every
+    # other value here carries a `_source`; this one did not, in a function
+    # whose docstring promises provenance on every value.
+    duration, duration_src = vod.get("duration"), "cache" if vod.get("duration") else None
     if video_file:
         vp = os.path.join(nas_root, video_file)
         if os.path.exists(vp):
-            duration = analyze_video_file(vp).get("duration_secs") or duration
+            probed = analyze_video_file(vp).get("duration_secs")
+            if probed:
+                duration, duration_src = probed, "ffprobe"
 
     def acc(src):
         if src is None:
@@ -1068,6 +1081,9 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
         "record_start_source": record_src,
         "record_start_accuracy": acc(record_src),
         "duration_secs": duration,
+        # `ffprobe` means the file on disk; `cache` means the platform's own
+        # number for the broadcast. See the note above the assignment.
+        "duration_source": duration_src,
         "filename_epoch_ms": fname_ms,
         "files": {"video": video_file, "chat": chat_file},
     }
@@ -1103,7 +1119,8 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
             else:
                 print(f"    {label}  UNKNOWN")
         if t["duration_secs"]:
-            print(f"    duration      {_seconds_to_hhmmss(t['duration_secs'])}")
+            print(f"    duration      {_seconds_to_hhmmss(t['duration_secs'])}"
+                  f"  [{t.get('duration_source') or 'unknown'}]")
 
     if not any_found:
         print("\n  Nothing to record.\n")
