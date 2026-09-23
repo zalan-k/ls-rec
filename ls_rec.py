@@ -1667,6 +1667,55 @@ class LivestreamRecorder:
     #  and force-restart a healthy recording. _find_part_files() would then
     #  sweep the same clip into the final concat.
 
+    def _write_meta(self, stream: dict, platform: str, title: str,
+                    duration, have_video: bool, have_chat: bool):
+        """One capture's timings, beside the capture, in the audit's own words.
+
+        The field names are `ls_audit._platform_timings`'s on purpose: a reader
+        should not have to know which program wrote a sidecar in order to read
+        one. What differs is the SOURCES — every value here is `recorder`,
+        because the recorder measured it rather than ranking four guesses at it
+        after the fact, and that is what makes this a witness.
+
+        One file per capture rather than one per entry. A dual-stream completes
+        twice, minutes apart and on different threads, and a shared per-entry
+        file would be a read-modify-write race over the one record that cannot
+        be rebuilt. `ls-audit` keeps writing the per-entry aggregate; that one
+        is a derivation and may be rewritten freely.
+        """
+        nas = self.config.get("nas_path") or ""
+        if not nas or not os.path.isdir(nas):
+            return                       # nothing uploaded, nothing to sit beside
+        stream_ms = stream.get("_stream_start_epoch")
+        record_ms = stream.get("_record_start_epoch")
+        doc = {
+            "recorder": ls_common.CHAT_RECORDER_VERSION,
+            "platform": platform,
+            "video_id": stream.get("identifier"),
+            "obsidian_index": stream.get("obsidian_index"),
+            # Milliseconds, matching the sidecar the audit writes. The
+            # recorder holds these as float seconds.
+            "stream_start_epoch_ms": int(stream_ms * 1000) if stream_ms else None,
+            "stream_start_source": "recorder (live probe)" if stream_ms else None,
+            "stream_start_accuracy": "exact" if stream_ms else None,
+            "record_start_epoch_ms": int(record_ms * 1000) if record_ms else None,
+            "record_start_source": "recorder" if record_ms else None,
+            "record_start_accuracy": "exact" if record_ms else None,
+            "duration_secs": duration,
+            # The file's length as this recorder measured it on the way out,
+            # which is a different fact from the platform's number for the
+            # broadcast. Labelled, because one unlabelled duration is how those
+            # two came to be compared as though they were one measurement.
+            "duration_source": "recorder" if duration else None,
+            "have_video": bool(have_video),
+            "have_chat": bool(have_chat),
+            "files": {"video": f"{title}.mp4" if have_video else None,
+                      "chat": f"{title}.json" if have_chat else None},
+        }
+        path = os.path.join(nas, ls_common.meta_name(title))
+        ls_common.write_meta(path, doc, by="recorder")
+        logger.info(f"timings sidecar: {ls_common.meta_name(title)}")
+
     def _clips_dir(self) -> str:
         return (self.config.get("clips_dir")
                 or os.path.join(self.config["output"], "clips"))
@@ -2429,6 +2478,27 @@ class LivestreamRecorder:
                 )
             except Exception as e:
                 logger.warning(f"archive completion packet failed: {e}")
+            # The sidecar, here for the same reason the packet above is here:
+            # it has to be written with whatever turned out to be true, and it
+            # has to be written whether or not the archive took the packet.
+            #
+            # That second half is the point. `post_done` and `post_start` both
+            # queue on a network failure or a 5xx, but a 4xx is logged and
+            # DROPPED — deliberately, because retrying an identical bad packet
+            # forever is worse. The cost of that, for one field, is specific:
+            # after a refused start packet the broadcast start existed only in
+            # vods.json, which is a cache and is going away. The live probe's
+            # payload is discarded after `_make_stream_info`, and on Twitch the
+            # number cannot be recovered once the stream ends — so this file is
+            # its local durable copy, sitting beside the recording it measures.
+            #
+            # Never fatal: a sidecar that could not be written must not take a
+            # finished recording down with it.
+            try:
+                self._write_meta(stream, platform, title, _duration,
+                                 _have_video, _have_chat)
+            except Exception as e:
+                logger.warning(f"timings sidecar failed for {title}: {e}")
             # yt-dlp leaves fragments behind when a chat segment is killed
             # mid-write (.part-FragNN, orphan .live_chat.json), and an empty
             # part log per failed retry. None of it is recoverable data, and

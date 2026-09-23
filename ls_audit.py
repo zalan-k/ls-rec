@@ -19,6 +19,7 @@ import ls_common
 import ls_chat
 import ls_archive
 import ls_assets
+import ls_witness
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1013,57 +1014,82 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
     vid = ls_common.extract_video_id_from_filename(chat_file or video_file)
     vod = (ls_common.find_vod(cache, vid, platform) or {}) if vid else {}
 
-    stream_ms = stream_src = None
-    record_ms = record_src = None
+    # ── GATHER, then settle. This was a fallback chain until C3 ─────────────
+    #
+    # Every witness is asked, every answer is kept, and `ls_witness.settle`
+    # applies the authority table to pick one. What changed is not usually the
+    # ANSWER — it is that the losers survive, so a caller can tell "the cache
+    # said 13:02" from "four sources agreed on 13:02", which nothing could
+    # before. The old chain stopped at the first hit and the rest were never
+    # asked, so a wrong first answer was silent.
+    #
+    # Two behavioural corrections fall out of the table rather than out of
+    # code here:
+    #   · the recorder's naive local `start_time` is a witness to RECORD start
+    #     and is refused as a broadcast start, which it had always been
+    #     offered as — five hours adrift on 257 of 450 cached rows;
+    #   · the filename's minute is offered to both clocks at the lowest rank
+    #     either has, instead of being hand-gated against `stream_ms` by a
+    #     60-second test that only existed because there was nowhere to record
+    #     "this is coarse".
+    ws = []
+    #  The recorder's own sidecar, when one exists. Nothing has one yet — C1
+    #  ships the writer and the back catalogue will never have them — so this
+    #  is the witness that starts absent and gets denser over months.
+    if video_file or chat_file:
+        side = ls_common.read_meta(os.path.join(
+            nas_root, ls_common.meta_name(
+                os.path.splitext(video_file or chat_file)[0])))
+        ws += ls_witness.read_sidecar(side)
+    ws += ls_witness.read_cache(vod, config.get("tz_offset_min"))
 
-    # 1. cache — written at record time, exact
-    if vod.get("stream_start_epoch_ms"):
-        stream_ms, stream_src = vod["stream_start_epoch_ms"], "cache"
-    if vod.get("record_start_epoch_ms"):
-        record_ms, record_src = vod["record_start_epoch_ms"], "cache"
-
-    # 2. the chat file itself — exact, and works for the whole back catalogue.
-    #    What the zero means depends on the format, so trust the source label.
-    if chat_file and (stream_ms is None or record_ms is None):
+    # The chat file itself — exact, and it works for the whole back catalogue.
+    # What the zero MEANS depends on the format, which is why the routing
+    # lives in `read_chat_zero` rather than in an `if` here.
+    if chat_file:
         zero, zsrc = ls_chat.peek_zero(os.path.join(nas_root, chat_file))
-        if zero is not None:
-            if zsrc in ("yt:timestampUsec", "tdc:created_at") and stream_ms is None:
-                stream_ms, stream_src = zero, f"chat ({zsrc})"
-            elif zsrc == "irc:tmi_sent_ts" and record_ms is None:
-                record_ms, record_src = zero, f"chat ({zsrc})"
+        ws += ls_witness.read_chat_zero(zero, zsrc)
 
-    # 3. recorder log — second accurate, but only the recent past
-    if record_ms is None and (video_file or chat_file):
-        hit = _log_record_start(config, video_file or chat_file)
-        if hit:
-            record_ms, record_src = hit, "log"
+    # The recorder log — second accurate, but only the recent past: it is
+    # written to the daemon's working directory and rolls over after a few
+    # dozen recordings.
+    if video_file or chat_file:
+        ws += ls_witness.read_log(_log_record_start(config, video_file or chat_file))
 
-    # 4. filename — minute only, and ambiguous: the recorder stamps the
-    #    detection time, an ls-audit re-download stamps the broadcast start.
-    #    Only usable as a record start once it is clearly not the latter.
     fname_ms = _filename_epoch_ms(chat_file or video_file)
-    if record_ms is None and fname_ms is not None:
-        if stream_ms is None or abs(fname_ms - stream_ms) > 60_000:
-            record_ms, record_src = fname_ms, "filename (minute)"
+    ws += ls_witness.read_filename(fname_ms)
 
-    # Two different facts have always shared this one field, and nothing said
-    # which one you were holding. The cache's number is what the PLATFORM says
-    # the broadcast ran for; ffprobe's is how long the FILE is. They disagree
+    # Two different facts have always shared one field, and nothing said which
+    # one you were holding. The cache's number is what the PLATFORM says the
+    # broadcast ran for; ffprobe's is how long the FILE is. They disagree
     # legitimately — a VOD trimmed at the far end, a capture that started late
     # or died early — and the disagreement is a finding rather than noise.
-    #
-    # Worse, which one you got depended on whether a file happened to be on
-    # disk, so a declined capture's broadcast length and a kept one's file
-    # length were compared as though they were the same measurement. Every
-    # other value here carries a `_source`; this one did not, in a function
-    # whose docstring promises provenance on every value.
-    duration, duration_src = vod.get("duration"), "cache" if vod.get("duration") else None
+    # They are two CLAIMS now, so nothing has to choose between them.
     if video_file:
         vp = os.path.join(nas_root, video_file)
         if os.path.exists(vp):
-            probed = analyze_video_file(vp).get("duration_secs")
-            if probed:
-                duration, duration_src = probed, "ffprobe"
+            ws += ls_witness.read_ffprobe(
+                analyze_video_file(vp).get("duration_secs"))
+
+    stream = ls_witness.settle(ls_witness.BROADCAST_START, ws)
+    record = ls_witness.settle(ls_witness.RECORD_START, ws)
+    on_disk = ls_witness.settle(ls_witness.FILE_DURATION, ws)
+    broadcast = ls_witness.settle(ls_witness.BROADCAST_DURATION, ws)
+
+    stream_ms, record_ms = stream["value"], record["value"]
+    #  The labels the CLI and the archive have always displayed. The witness's
+    #  `source` is the authority table's key; the label is what a person
+    #  reads, and keeping them apart is what let the table be built without
+    #  changing a word of the output.
+    stream_src = (stream["best"] or {}).get("label")
+    record_src = (record["best"] or {}).get("label")
+
+    #  The file still wins for the number in `duration_secs`, because that is
+    #  what every existing caller means by it. The platform's figure is kept
+    #  beside it rather than instead of it.
+    duration = on_disk["value"] if on_disk["value"] else broadcast["value"]
+    duration_src = ((on_disk["best"] or {}).get("label") if on_disk["value"]
+                    else (broadcast["best"] or {}).get("label"))
 
     def acc(src):
         if src is None:
@@ -1071,6 +1097,13 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
         return "minute" if "filename" in src else "exact"
 
     return {
+        #  What C3 adds, beside everything that was already here. The
+        #  settlements carry every witness that answered, every one that was
+        #  refused, who won and by how far anybody disagreed — which is the
+        #  product of this whole round and is additive on purpose, so no
+        #  existing reader has to change to keep working.
+        "settled": {"broadcast_start": stream, "record_start": record,
+                    "file_duration": on_disk, "broadcast_duration": broadcast},
         "video_id": vid,
         "stream_start_epoch_ms": stream_ms,
         "stream_start_iso": _iso(stream_ms),
@@ -1122,22 +1155,50 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
             print(f"    duration      {_seconds_to_hhmmss(t['duration_secs'])}"
                   f"  [{t.get('duration_source') or 'unknown'}]")
 
+    # False rather than a bare return, now that the caller reports whether a
+    # sweep actually did anything. "Nothing to record" and "already current"
+    # are both honest noes.
     if not any_found:
         print("\n  Nothing to record.\n")
-        return
+        return False
 
     if dry_run:
         print("\n  --dry-run: nothing written.\n")
-        return
+        return False
 
     if not output:
         src_name = (doc.get("youtube") or doc.get("twitch"))["files"]
         stem = _title_from_filename(src_name["chat"] or src_name["video"])
         output = os.path.join(config.get("nas_path", ""),
-                              f"{int(index):03d}_{stem}.meta.json")
-    with open(output, "w", encoding="utf-8") as f:
-        json.dump(doc, f, ensure_ascii=False, indent=1)
-    print(f"\n  ✔ {output}\n")
+                              ls_common.meta_name(f"{int(index):03d}_{stem}"))
+
+    # A recorder-written sidecar is not ours to touch. It is a contemporaneous
+    # claim by the only party present, and this one is a derivation from files
+    # and logs — overwriting evidence with a reconstruction of it is the exact
+    # direction the whole sidecar split exists to prevent.
+    existing = ls_common.read_meta(output)
+    if ls_common.meta_is_recorder(existing):
+        print(f"\n  · {os.path.basename(output)} was written by the recorder "
+              f"— left alone\n")
+        return False
+
+    # Otherwise it IS refreshable, and it needs to be: this used to be written
+    # once and never again, so a sidecar written while the cache was wrong, or
+    # before a chat backfill landed, could never be corrected. Rewritten only
+    # when something actually changed, though — the stamps move on every run by
+    # construction, and a sweep that reported work it did not do would be
+    # noise of exactly the kind this tool is meant to remove.
+    def _content(d):
+        return {k: v for k, v in (d or {}).items()
+                if k not in ("meta_version", "written_by", "written_at")}
+
+    if existing is not None and _content(existing) == _content(doc):
+        print(f"\n  · {os.path.basename(output)} is already current\n")
+        return False
+
+    ls_common.write_meta(output, doc, by="audit")
+    print(f"\n  ✔ {output}{' (refreshed)' if existing else ''}\n")
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1532,8 +1593,20 @@ def _offer_chat_backfill(config: dict, item: dict,
     run = _backfill_yt_chat if plat == "youtube" else _backfill_tw_chat
     ask = ("Download post-hoc chat and merge?" if plat == "youtube"
            else "Pull the VOD's chat beside it?")
+    #  Unattended, this does not download. That is the rule step 6 of `audit()`
+    #  already states one screen up about a missing VOD — "never pull one
+    #  unattended" — and this branch was the only thing in the file breaking
+    #  it. The size difference is not the distinction: a caller with nobody
+    #  watching may be a timer OR a website button, and a button that quietly
+    #  fetches from YouTube and Twitch is bandwidth spent by nobody.
+    #
+    #  Declining is not the end of the repair. The shortfall was just printed
+    #  in full, and `_pipeline` collects it for whoever asked, so it can be
+    #  offered somewhere a person can say yes.
     if not interactive:
-        return run(config, item)
+        print(f"    unattended — not downloading. To repair: {ask.lower()} "
+              "run ls-audit on this entry from a terminal.")
+        return False
     if input(f"\n  {ask} [y/N]: ").strip().lower() not in ("y", "yes"):
         print("  Skipped.")
         return False
@@ -2004,8 +2077,24 @@ def _recent_indices(config: dict, n: int = 5) -> list[int]:
     return sorted(idxs)[-n:]
 
 
+def _deferred_repair(item: dict, platform: str) -> dict:
+    """A repair that was not run because nobody was there to say yes.
+
+    Not a finding and not a question: a finding says what is true and a
+    question asks what nobody can see, and this is neither — it is work the
+    entry is waiting on, which somebody has to authorise because it spends
+    somebody else's bandwidth. It travels as its own shape so the caller can
+    decide what to do with it; `finish()` is the only thing that collects one.
+    """
+    return {"kind": "chat_backfill", "platform": platform,
+            "why": list(item.get("why") or []),
+            "count": item.get("count"),
+            "shortfall_secs": item.get("shortfall_secs")}
+
+
 def _pipeline(config: dict, cache: list[dict], index: int,
-              interactive: bool = True) -> bool:
+              interactive: bool = True,
+              deferred: list | None = None) -> bool:
     """
     Bring one entry to its finished shape: meta sidecar, merged chat, raws
     archived.
@@ -2015,6 +2104,12 @@ def _pipeline(config: dict, cache: list[dict], index: int,
 
     Anything not ready yet is left alone and picked up by a later run, so
     this is safe to call repeatedly.
+
+    `deferred`, when a list is passed, collects the repairs this run would
+    have offered and did not run because it is unattended. An out-parameter
+    rather than a second return value because every existing caller wants the
+    bool and only one caller wants this — changing the return type would make
+    three call sites learn about a case two of them cannot reach.
     """
     nas_root = config.get("nas_path", "")
     nas = scan_nas(config, index)
@@ -2031,13 +2126,14 @@ def _pipeline(config: dict, cache: list[dict], index: int,
     # 1. Meta sidecar, ensured first and independently of the merge: it reads
     #    the raw captures for exact zeros, and an entry merged before this
     #    step existed would otherwise never get one.
-    meta_glob = os.path.join(nas_root, f"{int(index):03d}_*.meta.json")
-    if not glob.glob(meta_glob):
-        cmd_timings(config, index)
-        # Only count it if a file actually appeared. An entry with nothing
-        # left to describe writes none, and claiming otherwise would make
-        # every sweep report work it did not do.
-        changed = bool(glob.glob(meta_glob))
+    # Not "only when absent" any more. Write-once was right for getting the
+    # first sidecar onto every entry and wrong forever after: one written while
+    # the cache held a bad start, or before a chat backfill landed, could never
+    # be corrected — and C's whole design reads these back. `cmd_timings` now
+    # decides for itself, leaving a recorder-written sidecar alone and
+    # rewriting its own only when the content actually changed, so this can
+    # simply ask every sweep and still report honestly.
+    changed = bool(cmd_timings(config, index))
 
     if merged_name:
         return changed                     # chat side already finished
@@ -2063,7 +2159,16 @@ def _pipeline(config: dict, cache: list[dict], index: int,
     short = _yt_chat_shortfall(config, cache, nas, yt_id)
     if short:
         if not _offer_chat_backfill(config, short, interactive=interactive):
-            print("    repair unavailable (replay chat not ready?) — will retry")
+            # Two different reasons to be standing here, and they are not the
+            # same news. Interactively it means the replay chat could not be
+            # had — a retry is the answer. Unattended it means nobody was
+            # asked, which is a repair waiting on a person rather than on the
+            # platform, and saying "will retry" about it would promise a retry
+            # that is going to decline again every single time.
+            if interactive:
+                print("    repair unavailable (replay chat not ready?) — will retry")
+            elif deferred is not None:
+                deferred.append(_deferred_repair(short, "youtube"))
             return changed
         nas = scan_nas(config, index)
         if _yt_chat_shortfall(config, cache, nas, yt_id):
@@ -2080,9 +2185,14 @@ def _pipeline(config: dict, cache: list[dict], index: int,
     tw_id = (ls_common.extract_video_id_from_filename(nas["tw_chat"])
              if nas.get("tw_chat") else None)
     tw_short = _tw_chat_shortfall(config, cache, nas, tw_id, index)
-    if tw_short and _offer_chat_backfill(config, tw_short,
-                                         interactive=interactive):
-        nas = scan_nas(config, index)      # the pull is a second capture now
+    if tw_short:
+        if _offer_chat_backfill(config, tw_short, interactive=interactive):
+            nas = scan_nas(config, index)  # the pull is a second capture now
+        elif not interactive and deferred is not None:
+            # Deferred only when nobody was asked. A person who said no said
+            # no, and putting that on a list for somebody to be asked again is
+            # how a queue fills with decisions already made.
+            deferred.append(_deferred_repair(tw_short, "twitch"))
 
     # `True` only if a merge was actually written. The meta-sidecar step above
     # already learned this lesson -- "only count it if a file actually
@@ -2271,12 +2381,75 @@ def _finding(level: str, check: str, message: str, *,
             "message": message, "short": short or message, "detail": detail}
 
 
-def _disk_findings(config: dict, nas: dict, entry: dict) -> list[dict]:
+#  What the archive has been told that no file can show.
+#
+#  The vault has always carried two of these — `.×` for "I did not keep this"
+#  and `no_yt`/`no_tw` for "there was no stream here" — and they are the only
+#  reason `_disk_findings` can tell a decision from a loss. The vault is
+#  retiring, and the archive now holds the same two facts as `claim` rows, so
+#  this is how they reach the checks that already know what to do with them.
+#
+#  Keyed on (platform, assertion) with the platform lowercased and `None` kept
+#  as itself: a claim about the broadcast as a whole carries no platform, and
+#  collapsing that to a string would make it match one.
+
+_PREFIX_PLATFORM = {"yt": "youtube", "tw": "twitch"}
+
+
+def _claims_index(claims: list[dict] | None) -> dict:
+    """(platform, assertion) -> the claim, newest first wins.
+
+    The archive hands them back newest-first already, so the first of each key
+    is the answer and the rest are the history behind it.
+    """
+    out: dict = {}
+    for c in claims or []:
+        if c.get("withdrawn_at"):
+            continue
+        # Lowercased, and an absent platform kept as `None` rather than
+        # becoming the string "none". The archive writes them lowercase today,
+        # so the casing only matters the first time a row arrives from
+        # somewhere else — and it would show up as a lookup that silently
+        # misses and a question asked forever.
+        key = ((c.get("platform") or "").lower() or None, c.get("assertion"))
+        out.setdefault(key, c)
+    return out
+
+
+def _asked(kind: str, prefix: str | None, message: str, answers: list[str]) -> dict:
+    """A question the evidence cannot settle, and what would settle it.
+
+    Carried on the finding that raised it rather than as a level of its own:
+    an unanswered question is not more or less severe than a missing file, it
+    is the same fact with somewhere to go. Adding it to LEVELS would have made
+    `worst()` claim a severity nobody meant.
+    """
+    return {"kind": kind, "platform": _PREFIX_PLATFORM.get(prefix or ""),
+            "message": message, "answers": answers}
+
+
+def _disk_findings(config: dict, nas: dict, entry: dict,
+                   claims: dict | None = None) -> list[dict]:
     """Is the file here, and if not, is that a decision or a loss?"""
     out = []
+    claims = claims or {}
+    # A claim carrying NO platform is about the broadcast as a whole, so it
+    # answers for both. "There was no stream that day" and "I kept none of it"
+    # are things somebody says once rather than twice, and the archive has
+    # always accepted them — this is where they finally mean something. Without
+    # it they were stored, served to this worker, and silently ignored.
+    none_at_all = (None, "no_broadcast") in claims
+    all_declined = (None, "declined") in claims
     for prefix, label in (("yt", "YouTube"), ("tw", "Twitch")):
-        if entry.get(f"no_{prefix}"):
+        platform = _PREFIX_PLATFORM[prefix]
+        # The vault's `no_yt` / `no_tw`, or the archive's claim saying the same
+        # thing. A platform that never broadcast has nothing to be missing.
+        if entry.get(f"no_{prefix}") or none_at_all or (platform, "no_broadcast") in claims:
             continue
+        # And the vault's `.×`, or the archive's claim saying the same thing.
+        # Checked once here so both the video and the chat branch below can ask
+        # the same question of either source.
+        declined = all_declined or (platform, "declined") in claims
         # VIDEO. The `.×` in the vault is a person saying "I did not keep
         # this" — both platforms get recorded and one master is usually
         # enough — and until the archive had a word for it, every audit
@@ -2285,14 +2458,23 @@ def _disk_findings(config: dict, nas: dict, entry: dict) -> list[dict]:
             out.append(_finding("ok", "disk", f"{label} video on disk",
                                 platform=prefix, short="video on disk",
                                 file=nas[f"{prefix}_video"]))
-        elif entry.get(f"{prefix}_video_x"):
+        elif entry.get(f"{prefix}_video_x") or declined:
             out.append(_finding("note", "disk", f"{label} video deliberately not kept",
                                 platform=prefix, short="video not kept",
                                 state="declined"))
         else:
+            # Missing, and nothing anywhere says why. That is the one case
+            # worth asking about rather than reporting every sweep: deleting
+            # the lower-quality copy is ordinary here, and an audit that calls
+            # it a loss every week is an audit nobody reads.
             out.append(_finding("warn", "disk", f"{label} video missing",
                                 platform=prefix, short="video MISSING",
-                                state="lost"))
+                                state="lost",
+                                question=_asked(
+                                    "video_missing", prefix,
+                                    f"The {label} video is not here. Was it "
+                                    f"kept and lost, or deliberately not kept?",
+                                    ["declined", "no_broadcast", "identified"])))
 
         # CHAT. Deep storage counts as present: the merge folded it in and
         # moved it on purpose, and calling that missing is the single most
@@ -2305,14 +2487,131 @@ def _disk_findings(config: dict, nas: dict, entry: dict) -> list[dict]:
         elif _chat_accounted(nas, prefix):
             out.append(_finding("ok", "disk", f"{label} chat folded into the merged file",
                                 platform=prefix, short="chat merged", state="kept"))
-        elif entry.get(f"{prefix}_chat_x"):
+        elif entry.get(f"{prefix}_chat_x") or declined:
             out.append(_finding("note", "disk", f"{label} chat deliberately not kept",
                                 platform=prefix, short="chat not kept",
                                 state="declined"))
         else:
             out.append(_finding("warn", "disk", f"{label} chat missing",
                                 platform=prefix, short="chat MISSING",
-                                state="lost"))
+                                state="lost",
+                                question=_asked(
+                                    "chat_missing", prefix,
+                                    f"The {label} chat is not here and was not "
+                                    f"folded into a merged file. Was there a "
+                                    f"broadcast on {label} at all?",
+                                    ["declined", "no_broadcast"])))
+    return out
+
+
+#  What each claim is called when a person has to read about it.
+_CLAIM_SAYS = {
+    ls_witness.BROADCAST_START: "the broadcast start",
+    ls_witness.RECORD_START: "the recording start",
+    ls_witness.FILE_DURATION: "the file's length",
+    ls_witness.BROADCAST_DURATION: "the broadcast's length",
+}
+
+#  Below this, a file shorter than the broadcast is the ordinary tail — a
+#  capture joined late or stopped at the end card. Above it, something was
+#  truncated and that is worth a person's time. Five minutes is a guess made
+#  once and written down rather than tuned; the number that matters is that
+#  there IS one, because without a floor this fires on every single entry.
+_TRUNCATION_FLOOR_S = 300
+
+
+def _witness_findings(timings: dict) -> list[dict]:
+    """Where the witnesses disagreed, and where there was nobody to ask.
+
+    The part of C3 a person actually sees. Until now a timing was a number
+    with a source label and no way to tell a corroborated answer from a lone
+    one — so this reports the three states worth a person's attention and
+    stays silent on the fourth, which is the common one.
+
+    Silent on a plain single-sourced exact answer, deliberately. 363 of 450
+    cached rows have exactly one clock witness; a note on each would be a
+    report that flags four fifths of the archive and is therefore read by
+    nobody. Single-sourced is recorded in the settlement for anyone who wants
+    it and is not news.
+    """
+    out = []
+    for prefix, t in sorted((timings or {}).items()):
+        #  A platform with no files at all yields None from
+        #  `_platform_timings`, and `inspect` does not store those — but a
+        #  caller assembling its own dict may, and a report is not worth a
+        #  traceback.
+        if not t:
+            continue
+        label = "YouTube" if prefix == "yt" else "Twitch"
+        settled = t.get("settled") or {}
+
+        for claim, s in sorted(settled.items()):
+            said = _CLAIM_SAYS.get(claim, claim)
+            if s.get("agreement") == ls_witness.DISAGREE:
+                #  Two independent witnesses to one question, far enough apart
+                #  that their own precision cannot explain it. This is the
+                #  thing the inversion exists to surface: before C3 the first
+                #  one answered and the second was never asked.
+                who = ", ".join(
+                    f"{w.get('label') or w['source']} {_iso(w['value'])}"
+                    if claim in (ls_witness.BROADCAST_START,
+                                 ls_witness.RECORD_START)
+                    else f"{w.get('label') or w['source']} "
+                         f"{_seconds_to_hhmmss(w['value'])}"
+                    for w in s.get("witnesses", []))
+                out.append(_finding(
+                    "warn", "assignment",
+                    f"{label}: witnesses disagree about {said} by "
+                    f"{_seconds_to_hhmmss(s.get('spread_s') or 0)} — {who}",
+                    platform=prefix, short=f"{said.split()[-1]} disputed",
+                    claim=claim, spread_s=s.get("spread_s")))
+            elif (claim == ls_witness.BROADCAST_START
+                  and s.get("agreement") == ls_witness.SINGLE
+                  and (s.get("precision_s") or 0) > ls_witness.PRECISE):
+                #  The only answer is a rounded one. Worth saying because the
+                #  number will be quietly used as though it were measured.
+                #
+                #  Scoped to the BROADCAST start and no other claim. The
+                #  recording start is bookkeeping — knowing it to the minute
+                #  changes nothing anybody does — and noting it fired on a
+                #  clean fixture, which is the noise this whole function is
+                #  trying not to be. The broadcast start is the one number
+                #  everything else is measured from.
+                out.append(_finding(
+                    "note", "assignment",
+                    f"{label}: {said} is only known to the minute, from "
+                    f"{(s.get('best') or {}).get('label') or s.get('source')}",
+                    platform=prefix, short=f"{said.split()[-1]} to the minute",
+                    claim=claim))
+
+        #  Nobody could say when it began. On Twitch that number cannot be
+        #  rebuilt once the stream ends, which is why it is worth a line
+        #  rather than an absence.
+        bs = settled.get(ls_witness.BROADCAST_START) or {}
+        if bs.get("agreement") == ls_witness.NONE:
+            out.append(_finding(
+                "note", "assignment",
+                f"{label}: nothing on hand says when the broadcast began"
+                + (" — on Twitch that is not recoverable later"
+                   if prefix == "tw" else ""),
+                platform=prefix, short="no broadcast start",
+                claim=ls_witness.BROADCAST_START))
+
+        #  The two durations are separate claims so neither overwrites the
+        #  other — which is exactly what makes comparing them meaningful. A
+        #  file much shorter than the broadcast is truncation, and the
+        #  authority table names this as the check the platform's figure is
+        #  FOR.
+        on_disk = (settled.get(ls_witness.FILE_DURATION) or {}).get("value")
+        aired = (settled.get(ls_witness.BROADCAST_DURATION) or {}).get("value")
+        if on_disk and aired and aired - on_disk > _TRUNCATION_FLOOR_S:
+            out.append(_finding(
+                "warn", "disk",
+                f"{label}: the file is {_seconds_to_hhmmss(aired - on_disk)} "
+                f"shorter than the broadcast "
+                f"({_seconds_to_hhmmss(on_disk)} of {_seconds_to_hhmmss(aired)})",
+                platform=prefix, short="capture short",
+                missing_s=aired - on_disk))
     return out
 
 
@@ -2438,6 +2737,91 @@ def _clock(ms) -> str:
     return datetime.datetime.fromtimestamp(int(ms) / 1000).strftime("%H:%M:%S")
 
 
+def media_report(config: dict, got: dict) -> dict:
+    """The measurements an audit confirms, as DATA rather than as columns.
+
+    Pulled out from under `render_media` for the same reason `inspect()` was
+    pulled out from under `audit()`: two surfaces now show these numbers — a
+    terminal and a panel on the website — and two implementations of "what is
+    the broadcast's zero" would eventually disagree about a stream's start
+    time, which is the one number in this whole system that everything else is
+    measured from.
+
+    It carries NUMBERS, not rendered strings, and that is deliberate. `_clock`
+    formats in the Pi's local timezone; the archive renders in the viewer's
+    browser using the stream's own `tz_offset_min`, and a report full of
+    pre-formatted Pi-local times would disagree with the timeline drawn six
+    inches above it. Each surface formats for itself; the measuring happens
+    once, here.
+
+    Reading a chat file costs a pass over it, so this is not free — and it was
+    not free before either, since `render_media` did exactly the same reads.
+    """
+    nas_root = config.get("nas_path", "")
+    nas, timings = got["nas"], got.get("timings") or {}
+
+    # The broadcast's own zero, which is what every offset is measured from.
+    # Earliest measured platform start, matching how `_archive_inputs` decides
+    # the stream's `started_at` — so the audit and the archive are reading the
+    # same instant.
+    zeros = [t["stream_start_epoch_ms"] for t in timings.values()
+             if t.get("stream_start_epoch_ms")]
+    zero_ms = min(zeros) if zeros else None
+
+    platforms = []
+    for prefix in ("yt", "tw"):
+        vid = (got["ids"].get("youtube" if prefix == "yt" else "twitch")
+               or (None, None))[0]
+        t = timings.get(prefix) or {}
+        # Neither an id nor a measurement means this platform is not part of
+        # this broadcast, and a row of dashes for it is noise.
+        if not vid and not timings.get(prefix):
+            continue
+        row = {
+            "platform": prefix,
+            "id": vid,
+            "stream_start_ms": t.get("stream_start_epoch_ms"),
+            "record_start_ms": t.get("record_start_epoch_ms"),
+            "duration_s": t.get("duration_secs"),
+            "duration_source": t.get("duration_source"),
+        }
+        raw = nas.get(f"{prefix}_chat")
+        if raw:
+            info = analyze_chat_file(os.path.join(nas_root, raw))
+            row["chat"] = {
+                "state": "raw", "file": raw,
+                # `analyze_chat_file` answers the string "UNKNOWN" for a file
+                # it could not parse. Kept as None here rather than passed on:
+                # a reader should not have to know that one field is sometimes
+                # a number and sometimes a word meaning "no number".
+                "count": info["count"] if isinstance(info["count"], int) else None,
+                "first": None if info["first_ts"] == "UNKNOWN" else info["first_ts"],
+                "last": None if info["last_ts"] == "UNKNOWN" else info["last_ts"],
+            }
+        elif _chat_accounted(nas, prefix):
+            row["chat"] = {"state": "merged"}
+        else:
+            row["chat"] = {"state": "none"}
+        platforms.append(row)
+
+    out = {"zero_ms": zero_ms, "platforms": platforms, "merged": None}
+
+    merged = got.get("merged")
+    if not merged:
+        return out
+    meta = _merged_chat_meta(os.path.join(nas_root, merged)) or {}
+    out["merged"] = {
+        "file": merged,
+        "sources": meta.get("chat_sources"),
+        "messages": meta.get("chat_messages"),
+        "first_ms": meta.get("chat_first_ms"),
+        "last_ms": meta.get("chat_last_ms"),
+        "archived_raws": (len(nas.get("yt_chats_archived", []))
+                          + len(nas.get("tw_chats_archived", []))),
+    }
+    return out
+
+
 def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
     """The measurements, aligned into columns, two lines per platform.
 
@@ -2450,32 +2834,26 @@ def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
 
     `-v` adds where each clock came from and how well it is known, which is
     genuinely only interesting once a number looks wrong.
+
+    The numbers come from `media_report`; this is only the columns. Provenance
+    under `-v` is read from `timings` directly, because it is the one thing
+    here the website's report deliberately does not carry.
     """
-    nas_root = config.get("nas_path", "")
-    nas, timings = got["nas"], got.get("timings") or {}
+    timings = got.get("timings") or {}
+    rep = media_report(config, got)
+    zero_ms = rep["zero_ms"]
 
-    # The broadcast's own zero, which is what every offset below is measured
-    # from. Earliest measured platform start, matching how `_archive_inputs`
-    # decides the stream's `started_at` — so the audit and the archive are
-    # reading the same instant.
-    zeros = [t["stream_start_epoch_ms"] for t in timings.values()
-             if t.get("stream_start_epoch_ms")]
-    zero_ms = min(zeros) if zeros else None
-
-    for prefix, label in (("yt", "YT"), ("tw", "TW")):
-        vid = (got["ids"].get("youtube" if prefix == "yt" else "twitch")
-               or (None, None))[0]
-        t = timings.get(prefix)
-        if not vid and not t:
-            continue
+    for row in rep["platforms"]:
+        prefix = row["platform"]
+        label = prefix.upper()
         # `—` rather than `_seconds_to_hhmmss`'s "UNKNOWN": the other columns
         # on this line already spell an absent number that way, and one row
         # reading `start — | rec — | UNKNOWN` says the same thing three ways.
-        dur = (_seconds_to_hhmmss(t.get("duration_secs"))
-               if t and t.get("duration_secs") else "—")
-        print(f"  {label}  {(vid or '—'):<14} |  "
-              f"start {_clock((t or {}).get('stream_start_epoch_ms')):<8} |  "
-              f"rec {_clock((t or {}).get('record_start_epoch_ms')):<8} |  {dur}")
+        dur = (_seconds_to_hhmmss(row["duration_s"]) if row["duration_s"] else "—")
+        print(f"  {label}  {(row['id'] or '—'):<14} |  "
+              f"start {_clock(row['stream_start_ms']):<8} |  "
+              f"rec {_clock(row['record_start_ms']):<8} |  {dur}")
+        t = timings.get(prefix)
         if verbose and t:
             # Provenance, which matters exactly when a clock looks wrong: a
             # number off a filename is a minute-accurate guess, one off a chat
@@ -2485,18 +2863,17 @@ def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
                 if src:
                     print(f"      {which.replace('_', ' '):<13}"
                           f"{src}  ±{t.get(f'{which}_accuracy') or '?'}")
-        raw = nas.get(f"{prefix}_chat")
-        if raw:
-            info = analyze_chat_file(os.path.join(nas_root, raw))
-            count = info["count"]
-            span = (f"   ({info['first_ts']} → {info['last_ts']})"
-                    if info["first_ts"] != "UNKNOWN" else "")
+        chat = row["chat"]
+        if chat["state"] == "raw":
+            span = (f"   ({chat['first']} → {chat['last']})"
+                    if chat["first"] else "")
             print("      chat  "
-                  + (f"{count:,} msgs" if isinstance(count, int) else "unreadable")
+                  + (f"{chat['count']:,} msgs" if chat["count"] is not None
+                     else "unreadable")
                   + span)
             if verbose:
-                print(f"            {raw}")
-        elif _chat_accounted(nas, prefix):
+                print(f"            {chat['file']}")
+        elif chat["state"] == "merged":
             print("      chat log merged")
         else:
             print("      chat  —")
@@ -2505,20 +2882,17 @@ def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
     # block: it is a property of the broadcast rather than of either platform,
     # and hanging it off the last platform's lines read as if it belonged to
     # that one.
-    merged = got.get("merged")
     print()
-    if not merged:
+    m = rep["merged"]
+    if not m:
         print("CHAT  not merged yet")
         print()
         return
-    meta = _merged_chat_meta(os.path.join(nas_root, merged)) or {}
-    n_arch = (len(nas.get("yt_chats_archived", []))
-              + len(nas.get("tw_chats_archived", [])))
-    print(f"CHAT merged  {merged}"
-          + (f"   {meta['chat_sources']}" if meta.get("chat_sources") else ""))
+    print(f"CHAT merged  {m['file']}"
+          + (f"   {m['sources']}" if m.get("sources") else ""))
     line2 = []
-    if meta.get("chat_messages"):
-        line2.append(f"{meta['chat_messages']:,} msgs")
+    if m.get("messages"):
+        line2.append(f"{m['messages']:,} msgs")
     # OFFSETS from the broadcast start, not wall clock. The stored numbers are
     # absolute — they have to be, holding two platforms whose zeros differ —
     # and rendering them as wall times made a correct 11h36m span read as
@@ -2527,21 +2901,21 @@ def render_media(config: dict, got: dict, *, verbose: bool = False) -> None:
     # begin nine hours early. Said as an offset it reads as what it is, and it
     # matches the raw chat lines above rather than inventing a second
     # convention. Wall clock is under -v for anyone who wants the clock.
-    if meta.get("chat_first_ms") and meta.get("chat_last_ms"):
+    if m.get("first_ms") and m.get("last_ms"):
         if zero_ms:
             line2.append(
-                f"({_seconds_to_hhmmss((meta['chat_first_ms'] - zero_ms) // 1000)}"
-                f" → {_seconds_to_hhmmss((meta['chat_last_ms'] - zero_ms) // 1000)})")
+                f"({_seconds_to_hhmmss((m['first_ms'] - zero_ms) // 1000)}"
+                f" → {_seconds_to_hhmmss((m['last_ms'] - zero_ms) // 1000)})")
         else:
-            line2.append(f"({_clock(meta['chat_first_ms'])}"
-                         f" → {_clock(meta['chat_last_ms'])})")
+            line2.append(f"({_clock(m['first_ms'])} → {_clock(m['last_ms'])})")
     if line2:
         print(f"             {'   '.join(line2)}")
-    if verbose and meta.get("chat_first_ms"):
-        print(f"             wall {_clock(meta['chat_first_ms'])}"
-              f" → {_clock(meta['chat_last_ms'])}")
-    if n_arch:
-        print(f"             {n_arch} raw{'s' if n_arch != 1 else ''} in deep storage")
+    if verbose and m.get("first_ms"):
+        print(f"             wall {_clock(m['first_ms'])}"
+              f" → {_clock(m['last_ms'])}")
+    if m["archived_raws"]:
+        n = m["archived_raws"]
+        print(f"             {n} raw{'s' if n != 1 else ''} in deep storage")
     print()
 
 
@@ -2607,7 +2981,8 @@ def worst(findings: list[dict]) -> str:
 def inspect(config: dict, index: int, *,
             yt_override: str | None = None,
             tw_override: str | None = None,
-            cache: list[dict] | None = None) -> dict:
+            cache: list[dict] | None = None,
+            claims: list[dict] | None = None) -> dict:
     """Everything an audit knows about one entry. Prints nothing, asks nothing.
 
     The return value is the whole of what the CLI renders, what a job report
@@ -2616,7 +2991,12 @@ def inspect(config: dict, index: int, *,
     """
     out = {"index": int(index), "ok": False, "reason": None, "findings": [],
            "entry": None, "nas": None, "ids": {}, "block": None,
-           "stream_fields": None, "captures": None}
+           "stream_fields": None, "captures": None, "questions": []}
+
+    # What the archive has already been told, if the caller fetched it. Kept
+    # optional so `inspect` still works from a terminal with no archive
+    # reachable — the same reason it takes `cache` rather than loading one.
+    known = _claims_index(claims)
 
     entry = ls_common.obsidian_parse_entry(config, index)
     if not entry["found"]:
@@ -2641,9 +3021,14 @@ def inspect(config: dict, index: int, *,
         ids["twitch"] = resolve_id(config, cache, "twitch", entry, nas, tw_override)
     out["ids"] = ids
 
-    out["findings"] = (_disk_findings(config, nas, entry)
+    out["findings"] = (_disk_findings(config, nas, entry, known)
                        + _platform_findings(cache, ids, entry)
                        + _assignment_findings(cache, ids, entry))
+    # Lifted out flat for a caller that wants the questions and not the whole
+    # report — the plan that goes home, and eventually the panel. They stay on
+    # their findings too, because the finding is where the context is.
+    out["questions"] = [f["detail"]["question"] for f in out["findings"]
+                        if f.get("detail", {}).get("question")]
 
     # The measurements, kept so the renderer does not have to re-derive them.
     # `_platform_timings` reads chat files and shells out to ffprobe; asking it
@@ -2655,6 +3040,11 @@ def inspect(config: dict, index: int, *,
         t = _platform_timings(config, cache, nas, prefix, platform)
         if t:
             out["timings"][prefix] = t
+    #  What the witnesses could not agree on, which is the product of C3 and
+    #  is computed here rather than in `_platform_timings` because it needs
+    #  both platforms' settlements in hand. Appended after the three checks
+    #  and before `worst`, so a disagreement can raise an entry's level.
+    out["findings"] += _witness_findings(out["timings"])
     out["merged"] = find_merged_chat(config.get("nas_path", ""), index)
 
     yt_id = (ids.get("youtube") or (None, None))[0]
@@ -2666,6 +3056,107 @@ def inspect(config: dict, index: int, *,
     out["ok"] = True
     out["worst"] = worst(out["findings"])
     return out
+
+
+def finish(config: dict, index: int,
+           cache: list[dict] | None = None) -> dict:
+    """The deterministic half of an audit: sidecar, merged chat, raws archived.
+
+    What `inspect()` is to the checks, this is to the work: the door a caller
+    with nobody sitting at it comes in by. `audit()` still calls `_pipeline`
+    directly, because it is the interactive one and has a terminal to ask at.
+
+    Deterministic is the whole claim and it is worth being precise about.
+    `cmd_timings` derives the entry's clocks from files already on disk.
+    `ls_chat.merge` UNIONS every source rather than preferring one, so there
+    is no wrong side for it to come down on — two captures of one chat merge
+    to the same file whichever order they arrive in. Neither asks anything and
+    neither has an editorial opinion, which is why they can run without a
+    person the way a rescan can and an id resolution cannot.
+
+    Nothing is downloaded. A chat short enough to want repairing comes back in
+    `deferred` instead, because spending somebody's bandwidth is a decision
+    and this function has nobody to take it.
+
+    Returns {"changed": bool, "deferred": [...]}. `changed` means a file
+    actually appeared or was rewritten — the caller re-reads the entry on it,
+    so claiming work that did not happen costs a wasted second pass.
+    """
+    deferred: list = []
+    cache = ls_common.load_cache() if cache is None else cache
+    changed = _pipeline(config, cache, index, interactive=False,
+                        deferred=deferred)
+    return {"changed": bool(changed), "deferred": deferred}
+
+
+def repair(config: dict, index: int, platform: str,
+           cache: list[dict] | None = None) -> dict:
+    """Run the one repair `finish()` declined, because somebody said yes.
+
+    The other half of the rule. `finish()` refuses to download because nobody
+    authorised it; this runs because somebody did, and it is the only door in
+    this file that pulls with no terminal attached. Everything that makes that
+    safe is upstream of here — the work arrives as a job, one platform at a
+    time, queued by a click — so this stays a small thing that does exactly
+    what it was told and then lets the deterministic half finish.
+
+    The shortfall is checked AGAIN rather than taken from whoever asked. A
+    question can sit in a panel for a week; by the time it is answered the
+    chat may have been repaired from a terminal, and downloading a second copy
+    of something already merged is the kind of work nobody notices is wasted.
+
+    Returns {"ran", "changed", "deferred", "why"} — `ran` False with a `why`
+    is the honest no-op, not a failure.
+    """
+    if platform not in ("youtube", "twitch"):
+        return {"ran": False, "changed": False, "deferred": [],
+                "why": f"unknown platform {platform!r}"}
+    cache = ls_common.load_cache() if cache is None else cache
+    nas = scan_nas(config, index)
+    if platform == "youtube":
+        yt_id = (ls_common.extract_video_id_from_filename(nas["yt_chat"])
+                 if nas.get("yt_chat") else None)
+        short = _yt_chat_shortfall(config, cache, nas, yt_id)
+    else:
+        tw_id = (ls_common.extract_video_id_from_filename(nas["tw_chat"])
+                 if nas.get("tw_chat") else None)
+        short = _tw_chat_shortfall(config, cache, nas, tw_id, index)
+    if not short:
+        # Not a failure. The entry is in the state the asker wanted it in, and
+        # the merge below may still have something to do.
+        done = finish(config, index, cache=cache)
+        return {"ran": False, "changed": done["changed"],
+                "deferred": done["deferred"],
+                "why": f"the {platform} chat is no longer short"}
+
+    run = _backfill_yt_chat if platform == "youtube" else _backfill_tw_chat
+    ok = bool(run(config, short))
+    # Either way, finish what can be finished. A Twitch pull that failed does
+    # not hold the merge back — the union happens in the merge and a later
+    # pull re-merges to the full thing — and a YouTube one that failed will
+    # block it there, which is `_pipeline`'s call and not this function's.
+    done = finish(config, index, cache=cache)
+    return {"ran": ok, "changed": done["changed"],
+            "deferred": done["deferred"],
+            "why": None if ok else f"the {platform} repair did not come back"}
+
+
+def give_up_chat(index: int, platform: str) -> dict:
+    """Stop waiting for this entry's chat on this platform.
+
+    The other answer to a short chat, and the one that costs nothing: a chat
+    that can never be placed is not repaired by being asked about every sweep
+    for the rest of time. Wraps `cmd_give_up_chat` rather than replacing it —
+    the terminal has offered this since the merge learned to ask, the ledger
+    is the same file, and undoing it is still deleting a line from it.
+    """
+    if platform not in ("youtube", "twitch"):
+        return {"ok": False, "why": f"unknown platform {platform!r}"}
+    cmd_give_up_chat(index, platform, why="let go from the archive")
+    # Read back rather than trusting the write: `cmd_give_up_chat` prints its
+    # refusals and returns None either way, so this is the only way to answer
+    # the caller honestly.
+    return {"ok": bool(chat_given_up(index, platform)), "why": None}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

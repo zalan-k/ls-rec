@@ -45,6 +45,18 @@ OUTBOX_PATH = os.path.join(SCRIPT_DIR, ".archive_outbox.json")
 # exist. Same file shape, separate file, so a stalled archive and a slow VOD
 # cannot block each other.
 PENDING_PATH = os.path.join(SCRIPT_DIR, ".archive_pending_ids.json")
+# Packets the archive REFUSED, which is a third thing again. The outbox holds
+# what could not be delivered and will be retried; this holds what was
+# delivered and rejected, which must not be retried — an identical bad packet
+# resent forever is worse than a dropped one.
+#
+# It exists because dropping one was not free. A start packet carries the
+# broadcast start off the live probe, and that payload is discarded after the
+# call; on Twitch the number cannot be recovered once the stream ends. Before
+# this, a 4xx left it in vods.json and nowhere else — and vods.json is a cache
+# that is being retired. A dead letter costs a few hundred bytes and means the
+# one unrepeatable measurement in the system survives being refused.
+REFUSED_PATH = os.path.join(SCRIPT_DIR, ".archive_refused.json")
 
 TIMEOUT = 6          # seconds; the archive is never worth waiting on
 OUTBOX_MAX = 500     # packets; beyond this something is wrong, not backlogged
@@ -147,6 +159,31 @@ def _queue(body: dict, why: str) -> None:
                    f"({len(items)} waiting)")
 
 
+def _refused(body: dict, why: str) -> None:
+    """Keep a packet the archive rejected. Never retried, only kept.
+
+    Appended rather than replaced, and never cleared automatically: the file is
+    small, and the moment to look at it is weeks later when something is
+    missing. Its own failure is swallowed for the same reason `_queue`'s is —
+    a recording must not come down over a bookkeeping write.
+    """
+    try:
+        items = []
+        if os.path.exists(REFUSED_PATH):
+            with open(REFUSED_PATH, encoding="utf-8") as f:
+                got = json.load(f)
+            if isinstance(got, list):
+                items = got
+        items.append({"refused_at": int(datetime.datetime.now().timestamp()),
+                      "why": why, "body": body})
+        tmp = REFUSED_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items[-OUTBOX_MAX:], f, ensure_ascii=False, indent=1)
+        os.replace(tmp, REFUSED_PATH)
+    except Exception as e:
+        logger.warning(f"could not write the refused-packet file: {e}")
+
+
 # ── the wire ──────────────────────────────────────────────────────────────
 
 def _headers(config: dict) -> dict:
@@ -191,6 +228,10 @@ def _send(config: dict, body: dict, *, queue_on_failure: bool = True) -> dict | 
             _queue(body, f"HTTP {e.code}")
         else:
             logger.error(f"archive refused the packet: HTTP {e.code} {detail}")
+            # Logged AND kept. The log scrolls; this does not. A refused start
+            # packet is the one case where dropping costs a measurement nothing
+            # can rebuild — see REFUSED_PATH.
+            _refused(body, f"HTTP {e.code} {detail}".strip())
         return None
     except Exception as e:
         if queue_on_failure:

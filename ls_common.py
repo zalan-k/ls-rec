@@ -580,6 +580,83 @@ def offline_pull_name(safe_title: str) -> str:
     return f"{safe_title}{OFFLINE_PULL_TAG}.json"
 
 
+# ── the timings sidecar ───────────────────────────────────────────────────
+#
+# Two programs write these and they are not the same kind of object, which is
+# the whole reason this lives in one place.
+#
+#   written_by: recorder   a claim made AT THE TIME by the only party present.
+#                          Immutable: it said what it said. The broadcast start
+#                          in it is the one number nothing can re-derive later —
+#                          the live probe's payload is discarded after the call,
+#                          and on Twitch it is gone for good once the stream
+#                          ends. This is its local durable copy, which is why it
+#                          is written whether or not the archive accepted
+#                          anything, and especially when the archive refused.
+#
+#   written_by: audit      a DERIVATION from files, caches and logs, possibly
+#                          years later. Worth nothing as evidence — it is the
+#                          audit's own earlier conclusion — and refreshable,
+#                          because its inputs move: a chat backfill, a merge, a
+#                          corrected id. Reading one back as a witness is
+#                          circular; it can only ever agree with last time.
+#
+# Same filename either way, opposite weight, so the stamp is not decoration.
+# `.meta.json` is already in ls_chat.DERIVED_SUFFIXES, so these are invisible
+# to scan_nas and to the merge and cannot be mistaken for a capture.
+
+META_VERSION = 1
+
+
+def meta_name(stem: str) -> str:
+    """Sidecar filename for the recording called `stem`."""
+    return f"{stem}.meta.json"
+
+
+def write_meta(path: str, doc: dict, *, by: str) -> dict:
+    """Stamp a sidecar and put it down atomically. Returns what was written.
+
+    tmp-then-rename because this is a durable record of something
+    unrepeatable: a half-written sidecar from an interrupted write would be a
+    file that parses as nothing and reads as "the recorder never said".
+    """
+    if by not in ("recorder", "audit"):
+        raise ValueError(f"a sidecar is written by the recorder or the audit, not {by!r}")
+    stamped = {"meta_version": META_VERSION, "written_by": by,
+               "written_at": int(datetime.datetime.now().timestamp()), **doc}
+    tmp = f"{path}.part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(stamped, f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return stamped
+
+
+def read_meta(path: str) -> dict | None:
+    """A sidecar, or None if it is absent or unreadable.
+
+    Unreadable reads as absent on purpose: every caller's next move is to write
+    a fresh one, and a file that cannot be parsed is not evidence of anything.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def meta_is_recorder(doc: dict | None) -> bool:
+    """Is this a contemporaneous claim rather than a derivation?
+
+    Absent `written_by` means audit-written: every sidecar that existed before
+    this stamp did was written by `cmd_timings`, and guessing the other way
+    would promote the whole back catalogue to evidence in one line.
+    """
+    return bool(doc) and doc.get("written_by") == "recorder"
+
+
 def find_confirmed_vod(cache: list[dict], video_id: str,
                        platform: str | None = None) -> dict | None:
     """`find_vod`, but a broadcast row does not count as knowing the id.

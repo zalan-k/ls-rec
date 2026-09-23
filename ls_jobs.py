@@ -1775,13 +1775,60 @@ def do_audit(config: dict, job: dict):
     except Exception as e:
         return ("failed", None, f"this worker cannot run audits: {e}", None)
 
+    # What the archive has already been told about this entry, so a question
+    # somebody has answered is not asked again. Read through the same
+    # read-before-write `lookup` the plan uses a moment later, which carries
+    # the claims with everything else — a second call would be a second thing
+    # to remember, and the one that gets skipped.
+    #
+    # Never fatal: an archive that cannot be reached means the audit reports
+    # what it always did. Losing the answers costs a repeated question; losing
+    # the audit costs the run.
+    known = None
     try:
-        got = ls_audit.inspect(config, idx)
+        seen = ls_archive.lookup(config, idx=idx)
+        known = ((seen or {}).get("stream") or {}).get("claims")
+    except Exception as e:
+        logger.warning("audit %s: could not read claims: %s", idx, e)
+
+    try:
+        got = ls_audit.inspect(config, idx, claims=known)
     except Exception as e:
         logger.exception("audit %s failed", idx)
         return ("failed", None, f"{type(e).__name__}: {e}", None)
     if not got.get("ok"):
         return ("failed", None, got.get("reason") or "the entry could not be read", None)
+
+    # The deterministic half of what the terminal's audit does: the timings
+    # sidecar and the chat merge. Both local, both with no editorial question
+    # in them — `ls_chat.merge` unions every source rather than preferring
+    # one, so there is no wrong side to come down on — which is the same
+    # reason `rescan` writes straight to the capture rows.
+    #
+    # Nothing is downloaded. A chat short enough to want repairing comes back
+    # as a deferral and is reported, because spending bandwidth is a decision
+    # and there is nobody here to take it.
+    #
+    # Never fatal, and this is the important part: a merge that cannot be
+    # written leaves the entry exactly as it was, and the inspection above
+    # still describes it. Losing the merge costs a re-run; failing the job
+    # would cost the whole audit over the half that was only ever a bonus.
+    deferred = []
+    try:
+        done = ls_audit.finish(config, idx, cache=got.get("cache"))
+        deferred = done["deferred"]
+        if done["changed"]:
+            # Something landed on disk, so the plan has to describe the entry
+            # as it is NOW. Without this the archive would be told about a
+            # chat this very run merged, and propose a change already made.
+            got = ls_audit.inspect(config, idx, claims=known)
+            if not got.get("ok"):
+                return ("failed", None,
+                        got.get("reason") or "the entry could not be re-read", None)
+    except Exception as e:
+        logger.exception("audit %s: the merge half failed", idx)
+        deferred.append({"kind": "pipeline_failed", "platform": None,
+                         "why": [f"{type(e).__name__}: {e}"]})
 
     # Per-platform captures, keyed by PLATFORM and remote_id and never by row
     # id. The archive addresses its own rows; a worker that named them could
@@ -1804,25 +1851,163 @@ def do_audit(config: dict, job: dict):
                 out[dst] = out.pop(src)
         caps.append(out)
 
+    # Trimmed to what a reader needs. The full finding carries a `detail`
+    # dict that is useful in a terminal and is noise in a log line.
+    findings = [{"level": f["level"], "check": f["check"],
+                 "platform": f.get("platform"), "message": f["message"],
+                 "short": f.get("short")}
+                for f in (got.get("findings") or [])]
+
+    # What did not happen, in two places and for two different readers. A
+    # deferral is not a finding — a finding says what is TRUE about the entry
+    # and this is work the entry is WAITING ON — so it goes in the report as a
+    # note for whoever reads the log, and in the questions as something with
+    # answers, for whoever has to decide. The note alone was where this landed
+    # first, and a repair somebody can only read about is a repair that never
+    # happens.
+    questions = list(got.get("questions") or [])
+    for d in deferred:
+        if d.get("kind") == "pipeline_failed":
+            findings.append({
+                "level": "warn", "check": "disk", "platform": None,
+                "message": "the chat merge did not run: "
+                           + "; ".join(d.get("why") or ["no reason given"]),
+                "short": "merge failed"})
+            # Deliberately not a question. Nobody can answer "the filesystem
+            # said no" — it is for the person who reads the log and fixes the
+            # mount, and offering it as a decision would be offering one that
+            # cannot be taken.
+            continue
+        yt = d.get("platform") == "youtube"
+        label = "YouTube" if yt else "Twitch"
+        findings.append({
+            "level": "note", "check": "disk", "platform": "yt" if yt else "tw",
+            "message": f"{label} chat is short and the repair was not run "
+                       "— nothing is downloaded unattended",
+            "short": "repair deferred"})
+        # How short, in the question itself: the whole decision is whether the
+        # missing part is worth a download, and a question that does not say
+        # how much is missing is a question nobody can answer without going to
+        # look. `repair` fetches it; `give_up` is the answer for a chat that
+        # can never be placed, which is what the terminal's --give-up-chat has
+        # always been for and which stops every sweep asking again forever.
+        miss = d.get("shortfall_secs")
+        how = f" — about {int(miss // 60)} minutes of it are missing" if miss else ""
+        questions.append({
+            "kind": "chat_backfill", "platform": d.get("platform"),
+            "message": f"The {label} chat stops well before the video does{how}. "
+                       "Download the rest from the replay, or stop waiting for it?",
+            "answers": ["repair", "give_up"]})
+
     plan = {
         "idx": idx,
-        "worst": got.get("worst", "ok"),
-        # Trimmed to what a reader needs. The full finding carries a `detail`
-        # dict that is useful in a terminal and is noise in a log line.
-        "findings": [{"level": f["level"], "check": f["check"],
-                      "platform": f.get("platform"), "message": f["message"],
-                      "short": f.get("short")}
-                     for f in (got.get("findings") or [])],
+        # The louder of the two halves, never just one. `inspect()` worked its
+        # own out before the merge ran and cannot know that it failed, so
+        # taking its answer alone would report `ok` on a run that just told
+        # the archive a merge broke. Recomputing over the trimmed list alone
+        # would be right too — `inspect` derives its `worst` from these very
+        # findings — but only for as long as that stays true, and leaning on
+        # an invariant in another function to get a severity right is how a
+        # report ends up quieter than its own contents. Taking the max of both
+        # costs one list entry and needs no invariant at all.
+        "worst": ls_audit.worst(findings + [{"level": got.get("worst", "ok")}]),
+        "findings": findings,
+        # What the evidence could not settle, plus what it would not do on its
+        # own. Carried separately from the findings, which are trimmed to a log
+        # line on purpose — a question has to survive the trip whole, because
+        # the answers it lists are what somebody is going to be offered.
+        "questions": questions,
         "stream": got.get("stream_fields") or {},
         "captures": caps,
     }
+
+    # The MEASUREMENTS, which until now never left this machine. An audit's
+    # findings say what is wrong; its measurements are what somebody reads to
+    # decide whether a run went well — the two platform clocks, the durations,
+    # how much chat there is and whether it got merged. A report that is only
+    # verdicts is a receipt: it says eight checks passed without showing that
+    # any of the numbers behind them is plausible.
+    #
+    # Numbers rather than the CLI's rendered columns: `_clock` formats in this
+    # machine's timezone, and the archive draws the same instants in the
+    # viewer's, beside a timeline that uses the stream's own offset. One
+    # measuring, two renderings.
+    #
+    # Never fatal. It reads chat files, and a chat file that cannot be read is
+    # a report with a gap in it, not an audit that failed.
+    try:
+        plan["report"] = ls_audit.media_report(config, got)
+    except Exception as e:
+        logger.warning("audit %s: could not measure: %s", idx, e)
+
     return ("done", None, None, plan)
+
+
+def do_chat_repair(config: dict, job: dict):
+    """Fetch the chat an audit would not fetch, because somebody said to.
+
+    The audit refuses to download with nobody watching — a click on a web page
+    is an unattended caller like any other — so a chat too short to merge comes
+    home as a question. This is what saying yes to it runs, and it is the only
+    job kind whose whole purpose is to open an outbound socket.
+
+    Two actions, one kind, because they are the two answers to one question:
+    `repair` goes and gets it; `give_up` stops waiting for it. The second
+    spends nothing and is still the Pi's job, because the ledger it writes
+    lives beside the recorder.
+
+    `ls_audit` is imported HERE for the same reason `do_audit` does it: it
+    pulls ls_chat and ls_assets behind it, and an import error in this path
+    should not stop a promote from running.
+    """
+    payload = job.get("payload", {}) or {}
+    try:
+        idx = int(payload.get("idx"))
+    except (TypeError, ValueError):
+        return ("failed", None, "the job does not name an entry", None)
+    platform = str(payload.get("platform") or "").lower()
+    action = str(payload.get("action") or "repair")
+    if platform not in ("youtube", "twitch"):
+        return ("failed", None,
+                f"the job names no platform to repair (got {platform!r})", None)
+    if action not in ("repair", "give_up"):
+        return ("failed", None, f"this worker does not do {action!r}", None)
+
+    try:
+        import ls_audit
+    except Exception as e:
+        return ("failed", None, f"this worker cannot repair chat: {e}", None)
+
+    try:
+        if action == "give_up":
+            out = ls_audit.give_up_chat(idx, platform)
+            if not out["ok"]:
+                return ("failed", None, out.get("why") or "could not write "
+                        "the give-up ledger", None)
+            return ("done", None, None,
+                    {"idx": idx, "platform": platform, "action": action})
+        out = ls_audit.repair(config, idx, platform)
+    except Exception as e:
+        logger.exception("chat repair %s %s failed", idx, platform)
+        return ("failed", None, f"{type(e).__name__}: {e}", None)
+
+    # A repair that came back empty-handed is a FAILED job, not a quiet one:
+    # somebody clicked a button and is owed an answer either way, and "the
+    # replay chat is not ready yet" is a thing they can act on by waiting.
+    # The no-op — nothing was short any more — is a success, because the
+    # entry is in the state they asked for.
+    if not out["ran"] and out.get("why") and "no longer short" not in out["why"]:
+        return ("failed", None, out["why"], None)
+    return ("done", None, None,
+            {"idx": idx, "platform": platform, "action": action,
+             "ran": out["ran"], "merged": out["changed"], "why": out.get("why")})
 
 
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
             "rescan": do_rescan, "harvest": do_harvest,
             "music_probe": do_music_probe, "music_fetch": do_music_fetch,
-            "clip": do_clip, "audit": do_audit}
+            "clip": do_clip, "audit": do_audit,
+            "chat_repair": do_chat_repair}
 
 _stop = False
 
