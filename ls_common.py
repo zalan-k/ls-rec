@@ -613,6 +613,29 @@ def meta_name(stem: str) -> str:
     return f"{stem}.meta.json"
 
 
+def entry_meta_name(index: int) -> str:
+    """Sidecar filename for the AUDIT's per-entry aggregate.
+
+    Not `meta_name` of anything, and that is the point. `meta_name` names a
+    file after a RECORDING, which is right for the recorder's sidecar — one
+    per capture, describing that capture. The audit's document is a different
+    shape: one per ENTRY, holding every platform at once.
+
+    It used to borrow a recording's name anyway, picking whichever platform
+    came first: a dual stream got the YouTube title on a document describing
+    both, sitting beside two capture stems that looked like its siblings and
+    were not. Worse, the name was a function of WHAT WAS FOUND — move or
+    retitle those files and the next refresh wrote a differently named file
+    and orphaned the old one, leaving two aggregates for one entry with
+    nothing to say which was current.
+
+    `NNN_meta.json` matches `NNN_merged-chat.json.gz`, the other per-entry
+    derivation, and cannot collide with a recorder sidecar: those keep the
+    `[id] @ date_time` the filename carries.
+    """
+    return f"{int(index):03d}_meta.json"
+
+
 def write_meta(path: str, doc: dict, *, by: str) -> dict:
     """Stamp a sidecar and put it down atomically. Returns what was written.
 

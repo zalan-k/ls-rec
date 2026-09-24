@@ -1122,6 +1122,85 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
     }
 
 
+def _old_entry_metas(nas_root: str, index: int, keep: str) -> list[str]:
+    """Aggregates for this entry sitting under the old per-recording name.
+
+    Identified POSITIVELY — by what the document says about itself — and not
+    by ruling the recorder out. The glob `NNN_*.meta.json` matches the
+    recorder's sidecars too, since a capture's filename starts with the same
+    index, and `meta_is_recorder` answers False for a file it could not read.
+    Negative identification would therefore rename a CORRUPT recorder sidecar,
+    which is the one file in this tree that cannot be rebuilt.
+
+    So: it must parse, it must carry the audit's own `schema`/`index` pair,
+    and it must not be stamped as the recorder's. A recorder document has
+    `platform`, `video_id` and `obsidian_index` and none of those.
+    """
+    if not nas_root or not os.path.isdir(nas_root):
+        return []
+    out = []
+    for name in sorted(os.listdir(nas_root)):
+        path = os.path.join(nas_root, name)
+        if path == keep or not name.endswith(".meta.json"):
+            continue
+        if not name.startswith(f"{int(index):03d}_"):
+            continue
+        doc = ls_common.read_meta(path)
+        if not doc or ls_common.meta_is_recorder(doc):
+            continue
+        try:
+            if int(doc.get("index", -1)) != int(index) or "schema" not in doc:
+                continue
+        except (TypeError, ValueError):
+            continue
+        out.append(path)
+    return out
+
+
+def _migrate_entry_meta(nas_root: str, index: int, target: str) -> None:
+    """Move this entry's aggregate onto `NNN_meta.json`, once.
+
+    A rename rather than a rewrite-and-delete: it loses nothing, it is
+    reversible by hand, and it means the `already current` check below
+    compares against the content that was really there instead of rewriting
+    every entry in the archive on one sweep just to change a filename.
+
+    Refuses rather than guesses in both of the ways this can be ambiguous:
+
+      · TWO candidates means the old name already flipped between platforms
+        at some point, so there are two aggregates and no way from here to
+        know which one is the entry's current truth. Picking would be picking
+        at random.
+      · The target already existing means something newer is there. Renaming
+        over it with `os.replace` would silently destroy it.
+
+    Both print and leave every file where it is. Nothing is deleted here,
+    now or later — the worst case is litter somebody reads and removes.
+    """
+    olds = _old_entry_metas(nas_root, index, target)
+    if not olds:
+        return
+    if len(olds) > 1:
+        print(f"  ! {len(olds)} old-format sidecars for #{index}, so which one "
+              f"is current cannot be known from here — left alone:")
+        for p in olds:
+            print(f"      {os.path.basename(p)}")
+        return
+    if os.path.exists(target):
+        print(f"  ! {os.path.basename(olds[0])} is the old name for "
+              f"{os.path.basename(target)}, which already exists — left alone")
+        return
+    try:
+        os.replace(olds[0], target)
+        print(f"  · renamed {os.path.basename(olds[0])} "
+              f"→ {os.path.basename(target)}")
+    except OSError as e:
+        # Never fatal. The sidecar is about to be written under the new name
+        # regardless, and a rename that failed leaves a readable file behind
+        # rather than losing one.
+        print(f"  ! could not rename {os.path.basename(olds[0])}: {e}")
+
+
 def cmd_timings(config: dict, index: int, output: str | None = None,
                 dry_run: bool = False):
     """Write a timings sidecar for one entry."""
@@ -1167,10 +1246,12 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
         return False
 
     if not output:
-        src_name = (doc.get("youtube") or doc.get("twitch"))["files"]
-        stem = _title_from_filename(src_name["chat"] or src_name["video"])
         output = os.path.join(config.get("nas_path", ""),
-                              ls_common.meta_name(f"{int(index):03d}_{stem}"))
+                              ls_common.entry_meta_name(index))
+        # Whatever this entry's aggregate was called before it was called
+        # that. Only on the default path: a caller that named a file meant
+        # that file.
+        _migrate_entry_meta(config.get("nas_path", ""), index, output)
 
     # A recorder-written sidecar is not ours to touch. It is a contemporaneous
     # claim by the only party present, and this one is a derivation from files

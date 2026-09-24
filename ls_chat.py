@@ -47,6 +47,14 @@ YT_MESSAGE_RENDERERS = (
 # so files already on the NAS stay recognised.
 DERIVED_SUFFIXES = (".chat.json", ".posthoc.json", ".live.json", ".merging",
                     ".archive", "merged-chat.json", ".meta.json",
+                    # The audit's per-entry aggregate, `NNN_meta.json`. Listed
+                    # SEPARATELY from `.meta.json` and without a leading dot,
+                    # for the same reason `merged-chat.json` above has none:
+                    # the separator is the entry number's underscore, so
+                    # `744_meta.json` does not end in `.meta.json` and the
+                    # recorder's entry would never match it. Without this line
+                    # scan_nas reads the sidecar as a capture.
+                    "_meta.json",
                     ".unified.json", ".merged.json", ".timings.json")
 
 
