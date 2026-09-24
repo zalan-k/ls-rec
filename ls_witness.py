@@ -428,16 +428,36 @@ DISAGREE = "disagree"
 NONE = "none"
 
 
+#  Two sources that both claim the second still will not agree ON the second.
+#  A platform reports when its ingest went live; a chat file's zero is derived
+#  from the first message the chat service stamped. Those are different events
+#  a few seconds apart, and no amount of precision on either side closes the
+#  gap — so with a floor of 1 they DISAGREE for ever, on every healthy entry
+#  in the archive.
+#
+#  Entry #716 is the case: cache 10:59:28 and chat 10:59:25, reported as a
+#  warning reading "witnesses disagree about the broadcast start by 00:00:02".
+#  Nothing was wrong and nothing was actionable, which is the definition of
+#  the noise that makes a report stop being read.
+#
+#  `precision_s` answers "how finely can this source STATE a number". It was
+#  being asked "how closely should two different methods agree", which is a
+#  different question, and conflating them is what put the warning there.
+CLOCK_SLOP_S = 10
+
+
 def tolerance_s(witnesses: list[dict]) -> int:
     """How far apart two measurements may be and still be the same one.
 
-    The COARSEST witness sets it. Two sources one minute apart are in
-    agreement when one of them is a filename that only knows minutes, and in
-    disagreement when both claim to know the second — the same numbers, and
-    the difference is what they were able to measure, which is exactly what
-    `precision_s` is for.
+    The COARSEST witness sets it, over a floor. Two sources one minute apart
+    are in agreement when one of them is a filename that only knows minutes,
+    and in disagreement when both claim to know the second — the same
+    numbers, and the difference is what they were able to measure, which is
+    exactly what `precision_s` is for.
+
+    The floor is what `precision_s` cannot express: see `CLOCK_SLOP_S`.
     """
-    return max([w["precision_s"] for w in witnesses] or [PRECISE])
+    return max([w["precision_s"] for w in witnesses] + [CLOCK_SLOP_S])
 
 
 def settle(claim: str, witnesses: list[dict]) -> dict:

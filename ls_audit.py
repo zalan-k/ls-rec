@@ -1065,11 +1065,12 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
     # legitimately — a VOD trimmed at the far end, a capture that started late
     # or died early — and the disagreement is a finding rather than noise.
     # They are two CLAIMS now, so nothing has to choose between them.
+    measured = None
     if video_file:
         vp = os.path.join(nas_root, video_file)
         if os.path.exists(vp):
-            ws += ls_witness.read_ffprobe(
-                analyze_video_file(vp).get("duration_secs"))
+            measured = analyze_video_file(vp).get("duration_secs")
+            ws += ls_witness.read_ffprobe(measured)
 
     stream = ls_witness.settle(ls_witness.BROADCAST_START, ws)
     record = ls_witness.settle(ls_witness.RECORD_START, ws)
@@ -1117,9 +1118,157 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
         # `ffprobe` means the file on disk; `cache` means the platform's own
         # number for the broadcast. See the note above the assignment.
         "duration_source": duration_src,
+        # The raw ffprobe reading, kept beside the settlement. The
+        # reconciler below compares PLATFORMS against each other and needs
+        # what each file actually measured, not what each settled on.
+        "measured_duration_s": measured,
         "filename_epoch_ms": fname_ms,
         "files": {"video": video_file, "chat": chat_file},
     }
+
+
+def _length_findings(config: dict, nas: dict, timings: dict) -> list[dict]:
+    """One recording's length denied by the other's.
+
+    This is the loudest thing an audit can find about an entry and it had no
+    voice at all. Entry #716: YouTube ffprobes at 6:25:11, Twitch at 2:08:10,
+    and every check downstream believed the first — the chat looked 254
+    minutes short, so the entry asked whether to download four hours of replay
+    chat that has never existed.
+
+    Suppressing that question without saying WHY would only move the problem:
+    the entry would go quiet while still carrying a length that is wrong in
+    the vault, on its card, and in the timeline. So the dispute is reported
+    here, in the one sentence a person needs — both numbers, and what else
+    agrees with which.
+
+    `_reconcile_durations` deliberately does not act on this case: with the
+    two recordings this far apart, neither is evidence about the other, and
+    the archive cannot tell the bugged file from the capture that died early.
+    A person can, in a second, from the numbers below.
+    """
+    got = {k: t.get("measured_duration_s") for k, t in (timings or {}).items()
+           if t and t.get("measured_duration_s")}
+    if len(got) < 2:
+        return []
+    lo_k = min(got, key=got.get)
+    hi_k = max(got, key=got.get)
+    if got[hi_k] - got[lo_k] <= _TRUNCATION_FLOOR_S:
+        return []
+    name = {"yt": "YouTube", "tw": "Twitch"}
+
+    #  What else there is to go on, said in the same breath. A chat's last
+    #  message is a LOWER bound on how long the broadcast ran — a chat can be
+    #  cut off, so it can never prove a recording too long — but when it lands
+    #  next to the shorter file it says which of the two to believe, and that
+    #  is the whole decision.
+    #  Read HERE and not in `_platform_timings`, which every audit runs: this
+    #  is a second full pass over a chat file and only a disputed entry needs
+    #  it. Rare by construction, so it costs nothing on a healthy sweep.
+    corroborates = []
+    for k in got:
+        f = nas.get(f"{k}_chat")
+        if not f:
+            continue
+        path = os.path.join(config.get("nas_path", ""), f)
+        if not os.path.exists(path):
+            continue
+        chat_end = analyze_chat_file(path).get("last_secs")
+        if chat_end and abs(chat_end - got[lo_k]) <= _TRUNCATION_FLOOR_S:
+            corroborates.append(f"{name.get(k, k)}'s chat runs to "
+                                f"{_seconds_to_hhmmss(chat_end)}")
+    also = (" — " + ", and ".join(corroborates)) if corroborates else ""
+    return [_finding(
+        "warn", "duration",
+        f"{name.get(hi_k, hi_k)} measures {_seconds_to_hhmmss(got[hi_k])} but "
+        f"{name.get(lo_k, lo_k)} recorded the same broadcast in "
+        f"{_seconds_to_hhmmss(got[lo_k])}{also}. One of these files is wrong "
+        f"and nothing here can say which, so the length is left alone and no "
+        f"check is measured against it.",
+        platform=hi_k, short="length disputed")]
+
+
+def _reconcile_durations(config: dict, cache: list[dict], timings: dict) -> list[str]:
+    """Correct a cached broadcast length that the recordings disprove.
+
+    THE CACHE GOES STALE AND NOTHING EVER FIXED IT. The pre-C audit said so in
+    one line — "the cache is written once at record time, so after a
+    re-download or a manual repair it reports the old length forever" — and
+    corrected it on the spot. C turned the file's length and the broadcast's
+    length into two claims, which is right, and then had no rule connecting
+    them: entry #716 carried a cached 6:25:11 against a two-hour recording and
+    reported the disagreement on every single sweep, for ever.
+
+    WHY THIS CANNOT BE DONE ONE PLATFORM AT A TIME, which is the mistake made
+    first. A cached figure longer than the file looks identical in both of the
+    cases that matter:
+
+        the cache is wrong   — a bugged recording's length was cached, or the
+                               file was re-downloaded and is now correct;
+        the FILE is short    — the capture died early, and the cache is the
+                               only thing that still knows how long the
+                               broadcast actually ran.
+
+    Correcting on the first reading would quietly overwrite the truth in the
+    second. Nothing inside one platform can tell them apart — a capture that
+    died early looks complete from the inside.
+
+    THE OTHER RECORDING IS THE EVIDENCE. A broadcast recorded twice should
+    produce two files of nearly the same length. When both platforms measured
+    and AGREE, that agreement is what the broadcast ran for, and a cached
+    figure that disagrees with it is simply wrong. When only one platform
+    recorded, this declines and says nothing — there is no second witness, and
+    a guess written into the cache is worse than a disagreement reported.
+
+    The floor is `_TRUNCATION_FLOOR_S`, the same number the truncation finding
+    uses, and deliberately the same: below it a difference is a trim at the far
+    end of a VOD and the two-claim model is right to keep both. Above it,
+    something is wrong.
+
+    Returns the lines it wants said. Mutates `cache` and the settled
+    broadcast_duration in `timings`, so the findings drawn afterwards read the
+    corrected figure rather than the one this just replaced.
+    """
+    measured = {k: t.get("measured_duration_s") for k, t in timings.items()
+                if t and t.get("measured_duration_s")}
+    if len(measured) < 2:
+        return []
+    lo, hi = min(measured.values()), max(measured.values())
+    if hi - lo > _TRUNCATION_FLOOR_S:
+        # The two recordings do not agree either, so neither is evidence about
+        # the other and there is nothing here to correct anything WITH.
+        return []
+    aired = max(measured.values())
+
+    said = []
+    for prefix, t in timings.items():
+        if not t:
+            continue
+        settled = (t.get("settled") or {}).get("broadcast_duration") or {}
+        cached = settled.get("value")
+        if not cached or abs(float(cached) - float(aired)) <= _TRUNCATION_FLOOR_S:
+            continue
+        vid = t.get("video_id")
+        platform = "youtube" if prefix == "yt" else "twitch"
+        vod = ls_common.find_vod(cache, vid, platform) if vid else None
+        if not vod or not vod.get("duration"):
+            continue
+        said.append(f"    duration corrected from cache "
+                    f"{_seconds_to_hhmmss(vod['duration'])} → "
+                    f"{_seconds_to_hhmmss(aired)} ({prefix}) — both recordings "
+                    f"say {_seconds_to_hhmmss(aired)}")
+        vod["duration"] = int(aired)
+        settled["value"] = int(aired)
+        if settled.get("best"):
+            settled["best"]["value"] = int(aired)
+            settled["best"]["label"] = "cache (corrected)"
+    if said:
+        try:
+            ls_common.save_cache(cache)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                f"could not save the corrected cache: {e}")
+    return said
 
 
 def _old_entry_metas(nas_root: str, index: int, keep: str) -> list[str]:
@@ -1215,8 +1364,19 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
            "generated_at": datetime.datetime.now().isoformat(timespec="seconds")}
     any_found = False
 
+    gathered = {}
     for prefix, platform in (("yt", "youtube"), ("tw", "twitch")):
         t = _platform_timings(config, cache, nas, prefix, platform)
+        if t:
+            gathered[prefix] = t
+    #  Before anything is printed or written down: a sidecar recording a
+    #  broadcast length the recordings disprove would be a derivation of a
+    #  stale number, kept for ever.
+    for line in _reconcile_durations(config, cache, gathered):
+        print(line)
+
+    for prefix, platform in (("yt", "youtube"), ("tw", "twitch")):
+        t = gathered.get(prefix)
         if not t:
             print(f"  {platform:<8} no files")
             continue
@@ -1330,6 +1490,27 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
     if not duration or duration <= 0:
         return None
 
+    #  IS THAT LENGTH WORTH MEASURING AGAINST? Entry #716's YouTube file
+    #  ffprobes at 6:25:11 and is simply wrong — the Twitch recording of the
+    #  same broadcast is 2:08:10 and the YouTube chat's own last message is at
+    #  2:10:22. Measured against the bogus figure the chat looks 254 minutes
+    #  short, so this asked whether to download four hours of replay chat that
+    #  has never existed, and answering it either way was a wrong answer to a
+    #  question that should not have been asked.
+    #
+    #  So: when the OTHER platform recorded the same broadcast and its file
+    #  disagrees by more than the truncation floor, this video's length is in
+    #  dispute and a shortfall computed from it is not a fact. Declines, and
+    #  the disputed length is reported instead by `_length_findings`.
+    #
+    #  The other recording only, never the chat's own span: a chat that was
+    #  cut off IS short, and letting it vouch for the length it stops at would
+    #  make this check unable to fire at all — which is the failure it exists
+    #  to catch.
+    other = _measured(config, nas, "tw")
+    if other and abs(other - duration) > _TRUNCATION_FLOOR_S:
+        return None
+
     shortfall = duration - last
     limit = min(CHAT_SHORTFALL_MAX_SECS, duration * CHAT_SHORTFALL_FRACTION)
     if shortfall <= limit:
@@ -1340,6 +1521,21 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
             "count": info["count"], "last_secs": last,
             "duration_secs": duration, "shortfall_secs": shortfall,
             "limit_secs": limit}
+
+
+def _measured(config: dict, nas: dict, prefix: str) -> float | None:
+    """How long one platform's video file actually is, or None.
+
+    Its own function because two checks and the reconciler all need the same
+    number and none of them should be the place that knows how to get it.
+    """
+    f = nas.get(f"{prefix}_video")
+    if not f:
+        return None
+    path = os.path.join(config.get("nas_path", ""), f)
+    if not os.path.exists(path):
+        return None
+    return analyze_video_file(path).get("duration_secs")
 
 
 def _tw_chat_shortfall(config: dict, cache: list[dict], nas: dict,
@@ -1431,7 +1627,13 @@ def _tw_chat_shortfall(config: dict, cache: list[dict], nas: dict,
         last_secs = (max(m.abs_ms for m in placed) - zero) / 1000.0
 
     shortfall = limit = None
-    if last_secs is not None and duration and duration > 0:
+    #  The same guard the YouTube side carries, and for the same reason: a
+    #  shortfall is measured AGAINST a length, so a length the other recording
+    #  denies produces a shortfall that is not a fact. See `_yt_chat_shortfall`.
+    other = _measured(config, nas, "yt")
+    contested = bool(other and duration
+                     and abs(other - duration) > _TRUNCATION_FLOOR_S)
+    if last_secs is not None and duration and duration > 0 and not contested:
         shortfall = duration - last_secs
         limit = min(CHAT_SHORTFALL_MAX_SECS, duration * CHAT_SHORTFALL_FRACTION)
         if shortfall > limit:
@@ -2633,13 +2835,21 @@ def _witness_findings(timings: dict) -> list[dict]:
                 #  that their own precision cannot explain it. This is the
                 #  thing the inversion exists to surface: before C3 the first
                 #  one answered and the second was never asked.
+                #  Only the witnesses that VOUCHED. The spread is computed
+                #  over those alone, so listing the others put numbers in the
+                #  sentence that its own figure does not describe — #716 read
+                #  "disagree by 00:00:02" and then named a filename four and a
+                #  half minutes away, which is a record-start proxy that
+                #  cannot answer this question at all. A reader trying to
+                #  reconcile the two is being sent after nothing.
                 who = ", ".join(
                     f"{w.get('label') or w['source']} {_iso(w['value'])}"
                     if claim in (ls_witness.BROADCAST_START,
                                  ls_witness.RECORD_START)
                     else f"{w.get('label') or w['source']} "
                          f"{_seconds_to_hhmmss(w['value'])}"
-                    for w in s.get("witnesses", []))
+                    for w in s.get("witnesses", [])
+                    if w.get("corroborates", True))
                 out.append(_finding(
                     "warn", "assignment",
                     f"{label}: witnesses disagree about {said} by "
@@ -2861,6 +3071,12 @@ def media_report(config: dict, got: dict) -> dict:
         row = {
             "platform": prefix,
             "id": vid,
+            # The link, built by the one builder — an id is not something a
+            # person can click, and the panel had them retyping it into a
+            # browser bar to check a recording against its source.
+            "url": (ls_common.build_stream_url(
+                config, "youtube" if prefix == "yt" else "twitch", vid)
+                if vid else None),
             "stream_start_ms": t.get("stream_start_epoch_ms"),
             "record_start_ms": t.get("record_start_epoch_ms"),
             "duration_s": t.get("duration_secs"),
@@ -2885,7 +3101,27 @@ def media_report(config: dict, got: dict) -> dict:
             row["chat"] = {"state": "none"}
         platforms.append(row)
 
-    out = {"zero_ms": zero_ms, "platforms": platforms, "merged": None}
+    # ── how long the BROADCAST ran, which is a different question from how
+    # long either recording is ─────────────────────────────────────────
+    #
+    # The longest recording, and that is the pre-C rule restored verbatim
+    # — `dur = max(durations)`. It is also the check that a single platform
+    # cannot do for itself: a capture that died early looks complete from the
+    # inside, and only the OTHER platform's length says otherwise. Entry #716
+    # is the case — a bugged YouTube recording against a Twitch one that ran
+    # the real two hours.
+    #
+    # `proposed` rather than `duration`, because this is what the audit would
+    # write into the vault, and naming it after the decision keeps it from
+    # being read as a fifth measurement.
+    lengths = [p["duration_s"] for p in platforms if p.get("duration_s")]
+    out = {"zero_ms": zero_ms, "platforms": platforms, "merged": None,
+           "proposed_duration_s": max(lengths) if lengths else None,
+           # How far apart the recordings are. A broadcast recorded twice
+           # should produce two files of nearly the same length; a gap here is
+           # one of them being wrong, and it is the only evidence that says so.
+           "duration_spread_s": (int(round(max(lengths) - min(lengths)))
+                                 if len(lengths) > 1 else None)}
 
     merged = got.get("merged")
     if not merged:
@@ -3121,10 +3357,20 @@ def inspect(config: dict, index: int, *,
         t = _platform_timings(config, cache, nas, prefix, platform)
         if t:
             out["timings"][prefix] = t
+    #  A cached broadcast length the two recordings disprove, corrected before
+    #  anything reads it. It needs both platforms in hand, which is why it is
+    #  out here and not inside `_platform_timings` — and why putting it in
+    #  there first was wrong: one recording cannot tell "the cache is stale"
+    #  from "this capture died early".
+    for line in _reconcile_durations(config, cache, out["timings"]):
+        out["findings"].append({
+            "level": "ok", "check": "duration", "platform": None,
+            "short": "cache corrected", "message": line.strip()})
     #  What the witnesses could not agree on, which is the product of C3 and
     #  is computed here rather than in `_platform_timings` because it needs
     #  both platforms' settlements in hand. Appended after the three checks
     #  and before `worst`, so a disagreement can raise an entry's level.
+    out["findings"] += _length_findings(config, nas, out["timings"])
     out["findings"] += _witness_findings(out["timings"])
     out["merged"] = find_merged_chat(config.get("nas_path", ""), index)
 
