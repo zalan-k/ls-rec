@@ -1011,7 +1011,15 @@ PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
             # into a changeset rather than applying, because reconciling a
             # vault against a filesystem against two platforms produces
             # disagreements whose wrong side cannot be known from here.
-            "audit")
+            "audit",
+            # The one errand whose whole purpose is to download. An audit will
+            # not pull chat with nobody watching — a click on a web page is an
+            # unattended caller like any other — so a chat too short to merge
+            # comes home as a question, and saying yes to it queues this. One
+            # platform, one entry, because somebody clicked. Its quieter half,
+            # `give_up`, spends no bandwidth and is still this machine's: the
+            # ledger it writes sits beside the recorder.
+            "chat_repair")
 
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 
