@@ -1149,13 +1149,51 @@ def _length_findings(config: dict, nas: dict, timings: dict) -> list[dict]:
     """
     got = {k: t.get("measured_duration_s") for k, t in (timings or {}).items()
            if t and t.get("measured_duration_s")}
+    name = {"yt": "YouTube", "tw": "Twitch"}
+
+    #  ── ONE RECORDING, so ask the source ─────────────────────────────
+    #
+    #  Two recordings check each other. One has nothing to check against, and
+    #  this is the case that has gone wrong repeatedly: a file twice as long
+    #  as the stream, believed by every number downstream.
+    #
+    #  Only when the entry is ALREADY suspect. The chat's last message is a
+    #  lower bound on how long the broadcast ran — a chat can be cut off, so
+    #  it can never prove a recording too long — but a recording that claims
+    #  to be hours longer than its own chat is worth one metadata call to
+    #  settle. A healthy solo entry makes no network call at all.
+    if len(got) == 1:
+        k = next(iter(got))
+        t = (timings or {}).get(k) or {}
+        chat_end = None
+        f = nas.get(f"{k}_chat")
+        if f and os.path.exists(os.path.join(config.get("nas_path", ""), f)):
+            chat_end = analyze_chat_file(
+                os.path.join(config.get("nas_path", ""), f)).get("last_secs")
+        if not chat_end or got[k] - chat_end <= _TRUNCATION_FLOOR_S:
+            return []
+        aired = _ask_the_source(config, nas, k, t.get("video_id"))
+        if not aired or abs(aired - got[k]) <= _TRUNCATION_FLOOR_S:
+            #  Either the source will not say, or it agrees with the file —
+            #  in which case the chat really is short and the coverage check
+            #  is right to ask about it. Nothing to report here either way.
+            return []
+        return [_finding(
+            "warn", "duration",
+            f"{name.get(k, k)} measures {_seconds_to_hhmmss(got[k])} but "
+            f"{name.get(k, k)} itself says the video is "
+            f"{_seconds_to_hhmmss(aired)} — and its chat runs to "
+            f"{_seconds_to_hhmmss(chat_end)}, which agrees with the source. "
+            f"The recording on disk is the wrong one; no check is measured "
+            f"against it.",
+            platform=k, short="length disputed", aired_s=int(aired))]
+
     if len(got) < 2:
         return []
     lo_k = min(got, key=got.get)
     hi_k = max(got, key=got.get)
     if got[hi_k] - got[lo_k] <= _TRUNCATION_FLOOR_S:
         return []
-    name = {"yt": "YouTube", "tw": "Twitch"}
 
     #  What else there is to go on, said in the same breath. A chat's last
     #  message is a LOWER bound on how long the broadcast ran — a chat can be
@@ -1186,6 +1224,45 @@ def _length_findings(config: dict, nas: dict, timings: dict) -> list[dict]:
         f"and nothing here can say which, so the length is left alone and no "
         f"check is measured against it.",
         platform=hi_k, short="length disputed")]
+
+
+def _ask_the_source(config: dict, nas: dict, prefix: str, vid: str | None) -> float | None:
+    """How long the platform says this video is. None if it will not say.
+
+    THE ONLY WITNESS LEFT when a broadcast was recorded once. Two recordings
+    check each other — a capture that died early looks complete from the
+    inside, and only the other one says otherwise — but a solo entry has
+    nothing to compare against, and a file that is twice as long as the
+    stream is believed by everything downstream: the vault duration, the
+    card, the timeline, and the chat-coverage check, which then reports hours
+    missing from a complete log and offers to download them.
+
+    Entry #747: the YouTube recording measures 6:19:06 and the chat stops at
+    3:09:10, which is 2.004 times. Nothing local could tell which was wrong.
+    The source can, in one metadata call.
+
+    A PROBE, NOT A DOWNLOAD. The audit's rule against spending bandwidth
+    unattended is about pulling files; `do_rescan` already reads this from
+    every capture on a timer, and it is one request. Called only when it can
+    decide something — see the caller — so a healthy sweep makes no network
+    calls at all.
+
+    Never raises: this is a courtesy, and an entry that cannot be checked
+    against its source is exactly as well off as it was before.
+    """
+    if not vid:
+        return None
+    platform = "youtube" if prefix == "yt" else "twitch"
+    try:
+        url = ls_common.build_stream_url(config, platform, vid)
+        data, why = ls_common.ytdlp_probe(config, url, with_reason=True)
+        if why != "ok" or not data:
+            return None
+        d = data.get("duration")
+        return float(d) if d else None
+    except Exception as e:
+        logging.getLogger(__name__).info(f"could not ask {platform} about {vid}: {e}")
+        return None
 
 
 def _reconcile_durations(config: dict, cache: list[dict], timings: dict) -> list[str]:
@@ -1511,6 +1588,19 @@ def _yt_chat_shortfall(config: dict, cache: list[dict], nas: dict,
     if other and abs(other - duration) > _TRUNCATION_FLOOR_S:
         return None
 
+    #  AND WHEN THERE IS NO OTHER RECORDING, ask the source. Entry #747 had
+    #  one YouTube file measuring 6:19:06 against a chat ending at 3:09:10,
+    #  and no second capture to catch it — so this asked whether to download
+    #  189 minutes of replay chat that has never existed.
+    #
+    #  Only once the chat already looks short by more than the floor, which
+    #  is checked below — so the call is made at the moment it can change the
+    #  answer and never on a healthy entry.
+    if not other and (duration - last) > _TRUNCATION_FLOOR_S:
+        aired = _ask_the_source(config, nas, "yt", yt_id)
+        if aired and abs(aired - duration) > _TRUNCATION_FLOOR_S:
+            return None
+
     shortfall = duration - last
     limit = min(CHAT_SHORTFALL_MAX_SECS, duration * CHAT_SHORTFALL_FRACTION)
     if shortfall <= limit:
@@ -1633,6 +1723,14 @@ def _tw_chat_shortfall(config: dict, cache: list[dict], nas: dict,
     other = _measured(config, nas, "yt")
     contested = bool(other and duration
                      and abs(other - duration) > _TRUNCATION_FLOOR_S)
+    #  The solo case, as on the YouTube side: with no second recording the
+    #  source is the only thing that can say whether this file's length is
+    #  real. Asked only once the chat already looks short.
+    if (not other and duration and last_secs is not None
+            and (duration - last_secs) > _TRUNCATION_FLOOR_S):
+        aired = _ask_the_source(config, nas, "tw", tw_id)
+        if aired and abs(aired - duration) > _TRUNCATION_FLOOR_S:
+            contested = True
     if last_secs is not None and duration and duration > 0 and not contested:
         shortfall = duration - last_secs
         limit = min(CHAT_SHORTFALL_MAX_SECS, duration * CHAT_SHORTFALL_FRACTION)

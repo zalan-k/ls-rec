@@ -1430,12 +1430,38 @@ class LivestreamRecorder:
                             return
                         logger.warning(
                             f"Part {part_num:02d} ended rc=0, liveness ASSUMED "
-                            f"(probe blind); rotating {spent}/"
-                            f"{ASSUMED_ROTATE_MAX}: {title}")
+                            f"(probe blind); "
+                            + ("resuming" if stream["_from_start"] else "rotating")
+                            + f" {spent}/{ASSUMED_ROTATE_MAX}: {title}")
                     else:
                         stream["_assumed_rotations"] = 0
-                        logger.warning(f"Part {part_num:02d} ended rc=0 but {title} still live; rotating to live-edge")
-                    stream["_from_start"] = False
+                        logger.warning(
+                            f"Part {part_num:02d} ended rc=0 but {title} still "
+                            f"live; " + ("resuming part 01 from its own state"
+                                         if stream["_from_start"]
+                                         else "rotating to live-edge"))
+                    #  `_from_start` used to be cleared here, and that one
+                    #  line was the doubling. It is False for Twitch from
+                    #  setup, so clearing it only ever did anything on
+                    #  YouTube — where live-edge does not mean "from now" but
+                    #  "from the start of the DVR window", which on a fully
+                    #  buffered stream is the broadcast start. The next part
+                    #  re-pulled the whole stream and the concat wrote the
+                    #  broadcast into itself.
+                    #
+                    #  Left set, `_record_video` sends the restart back to
+                    #  part01 against the same output template and yt-dlp
+                    #  resumes from its own `.ytdl` state — what that
+                    #  function's docstring has always said the design is.
+                    #
+                    #  The liveness gate above is untouched. It never could
+                    #  have caught this: the stream really is still live in
+                    #  both the good case and the bad one, so it answers yes
+                    #  either way. It decides WHETHER to carry on; this was
+                    #  about HOW, which nothing was asking. The anti-loop
+                    #  budgets are equally unaffected — `_restart_count`
+                    #  catches an rc=0 returning inside 30 seconds, and a
+                    #  resume that runs longer than that is downloading.
                     stream["_restart_count"] = 0
                     time.sleep(3)
                 if stream_key in self.active_streams and not self.manual_termination_in_progress:
@@ -1592,20 +1618,51 @@ class LivestreamRecorder:
             logger.error(f"Watchdog terminate failed: {e}")
 
     def _find_part_files(self, stream_title: str) -> list[str]:
+        """The parts THIS recorder wrote, and nothing else.
+
+        Identified POSITIVELY. This used to be a denylist — glob everything
+        matching `<title>.part*.*` and skip whatever looked like a yt-dlp
+        intermediate, by the pattern `.partNN.fNNN.ext`.
+
+        A denylist here is a doubled recording. yt-dlp writes a per-format
+        file beside the merged one, and `f\d+` only recognises a numeric
+        format id: anything else it emits under this template — an HLS or
+        storyboard id, a suffix nobody anticipated — was not recognised, was
+        taken for a second PART, and was concatenated onto the merged file
+        that already contained the same footage. The output is then exactly
+        twice as long as the stream, and every number downstream believes it:
+        the vault duration, the card, the timeline, and the chat-coverage
+        check, which then reports hours of chat missing from a complete log
+        and offers to download them.
+
+        The output template is `f"{title}.part{part_num:02d}.%(ext)s"`, so a
+        part this recorder made is exactly that and nothing more — two
+        digits, then one known video extension, then the end of the name. A
+        file that does not match was written by something else, whatever it is
+        called, and the concat is not the place to find out.
+        """
         output_dir = self.config["output"]
-        pattern    = os.path.join(
-            output_dir, f"{glob.escape(stream_title)}.part*.*"
-        )
+        want = re.compile(
+            r"^" + re.escape(stream_title) + r"\.part\d{2}"
+            + r"(?:" + "|".join(re.escape(e) for e in ls_common.VIDEO_EXTS) + r")$",
+            re.IGNORECASE)
         parts: list[str] = []
-        for p in sorted(glob.glob(pattern)):
+        skipped: list[str] = []
+        for p in sorted(glob.glob(os.path.join(
+                output_dir, f"{glob.escape(stream_title)}.part*.*"))):
             base = os.path.basename(p)
-            if base.endswith((".log", ".part", ".ytdl", ".frag.json", ".temp")):
-                continue
-            # yt-dlp per-format intermediates: .partNN.f299.mp4, .partNN.f299-dash.mp4, .partNN.f140.m4a
-            if re.search(r"\.part\d{2}\.f\d+(-\w+)?\.\w+$", base):
-                continue
-            if os.path.splitext(p)[1].lower() in ls_common.VIDEO_EXTS:
+            if want.match(base):
                 parts.append(p)
+            elif not base.endswith((".log", ".part", ".ytdl", ".frag.json", ".temp")):
+                skipped.append(base)
+        #  Said out loud, because the bug this replaces was silent for months.
+        #  A recording that leaves per-format files behind is normal; one that
+        #  leaves something this does not recognise is worth a line in the log
+        #  on the day somebody goes looking.
+        if skipped:
+            logger.info(f"parts: ignoring {len(skipped)} non-part file(s) "
+                        f"beside {stream_title}: {', '.join(skipped[:4])}"
+                        + (" …" if len(skipped) > 4 else ""))
         return parts
 
     def _cleanup(self, paths: list[str]):
@@ -1615,7 +1672,60 @@ class LivestreamRecorder:
             except OSError:
                 pass
 
-    def _merge_parts(self, parts: list[str], dest_mp4: str) -> tuple[bool, float | None]:
+    def _overlapping_parts(self, parts: list[str], history: list[dict] | None):
+        """Which parts hold footage an earlier part already holds.
+
+        THE DOUBLING. yt-dlp exits rc=0 while the broadcast is still live, so
+        the recorder rotates off `--live-from-start` to live-edge and spawns
+        the next part. That is right for Twitch, where the live edge means
+        "from now". It is wrong for YouTube: the DVR window of a fully
+        buffered stream reaches back to the broadcast start, so the new part
+        re-pulls the WHOLE stream and the concat writes it twice. A recording
+        that measures exactly 2.004x its own chat is this, every time.
+
+        THE TEST IS WALL TIME, and it holds whatever the cause. A live-edge
+        part records in realtime: it cannot contain more footage than the
+        seconds it was actually running. One that pulled six hours of video in
+        forty minutes was reading history, not recording. A from-start part is
+        exempt by definition — downloading the past quickly is its whole job.
+
+        Returns the paths to leave out. Never raises: a merge that cannot be
+        checked is the merge this has always done.
+        """
+        if len(parts) < 2 or not history:
+            return set()
+        by_num = {}
+        for h in history:
+            by_num[h.get("num")] = h
+        drop = set()
+        now = time.time()
+        for path in parts:
+            m = re.search(r"\.part(\d{2})\.[^.]+$", os.path.basename(path))
+            if not m:
+                continue
+            h = by_num.get(int(m.group(1)))
+            if not h or h.get("from_start"):
+                continue
+            dur = ls_common.probe_duration(path)
+            if not dur:
+                continue
+            #  How long it was running, from when it started to now — this is
+            #  called at completion, so `now` is the end of the recording.
+            ran = max(0.0, now - float(h.get("started_ts") or now))
+            #  Five minutes of slack. Container durations and process
+            #  bookkeeping differ by seconds legitimately, and the case this
+            #  catches is off by hours.
+            if dur > ran + 300:
+                logger.error(
+                    f"parts: {os.path.basename(path)} holds "
+                    f"{int(dur)}s of video but was only recording for "
+                    f"{int(ran)}s — it re-pulled the stream from the start "
+                    f"instead of continuing, so it overlaps the part before it.")
+                drop.add(path)
+        return drop
+
+    def _merge_parts(self, parts: list[str], dest_mp4: str,
+                     history: list[dict] | None = None) -> tuple[bool, float | None]:
         if not parts:
             return False, None
 
@@ -1636,6 +1746,24 @@ class LivestreamRecorder:
             return (dur is not None), dur
 
         # Multi-part (Twitch restart recovery only): concat, stream copy.
+        #
+        #  A part that re-pulled the stream holds everything the parts before
+        #  it hold. Concatenating them writes the broadcast twice, so the
+        #  longest one is kept ALONE — it is the complete recording, and the
+        #  others are prefixes of it.
+        #
+        #  Nothing is deleted here. `_cleanup` below only runs on the parts
+        #  that were actually merged, so a part left out stays on disk where
+        #  somebody can look at it, which is the whole point of noticing.
+        overlap = self._overlapping_parts(parts, history)
+        if overlap:
+            keep = max(parts, key=lambda p: ls_common.probe_duration(p) or 0)
+            logger.warning(
+                f"parts: keeping {os.path.basename(keep)} alone and leaving "
+                f"{len(parts) - 1} overlapping part(s) on disk rather than "
+                f"concatenating the broadcast into itself.")
+            return self._merge_parts([keep], dest_mp4)
+
         list_file = dest_mp4 + ".concat.txt"
         with open(list_file, "w") as f:
             for p in parts:
@@ -1645,7 +1773,12 @@ class LivestreamRecorder:
         dur = ls_common.probe_duration(dest_mp4)
         if os.path.exists(dest_mp4) and dur:
             self._cleanup(parts + [list_file])
-            logger.info(f"Merged {len(parts)} parts → {os.path.basename(dest_mp4)}")
+            #  Named, not counted. "Merged 2 parts" is what this said while it
+            #  was merging a file with its own duplicate, and a count cannot
+            #  tell you that.
+            logger.info(f"Merged {len(parts)} parts → {os.path.basename(dest_mp4)} "
+                        f"[{', '.join(os.path.basename(x) for x in parts)}] "
+                        f"= {int(dur)}s")
             return True, dur
         logger.error(f"Concat failed (rc={r.returncode}): {r.stderr[-300:]}")
         self._cleanup([list_file])           # leave parts in place for recovery
@@ -2434,7 +2567,8 @@ class LivestreamRecorder:
                 return
 
             merged_local = os.path.join(self.config["output"], f"{title}.mp4")
-            ok, duration = self._merge_parts(parts, merged_local)
+            ok, duration = self._merge_parts(parts, merged_local,
+                                              stream.get("_part_history"))
             if not ok:
                 logger.error(f"Merge failed; parts left in place for: {title}")
                 return
