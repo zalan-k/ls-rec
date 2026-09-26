@@ -753,22 +753,24 @@ def _identify_missing(config: dict, nas: dict,
     """List files that should exist but don't, skipping known-absent (.×) ones."""
     absent = absent or {}
     missing = []
+    # `video_id` rides along because the file a pull writes is NAMED after it
+    # and a url is not a reliable place to get it back from. See `_pull_stem`.
     if yt_id:
         url = ls_common.build_stream_url(config, "youtube", yt_id)
         if not nas["yt_video"] and not absent.get("yt_video"):
             missing.append({"platform": "youtube", "type": "video",
-                            "url": url, "label": "YT video"})
+                            "url": url, "video_id": yt_id, "label": "YT video"})
         if not _chat_accounted(nas, "yt") and not absent.get("yt_chat"):
             missing.append({"platform": "youtube", "type": "chat",
-                            "url": url, "label": "YT chat"})
+                            "url": url, "video_id": yt_id, "label": "YT chat"})
     if tw_id:
         url = ls_common.build_stream_url(config, "twitch", tw_id)
         if not nas["tw_video"] and not absent.get("tw_video"):
             missing.append({"platform": "twitch", "type": "video",
-                            "url": url, "label": "TW video"})
+                            "url": url, "video_id": tw_id, "label": "TW video"})
         if not _chat_accounted(nas, "tw") and not absent.get("tw_chat"):
             missing.append({"platform": "twitch", "type": "chat",
-                            "url": url, "label": "TW chat"})
+                            "url": url, "video_id": tw_id, "label": "TW chat"})
     return missing
 
 
@@ -816,7 +818,7 @@ def _download_files(config: dict, missing: list[dict],
 PULL_TIMEOUT_S = 7200
 
 
-def _pull_stem(config: dict, index: int, url: str) -> str:
+def _pull_stem(config: dict, index: int, url: str, vid: str) -> str:
     """The name a file pulled for entry #index is written under.
 
     Asked of the PLATFORM rather than assembled from what is on disk, because
@@ -824,28 +826,26 @@ def _pull_stem(config: dict, index: int, url: str) -> str:
     collab partner's channel has no local file to take a name from, which is
     exactly why its chat could never be fetched.
 
-    The `[id]` is not decoration. `scan_nas` skips any file it cannot read a
-    video id out of, so a pull named without one lands on the NAS and is
-    invisible to every sweep after it.
+    THE `[id]` IS NOT DECORATION, and it is why the id is a parameter here
+    rather than read off the probe. `scan_nas` skips any file it cannot read
+    a video id out of — so a probe that fails, which is the ordinary outcome
+    for a members-only VOD or a bot check, used to name the file
+    `747_unknown @ 2026-09-26 05_31_13` and the download would land on the
+    NAS invisible to every sweep afterwards. Gigabytes nothing would ever
+    find. The id is the one part of the name that is known before the network
+    is touched, so it is the one part that cannot go missing.
     """
     data = ls_common.ytdlp_probe(config, url, playlist_items="1")
-    if data:
-        title = data.get("title") or "Unknown"
-        vid = data.get("id", "unknown")
-        release_ts = data.get("release_timestamp")
-        upload_date = data.get("upload_date", "")
-        if release_ts:
-            ts = datetime.datetime.fromtimestamp(release_ts).strftime(
-                "%Y-%m-%d_%H-%M",
-            )
-        elif upload_date:
-            ts = (f"{upload_date[:4]}-{upload_date[4:6]}"
-                  f"-{upload_date[6:]}_00-00")
-        else:
-            ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-        stem = sanitize_filename(f"{title} [{vid}] @ {ts}")
+    title = (data or {}).get("title") or "Unknown"
+    release_ts = (data or {}).get("release_timestamp")
+    upload_date = (data or {}).get("upload_date", "")
+    if release_ts:
+        ts = datetime.datetime.fromtimestamp(release_ts).strftime("%Y-%m-%d_%H-%M")
+    elif upload_date and len(str(upload_date)) == 8:
+        ts = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}_00-00"
     else:
-        stem = sanitize_filename(f"unknown @ {datetime.datetime.now()}")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    stem = sanitize_filename(f"{title} [{vid}] @ {ts}")
     return f"{int(index):03d}_{stem}"
 
 
@@ -871,6 +871,21 @@ def _pull_one(config: dict, index: int, item: dict, *,
     nas_path = config["nas_path"]
     if not nas_path or not os.path.isdir(nas_path):
         return {"ok": False, "file": None, "why": "the NAS is not mounted"}
+    # Nowhere to put it beats nothing to call it: the mount is the more
+    # fundamental failure and the one a person fixes first.
+    vid = item.get("video_id") or ls_common.extract_video_id_from_url(url)[0]
+    # Canonical form, and this is not cosmetic. yt-dlp hands back a Twitch VOD
+    # id as `v2883601443`; Helix, the archive and `build_stream_url` all use
+    # the bare digits. A file named with the `v` still SCANS -- classify_video_id
+    # strips it -- but `resolve_id` would then read that id off the filename,
+    # and the archive push would propose `v2883601443` against the stored
+    # `2883601443` on every sweep, for ever, over the same video.
+    if vid and platform == "twitch":
+        vid = vid.lstrip("v") or vid
+    if not vid:
+        return {"ok": False, "file": None,
+                "why": f"no video id in {url} — a file named without one is "
+                       f"invisible to every later sweep"}
 
     # Before the name, which costs a network round trip to build: a Twitch
     # chat needs a downloader this machine may not have, and spending a probe
@@ -882,8 +897,8 @@ def _pull_one(config: dict, index: int, item: dict, *,
                 "why": "twitch_downloader_cli is not configured; "
                        "a Twitch chat cannot be pulled without it"}
 
-    stem = _pull_stem(config, index, url)
-    print(f"\n  ↓ {item['label']}: {stem}")
+    stem = _pull_stem(config, index, url, vid)
+    print(f"\n  ↓ {item['label']}: {stem}", flush=True)
 
     try:
         if what == "video":
@@ -2678,6 +2693,60 @@ def _deferred_repair(item: dict, platform: str) -> dict:
             "shortfall_secs": item.get("shortfall_secs")}
 
 
+def _late_captures(config: dict, nas_root: str, merged_name: str,
+                   nas: dict) -> list[str]:
+    """Raws on the NAS that the merged file does not name as a source.
+
+    The merge is written once and then `_pipeline` calls the chat side
+    finished, which was right for every capture that exists before the merge
+    and wrong for the one shape that arrives after it: a PULL. An offline chat
+    dropped beside an entry merged months ago would land, be skipped by the
+    very next sweep, and sit on the NAS forever while the entry reported a
+    merged chat that did not contain it.
+
+    `cmd_merge_chat` has known how to do this properly since archived raws
+    became merge sources -- it reads deep storage and the NAS root together
+    and unions the lot. Nothing ever called it a second time.
+
+    Read off the merged file's own header, which names every source that went
+    into it and costs a few kilobytes to read. Two ways of saying "do not":
+
+      no header, or a header naming no sources -- a v1 file, or one this
+      cannot parse. Not knowing what is in it is not a reason to rewrite it.
+
+      a source the merge names that is no longer findable, on the NAS or in
+      deep storage. A re-merge REPLACES the merged file from its sources, so
+      one that has gone would be dropped out of it, and the merged copy is
+      the only place it still exists. Better a stale merge than a shorter one.
+    """
+    meta = ls_chat.read_header(os.path.join(nas_root, merged_name),
+                               MERGED_CHAT_HEAD_BYTES)
+    named = {str(src.get("file") or "")
+             for src in ((meta or {}).get("sources") or [])}
+    named.discard("")
+    if not named:
+        return []
+
+    arch = config.get("chat_archive_path")
+    arch_dir = os.path.join(nas_root, arch) if arch else None
+    here = set()
+    for k in ("yt_chats", "tw_chats"):
+        here |= {n for n in (nas.get(k) or [])
+                 if os.path.exists(os.path.join(nas_root, n))}
+    stored = set()
+    if arch_dir:
+        for k in ("yt_chats_archived", "tw_chats_archived"):
+            stored |= {n for n in (nas.get(k) or [])
+                       if os.path.exists(os.path.join(arch_dir, n))}
+    lost = named - here - stored
+    if lost:
+        print(f"    {len(lost)} merged source(s) are no longer on disk "
+              f"— not re-merging: " + ", ".join(sorted(lost)[:3]))
+        return []
+
+    return sorted(here - named)
+
+
 def _pipeline(config: dict, cache: list[dict], index: int,
               interactive: bool = True,
               deferred: list | None = None) -> bool:
@@ -2722,7 +2791,16 @@ def _pipeline(config: dict, cache: list[dict], index: int,
     changed = bool(cmd_timings(config, index))
 
     if merged_name:
-        return changed                     # chat side already finished
+        late = _late_captures(config, nas_root, merged_name, nas)
+        if not late:
+            return changed                 # chat side already finished
+        #  A capture that arrived AFTER the merge, which is what a pull is.
+        #  Falling through re-runs the whole chat side, and `cmd_merge_chat`
+        #  writes over the merged file atomically from every source including
+        #  the ones in deep storage -- so this widens the merge, it does not
+        #  replace it with the drop.
+        print(f"    {len(late)} capture(s) arrived after the merge "
+              f"— re-merging: " + ", ".join(late))
 
     chats = [k for k in ("yt_chats", "tw_chats") if nas.get(k)]
     if not chats:
@@ -3089,12 +3167,18 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
                     "nothing_recorded", prefix,
                     f"Nothing from {label} was recorded for this entry. Was "
                     f"there a broadcast on {label}?",
-                    #  Order is the order a person meets them in: fetch first
-                    #  when there is something to fetch, because it is the one
-                    #  that ENDS the question rather than describing it, then
-                    #  the common answer, then the one that needs a link, then
-                    #  the one that says a file existed and was let go.
-                    (["fetch"] if can_fetch else [])
+                    #  Order is the order a person meets them in: the fetches
+                    #  first when there is something to fetch, because they
+                    #  END the question rather than describing it, then the
+                    #  common answer, then the one that needs a link, then the
+                    #  one that says a file existed and was let go.
+                    #
+                    #  TWO of them, never one that gets both. A VOD is hours
+                    #  of video and its chat is a few megabytes; wanting the
+                    #  second and not the first is the ordinary case, not an
+                    #  edge, and a single button spends the difference without
+                    #  asking.
+                    (["fetch_video", "fetch_chat"] if can_fetch else [])
                     + ["no_broadcast", "identified", "declined"])))
             continue
         # VIDEO. The `.×` in the vault is a person saying "I did not keep
@@ -3129,8 +3213,10 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
                                 question=_asked(
                                     "located_not_here", prefix,
                                     f"The {label} broadcast is {located_id} and "
-                                    f"nothing from it is here. Pull it?",
-                                    ["fetch", "declined"]) if can_fetch else None))
+                                    f"nothing from it is here. Pull the video, "
+                                    f"the chat, or neither?",
+                                    ["fetch_video", "fetch_chat", "declined"])
+                                if can_fetch else None))
         else:
             # Missing, and nothing anywhere says why. That is the one case
             # worth asking about rather than reporting every sweep: deleting
@@ -3144,7 +3230,7 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
                                     f"The {label} video is not here. Was it "
                                     f"kept and lost, or deliberately not kept?"
                                     + (" It can be pulled." if can_fetch else ""),
-                                    (["fetch"] if can_fetch else [])
+                                    (["fetch_video"] if can_fetch else [])
                                     + ["declined", "no_broadcast", "identified"])))
 
         # CHAT. Deep storage counts as present: the merge folded it in and
@@ -3180,7 +3266,7 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
                                     f"broadcast on {label} at all?"
                                     + (" The VOD's chat can be pulled."
                                        if can_fetch else ""),
-                                    (["fetch"] if can_fetch else [])
+                                    (["fetch_chat"] if can_fetch else [])
                                     + ["declined", "no_broadcast"])))
     return out
 
