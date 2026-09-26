@@ -678,7 +678,16 @@ def _quality(t, claim):
     if not st.get("source"):
         return None
     ws = st.get("witnesses") or []
+    best = st.get("best") or {}
     return {"agreement": st.get("agreement"),
+            #  The winner was carried forward rather than re-taken this run:
+            #  the file it was measured on is gone, the cache row went, the
+            #  log rolled over. The number is still the best anybody ever
+            #  had; it is simply no longer checkable, and a panel that does
+            #  not say so is showing a measurement of something that is not
+            #  there as though it were of something that is.
+            "stale": bool(best.get("stale")),
+            "seen_at": best.get("seen_at"),
             "precision_s": st.get("precision_s"),
             "witnesses": len(ws),
             #  Not "did anybody agree" but "was anybody ENTITLED to". A cache
@@ -687,6 +696,28 @@ def _quality(t, claim):
             #  never happened.
             "corroborated": sum(1 for w in ws if w.get("corroborates", True)) > 1,
             "spread_s": st.get("spread_s")}
+
+
+#  Which claim, if any, a capture field is a reading of. Only these can go
+#  stale, because only these are settlements -- a path or an id is not a
+#  measurement and has nothing to be stale about.
+_FIELD_CLAIM = {
+    "remote_start_wall": ls_witness.BROADCAST_START,
+    "local_start_wall": ls_witness.RECORD_START,
+    "local_start_precision_s": ls_witness.RECORD_START,
+    "file_duration_s": ls_witness.FILE_DURATION,
+}
+
+
+def _stale_quality(t, field):
+    """What the last live reading of this field said, when nothing can read it
+    now. None when there is no settlement behind the field, or when the
+    settlement is live and simply produced nothing this run."""
+    q = _quality(t, _FIELD_CLAIM.get(field)) if _FIELD_CLAIM.get(field) else None
+    if not q or not q.get("stale"):
+        return None
+    st = ((t or {}).get("settled") or {}).get(_FIELD_CLAIM[field]) or {}
+    return {**q, "was": st.get("value"), "was_source": (st.get("best") or {}).get("label")}
 
 
 def _cap_evidence(config, cache, nas, prefix, platform, timings):
@@ -733,6 +764,16 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
         saw("local_start_precision_s",
             60 if t.get("record_start_accuracy") == "minute" else 1,
             "how precisely the recording start could be read")
+    #  Fresh only. A stale `file_duration` is a measurement of a file that is
+    #  no longer on the NAS, and proposing one would be this machine telling
+    #  the archive to adopt a number it cannot check -- about a copy somebody
+    #  deleted on purpose, which on #747 was the doubled recording whose
+    #  length is exactly the thing that was wrong with it.
+    #
+    #  It is still SAID, through `stale_quality` below: "the archive holds
+    #  11374; the last thing that measured this file got 22746, on a file
+    #  that is no longer here" is a sentence somebody can act on, and a bare
+    #  "nothing measures this" is not.
     if t.get("measured_duration_s"):
         saw("file_duration_s", int(t["measured_duration_s"]), "ffprobe",
             ls_witness.FILE_DURATION)
@@ -821,9 +862,14 @@ def evaluate(config: dict, index: int, state: dict, *,
                 out["drift"]["sent_but_unchecked"].append(f"capture.{field}")
                 continue
             got = saw.get(field)
+            #  What the last live reading said, for a field nothing can read
+            #  now. Attached to the verdict rather than offered as evidence:
+            #  it explains the gap, it does not fill it.
+            stale_q = (None if got else
+                       _stale_quality((timings or {}).get(prefix), field))
             v = _verdict(field, held, got["value"] if got else None,
                          source=got["source"] if got else None,
-                         quality=got["quality"] if got else None,
+                         quality=got["quality"] if got else stale_q,
                          why=None if got else (
                              "the platform this came from is not one this "
                              "recorder knows" if not prefix else
