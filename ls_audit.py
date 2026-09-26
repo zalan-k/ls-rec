@@ -637,10 +637,10 @@ _EVAL_TOL = {
 }
 
 
-def _verdict(field, held, saw, *, why=None, source=None, tol=None):
+def _verdict(field, held, saw, *, why=None, source=None, tol=None, quality=None):
     """One field, compared. `saw` None means there was nothing to compare."""
     out = {"field": field, "currently": held, "verdict": UNKNOWN,
-           "proposed": None, "why": why, "source": source}
+           "proposed": None, "why": why, "source": source, "quality": quality}
     if saw is None:
         out["why"] = why or "nothing here measures this"
         return out
@@ -659,8 +659,38 @@ def _verdict(field, held, saw, *, why=None, source=None, tol=None):
     return out
 
 
+#  How good a settled number is, taken off the settlement `ls_witness` already
+#  computed and then nobody read. It is all there in the sidecar on every run:
+#
+#      "agreement": "single", "precision_s": 60,
+#      "witnesses": [{ "source": "filename", "corroborates": false }]
+#
+#  -- one witness, entitled to answer and not to vouch, accurate to the minute.
+#  `_platform_timings` takes `settled[...]["value"]` and throws the rest away,
+#  so a broadcast start nothing but a filename claims arrives downstream
+#  looking exactly as solid as one the recorder measured at the time.
+#
+#  A filename is still allowed to answer -- it is the last fallback and that is
+#  the right job for a minute-accurate guess. It is not allowed to arrive
+#  silently, which is different.
+def _quality(t, claim):
+    st = ((t or {}).get("settled") or {}).get(claim) or {}
+    if not st.get("source"):
+        return None
+    ws = st.get("witnesses") or []
+    return {"agreement": st.get("agreement"),
+            "precision_s": st.get("precision_s"),
+            "witnesses": len(ws),
+            #  Not "did anybody agree" but "was anybody ENTITLED to". A cache
+            #  row derived from the same reading as the sidecar is one witness
+            #  spelled twice, and counting it would report corroboration that
+            #  never happened.
+            "corroborated": sum(1 for w in ws if w.get("corroborates", True)) > 1,
+            "spread_s": st.get("spread_s")}
+
+
 def _cap_evidence(config, cache, nas, prefix, platform, timings):
-    """{field: (value, source)} for one platform, from files on this machine.
+    """{field: {value, source, quality}} for one platform, from this machine.
 
     Only what was actually SEEN. A key absent here means no evidence, which
     `_verdict` turns into `unknown` rather than into a proposal of None --
@@ -671,6 +701,10 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
     t = (timings or {}).get(prefix) or {}
     nas_root = config.get("nas_path", "")
 
+    def saw(field, value, source, claim=None):
+        out[field] = {"value": value, "source": source,
+                      "quality": _quality(t, claim) if claim else None}
+
     vid, _src = None, None
     for f in (nas.get(f"{prefix}_video"), nas.get(f"{prefix}_chat")):
         if f:
@@ -678,32 +712,35 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
             if vid:
                 if platform == "twitch":
                     vid = vid.lstrip("v") or vid
-                out["remote_id"] = (vid, f"the filename of {f}")
+                saw("remote_id", vid, f"the filename of {f}")
                 break
 
     if nas.get(f"{prefix}_video"):
-        out["video_path"] = (ls_archive.archive_path(config, nas[f"{prefix}_video"]),
-                             "the file on the NAS")
+        saw("video_path", ls_archive.archive_path(config, nas[f"{prefix}_video"]),
+            "the file on the NAS")
     if nas.get(f"{prefix}_chat"):
-        out["chat_path"] = (ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
-                            "the file on the NAS")
+        saw("chat_path", ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
+            "the file on the NAS")
 
     if t.get("stream_start_epoch_ms"):
-        out["remote_start_wall"] = (t["stream_start_epoch_ms"] // 1000,
-                                    t.get("stream_start_source") or "measured here")
+        saw("remote_start_wall", t["stream_start_epoch_ms"] // 1000,
+            t.get("stream_start_source") or "measured here",
+            ls_witness.BROADCAST_START)
     if t.get("record_start_epoch_ms"):
-        out["local_start_wall"] = (t["record_start_epoch_ms"] // 1000,
-                                   t.get("record_start_source") or "measured here")
-        out["local_start_precision_s"] = (
+        saw("local_start_wall", t["record_start_epoch_ms"] // 1000,
+            t.get("record_start_source") or "measured here",
+            ls_witness.RECORD_START)
+        saw("local_start_precision_s",
             60 if t.get("record_start_accuracy") == "minute" else 1,
             "how precisely the recording start could be read")
     if t.get("measured_duration_s"):
-        out["file_duration_s"] = (int(t["measured_duration_s"]), "ffprobe")
+        saw("file_duration_s", int(t["measured_duration_s"]), "ffprobe",
+            ls_witness.FILE_DURATION)
 
     row = ls_common.find_vod(cache, vid, platform) if vid else None
     if row and row.get("duration_secs"):
-        out["remote_duration_s"] = (int(row["duration_secs"]),
-                                    f"what {platform} says about {vid}")
+        saw("remote_duration_s", int(row["duration_secs"]),
+            f"what {platform} says about {vid}")
     return out
 
 
@@ -747,14 +784,14 @@ def evaluate(config: dict, index: int, state: dict, *,
             out["stream"].append({
                 "field": field, "currently": held_s.get(field), "kind": "derived",
                 "verdict": UNKNOWN, "proposed": None, "source": None,
-                "why": "derived from the measurements below it"})
+                "quality": None, "why": "derived from the measurements below it"})
             continue
         # Stream-level measurements are next round's work; answered honestly
         # rather than left out, so the drift check below stays meaningful.
         out["stream"].append({
             "field": field, "currently": held_s.get(field), "kind": "measured",
             "verdict": UNKNOWN, "proposed": None, "source": None,
-            "why": "no check for this yet"})
+            "quality": None, "why": "no check for this yet"})
         out["drift"]["sent_but_unchecked"].append(f"stream.{field}")
 
     known = {"remote_id", "video_path", "chat_path", "remote_start_wall",
@@ -774,17 +811,19 @@ def evaluate(config: dict, index: int, state: dict, *,
             if kind == "derived":
                 rows.append({"field": field, "currently": held, "kind": "derived",
                              "verdict": UNKNOWN, "proposed": None, "source": None,
+                             "quality": None,
                              "why": "derived from the measurements above it"})
                 continue
             if field not in known:
                 rows.append({"field": field, "currently": held, "kind": "measured",
                              "verdict": UNKNOWN, "proposed": None, "source": None,
-                             "why": "no check for this yet"})
+                             "quality": None, "why": "no check for this yet"})
                 out["drift"]["sent_but_unchecked"].append(f"capture.{field}")
                 continue
             got = saw.get(field)
-            v = _verdict(field, held, got[0] if got else None,
-                         source=got[1] if got else None,
+            v = _verdict(field, held, got["value"] if got else None,
+                         source=got["source"] if got else None,
+                         quality=got["quality"] if got else None,
                          why=None if got else (
                              "the platform this came from is not one this "
                              "recorder knows" if not prefix else
@@ -1449,16 +1488,53 @@ def _iso(ms: int | None) -> str | None:
     return datetime.datetime.fromtimestamp(ms / 1000).isoformat(timespec="seconds")
 
 
+def _kept_testimony(config: dict, index: int) -> dict:
+    """{prefix: [witness, ...]} out of the entry's sidecar, per platform.
+
+    One reader for the three places that need it. A sidecar written before
+    testimony was a thing has no `testimony` key, so its history is taken off
+    the settlement blocks it does carry -- `witnesses` plus `refused`, which
+    between them are everything `settle` was given. Without that fallback the
+    first sweep after this change would start every entry from empty, which
+    is precisely the loss it exists to prevent.
+    """
+    prior = ls_common.read_meta(os.path.join(
+        config.get("nas_path", ""), ls_common.entry_meta_name(index))) or {}
+    out = {}
+    for prefix, platform in (("yt", "youtube"), ("tw", "twitch")):
+        old = prior.get(platform) or {}
+        keep = old.get("testimony")
+        if keep is None:
+            keep = [w for st in (old.get("settled") or {}).values()
+                    for w in ((st or {}).get("witnesses") or [])
+                    + ((st or {}).get("refused") or [])]
+        out[prefix] = keep
+    return out
+
+
 def _platform_timings(config: dict, cache: list[dict], nas: dict,
-                      prefix: str, platform: str) -> dict | None:
-    """Best-effort timings for one platform, with provenance on every value."""
+                      prefix: str, platform: str,
+                      kept: list[dict] | None = None) -> dict | None:
+    """Best-effort timings for one platform, with provenance on every value.
+
+    `kept` is what this entry's sidecar already held for this platform. Fresh
+    readings replace it per (claim, source) and the rest survives -- see
+    `ls_witness.merge_testimony`. Absent, this behaves exactly as it did.
+    """
     nas_root = config.get("nas_path", "")
     chat_file = nas.get(f"{prefix}_chat")
     video_file = nas.get(f"{prefix}_video")
-    if not (chat_file or video_file):
+    #  NOT "no files, nothing to say" any more. That line is why deleting one
+    #  recording erased its platform's whole block: the sidecar was rebuilt
+    #  from the files present this minute, and a platform with none was simply
+    #  not in the new document. What a witness said once does not stop being
+    #  true because the file it said it about has gone -- and for the two wall
+    #  times, nothing can ever say it again.
+    if not (chat_file or video_file or kept):
         return None
 
-    vid = ls_common.extract_video_id_from_filename(chat_file or video_file)
+    vid = (ls_common.extract_video_id_from_filename(chat_file or video_file)
+           if (chat_file or video_file) else None)
     vod = (ls_common.find_vod(cache, vid, platform) or {}) if vid else {}
 
     # ── GATHER, then settle. This was a fallback chain until C3 ─────────────
@@ -1519,6 +1595,12 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
             measured = analyze_video_file(vp).get("duration_secs")
             ws += ls_witness.read_ffprobe(measured)
 
+    #  Everything heard before, under everything heard now. The settlement
+    #  runs over the merged set, so a claim whose only live witness has gone
+    #  is still answered -- by the last source that answered it, marked stale.
+    ws = ls_witness.merge_testimony(
+        kept, ws, now_s=int(datetime.datetime.now().timestamp()))
+
     stream = ls_witness.settle(ls_witness.BROADCAST_START, ws)
     record = ls_witness.settle(ls_witness.RECORD_START, ws)
     on_disk = ls_witness.settle(ls_witness.FILE_DURATION, ws)
@@ -1550,6 +1632,10 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
         #  refused, who won and by how far anybody disagreed — which is the
         #  product of this whole round and is additive on purpose, so no
         #  existing reader has to change to keep working.
+        #  THE STORE, beside the derived view of it. `settled` is what the
+        #  witnesses add up to and is recomputed every run; this is the
+        #  witnesses themselves, and it is the thing that persists.
+        "testimony": ws,
         "settled": {"broadcast_start": stream, "record_start": record,
                     "file_duration": on_disk, "broadcast_duration": broadcast},
         "video_id": vid,
@@ -1884,13 +1970,19 @@ def cmd_timings(config: dict, index: int, output: str | None = None,
     nas = scan_nas(config, index)
     cache = ls_common.load_cache()
 
+    #  What this entry's sidecar already holds, read BEFORE anything is
+    #  derived, because it is an input now rather than merely the thing about
+    #  to be overwritten.
+    prior_ws = _kept_testimony(config, index)
+
     doc = {"schema": 1, "index": int(index),
            "generated_at": datetime.datetime.now().isoformat(timespec="seconds")}
     any_found = False
 
     gathered = {}
     for prefix, platform in (("yt", "youtube"), ("tw", "twitch")):
-        t = _platform_timings(config, cache, nas, prefix, platform)
+        t = _platform_timings(config, cache, nas, prefix, platform,
+                              prior_ws.get(prefix))
         if t:
             gathered[prefix] = t
     #  Before anything is printed or written down: a sidecar recording a
@@ -4071,11 +4163,16 @@ def inspect(config: dict, index: int, *,
     # The measurements, kept so the renderer does not have to re-derive them.
     # `_platform_timings` reads chat files and shells out to ffprobe; asking it
     # twice for one entry would double the slowest part of an audit.
+    #  The same history `cmd_timings` writes with. Without this the report
+    #  would describe a platform as having nothing while the sidecar beside it
+    #  holds its broadcast start -- two answers to one question, from one run.
+    prior_ws = _kept_testimony(config, index)
     out["timings"] = {}
     for prefix, platform in (("yt", "youtube"), ("tw", "twitch")):
         if entry.get(f"no_{prefix}"):
             continue
-        t = _platform_timings(config, cache, nas, prefix, platform)
+        t = _platform_timings(config, cache, nas, prefix, platform,
+                              prior_ws.get(prefix))
         if t:
             out["timings"][prefix] = t
     #  A cached broadcast length the two recordings disprove, corrected before
@@ -4489,7 +4586,8 @@ def _archive_inputs(config: dict, cache: list[dict], entry: dict, nas: dict,
         # how the archive already spells "there was nothing here".
         if no_it or not vid:
             continue
-        t = _platform_timings(config, cache, nas, prefix, platform) or {}
+        t = _platform_timings(config, cache, nas, prefix, platform,
+                              _kept_testimony(config, index).get(prefix)) or {}
         timings[platform] = t
         cap = {
             "platform": platform,

@@ -526,3 +526,70 @@ def settle(claim: str, witnesses: list[dict]) -> dict:
             #  display vocabulary in the settlement.
             "best": best,
             "witnesses": usable, "refused": refused, "spread_s": spread}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TESTIMONY
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  The sidecar was a REGENERATION: every run rebuilt it from whatever files
+#  were on the NAS that minute, and everything the files no longer said was
+#  gone. Deleting one duplicated recording erased its platform's entire block
+#  — start, record start, duration, the lot — and the recorder's two wall
+#  times, the only numbers in this system that nothing can recover afterwards,
+#  survived that only because the archive happened to hold a copy.
+#
+#  So it accumulates instead. A witness is one source's answer to one
+#  question, which makes (claim, source) its identity: ask again and the new
+#  answer replaces the old one under that key; do not ask, or ask and get
+#  nothing, and the stored answer stays.
+#
+#  Two stamps, recorded and not acted on:
+#
+#    seen_at  when this reading was last taken.
+#    stale    this run could not re-take it. The file it came from is gone,
+#             the cache row went, the log rolled over.
+#
+#  A stale witness keeps its authority and settles exactly as it always did.
+#  That is deliberate and it is not obviously right for every claim — a
+#  `file_duration` is a fact about a file, and one whose file has been deleted
+#  is testimony about something that no longer exists, while a
+#  `broadcast_start` is a fact about the broadcast and stays true whatever
+#  happens to the recordings of it. Marking it and leaving the behaviour alone
+#  keeps that a question somebody can look at and answer, rather than one this
+#  function answered quietly on their behalf.
+
+def testimony_key(w: dict) -> tuple:
+    """What makes two readings the same reading: one source, one question."""
+    return (str(w.get("claim") or ""), str(w.get("source") or ""))
+
+
+def merge_testimony(kept, fresh, *, now_s: int) -> list[dict]:
+    """Everything ever heard about one platform, newest answer per source.
+
+    `fresh` wins on collision, and that is the whole of the overwrite rule: a
+    renamed file, a refreshed cache row, a platform asked a second time are
+    all the same source answering again, and the newer answer is the one to
+    keep. `kept` entries with no fresh counterpart survive, marked stale.
+
+    Order is fresh-first then kept, so a caller reading the list top-down sees
+    what was just measured before what merely persists.
+    """
+    out, seen = [], set()
+    for w in fresh or []:
+        k = testimony_key(w)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({**w, "seen_at": now_s, "stale": False})
+    for w in kept or []:
+        k = testimony_key(w)
+        if k in seen or not k[0]:
+            continue
+        seen.add(k)
+        #  `seen_at` is preserved, never restamped: it says when the reading
+        #  was TAKEN, and a sweep that merely carried it forward has not taken
+        #  it again. Restamping would make a five-month-old measurement look
+        #  like this morning's on every run.
+        out.append({**w, "seen_at": w.get("seen_at"), "stale": True})
+    return out
