@@ -736,15 +736,56 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
         out[field] = {"value": value, "source": source,
                       "quality": _quality(t, claim) if claim else None}
 
-    vid, _src = None, None
+    #  THE ID OFF THE FILENAME, WHICH ON TWITCH IS OFTEN THE WRONG KIND.
+    #
+    #  A Twitch BROADCAST and the VOD it becomes carry different numbers. The
+    #  recorder catches the channel live, so the only id that exists while it
+    #  is writing the file is the broadcast's -- and that is the one that ends
+    #  up in the filename. The VOD is minted when the broadcast ends.
+    #
+    #  `resolve_id` has corrected for this for years; this did not, and the
+    #  consequence was a read-back offering to replace a capture's good VOD id
+    #  with the broadcast id out of its own filename. On #748 the archive held
+    #  2884336619 and this proposed 318722472677, which is a number no watch
+    #  URL resolves.
+    #
+    #  So the same correction runs here. When the cache cannot map it -- a
+    #  broadcast it has never seen -- nothing is proposed at all: `unknown`
+    #  with the reason, because "I have a number and it is the wrong kind" is
+    #  not a better answer than "I cannot tell".
+    vid = None
     for f in (nas.get(f"{prefix}_video"), nas.get(f"{prefix}_chat")):
-        if f:
-            vid = ls_common.extract_video_id_from_filename(f)
-            if vid:
-                if platform == "twitch":
-                    vid = vid.lstrip("v") or vid
-                saw("remote_id", vid, f"the filename of {f}")
-                break
+        if not f:
+            continue
+        raw = ls_common.extract_video_id_from_filename(f)
+        if not raw:
+            continue
+        if platform != "twitch":
+            saw("remote_id", raw, f"the filename of {f}")
+            vid = raw
+            break
+        raw = raw.lstrip("v") or raw
+        fixed, corrected = ls_common.twitch_correct_id(cache, raw)
+        if corrected:
+            saw("remote_id", fixed, f"the VOD that {raw} became, per the cache")
+            vid = fixed
+            break
+        row = ls_common.find_vod(cache, raw, "twitch")
+        if row and ls_common.is_broadcast_row(row):
+            #  Known to be a broadcast, and no VOD claims it yet. Saying so is
+            #  the whole value: the archive's id is probably right and this
+            #  one is definitely not a video.
+            out["remote_id"] = {
+                "value": None, "source": None,
+                "quality": {"agreement": "single", "precision_s": 0,
+                            "witnesses": 1, "corroborated": False,
+                            "stale": False, "seen_at": None,
+                            "was": raw, "was_source": "a broadcast id, not a VOD"}}
+            vid = raw
+            break
+        saw("remote_id", raw, f"the filename of {f}")
+        vid = raw
+        break
 
     if nas.get(f"{prefix}_video"):
         saw("video_path", ls_archive.archive_path(config, nas[f"{prefix}_video"]),
