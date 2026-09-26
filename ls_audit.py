@@ -882,6 +882,11 @@ def evaluate(config: dict, index: int, state: dict, *,
     for field in sorted(known - set(c_kinds)):
         out["drift"]["checked_but_unsent"].append(f"capture.{field}")
 
+    #  Drift is about the CONTRACT, not about one capture. An entry with two
+    #  of them reported `capture.url is sent and nothing checks it` twice,
+    #  which reads as two problems and is one -- the loop below appends per
+    #  capture, so the count was a count of captures wearing the shape of a
+    #  count of gaps.
     for cap in ((state or {}).get("captures") or []):
         plat = _UNPLATFORM.get(str(cap.get("platform") or "").strip().upper())
         prefix = {"youtube": "yt", "twitch": "tw"}.get(plat)
@@ -919,6 +924,18 @@ def evaluate(config: dict, index: int, state: dict, *,
             rows.append(v)
         out["captures"].append({"id": cap.get("id"), "platform": cap.get("platform"),
                                 "fields": rows})
+
+    #  One line per gap, in a stable order, however many captures were looked
+    #  at. Sorted rather than first-seen so two runs over the same entry say
+    #  the same sentence -- a drift report that reshuffles itself is one
+    #  nobody can diff against yesterday's.
+    #
+    #  `checked_but_unsent` cannot duplicate today: it is built from a set
+    #  difference before the capture loop runs. It goes through here anyway
+    #  so the two halves are the same shape, and so the day somebody builds
+    #  it per capture as well it does not quietly start counting captures.
+    for k in ("sent_but_unchecked", "checked_but_unsent"):
+        out["drift"][k] = sorted(set(out["drift"][k]))
     return out
 
 
