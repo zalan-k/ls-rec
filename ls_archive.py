@@ -1019,7 +1019,13 @@ PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
             # platform, one entry, because somebody clicked. Its quieter half,
             # `give_up`, spends no bandwidth and is still this machine's: the
             # ledger it writes sits beside the recorder.
-            "chat_repair")
+            "chat_repair",
+            # And its sibling, for a file that was never here to be short. A
+            # broadcast on somebody else's channel exists to this archive as a
+            # URL and nothing more; `chat_repair` cannot touch it, because
+            # everything it does is relative to a capture already on the NAS.
+            # This one starts from the id and writes the first copy.
+            "pull")
 
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 

@@ -1784,7 +1784,12 @@ def do_audit(config: dict, job: dict):
     # Never fatal: an archive that cannot be reached means the audit reports
     # what it always did. Losing the answers costs a repeated question; losing
     # the audit costs the run.
-    known = None
+    #
+    # The same packet also carries the capture rows, and those are where an id
+    # a human pasted into the website lives. Handed down so the audit can see
+    # it: the recorder's four id sources are the vault, the filename, the
+    # cache and the CLI, none of which a website visitor can write to.
+    known = seen = None
     try:
         seen = ls_archive.lookup(config, idx=idx)
         known = ((seen or {}).get("stream") or {}).get("claims")
@@ -1792,7 +1797,7 @@ def do_audit(config: dict, job: dict):
         logger.warning("audit %s: could not read claims: %s", idx, e)
 
     try:
-        got = ls_audit.inspect(config, idx, claims=known)
+        got = ls_audit.inspect(config, idx, claims=known, archive=seen)
     except Exception as e:
         logger.exception("audit %s failed", idx)
         return ("failed", None, f"{type(e).__name__}: {e}", None)
@@ -1821,7 +1826,7 @@ def do_audit(config: dict, job: dict):
             # Something landed on disk, so the plan has to describe the entry
             # as it is NOW. Without this the archive would be told about a
             # chat this very run merged, and propose a change already made.
-            got = ls_audit.inspect(config, idx, claims=known)
+            got = ls_audit.inspect(config, idx, claims=known, archive=seen)
             if not got.get("ok"):
                 return ("failed", None,
                         got.get("reason") or "the entry could not be re-read", None)
@@ -2003,11 +2008,64 @@ def do_chat_repair(config: dict, job: dict):
              "ran": out["ran"], "merged": out["changed"], "why": out.get("why")})
 
 
+def do_pull(config: dict, job: dict):
+    """Fetch a file this machine never recorded, because somebody said to.
+
+    The sibling of `do_chat_repair` and the gap beside it. A repair mends a
+    capture that is HERE and short; this gets one that was never here at all.
+    Until it existed, a broadcast whose only trace was a URL somebody pasted
+    into the website could be entered, stored and resolved, and then acted on
+    by nobody: the panel's answers were "there was no broadcast" and "I did
+    not keep it", and on that entry both of them are false.
+
+    `what` is "video", "chat" or "both". This is the second kind whose whole
+    purpose is to open an outbound socket, and like the first it only ever
+    runs because a person clicked.
+
+    `ls_audit` is imported HERE for the same reason `do_audit` does it.
+    """
+    payload = job.get("payload", {}) or {}
+    try:
+        idx = int(payload.get("idx"))
+    except (TypeError, ValueError):
+        return ("failed", None, "the job does not name an entry", None)
+    platform = str(payload.get("platform") or "").lower()
+    what = str(payload.get("what") or "both").lower()
+    if platform not in ("youtube", "twitch"):
+        return ("failed", None,
+                f"the job names no platform to pull (got {platform!r})", None)
+    if what not in ("video", "chat", "both"):
+        return ("failed", None, f"this worker does not pull {what!r}", None)
+
+    try:
+        import ls_audit
+    except Exception as e:
+        return ("failed", None, f"this worker cannot pull: {e}", None)
+
+    try:
+        out = ls_audit.pull(config, idx, platform, what)
+    except Exception as e:
+        logger.exception("pull %s %s %s failed", idx, platform, what)
+        return ("failed", None, f"{type(e).__name__}: {e}", None)
+
+    # Same rule as a repair: somebody clicked a button and is owed an answer
+    # either way, so a pull that came back empty-handed is a FAILED job and
+    # its `why` is the whole of what they get told. The no-op -- it was
+    # already here -- is a success, because the entry is in the state they
+    # asked for.
+    if not out["ran"] and "already here" not in (out.get("why") or ""):
+        return ("failed", None, out.get("why") or "nothing came back", None)
+    return ("done", None, None,
+            {"idx": idx, "platform": platform, "what": what,
+             "ran": out["ran"], "merged": out["changed"],
+             "files": out["files"], "why": out.get("why")})
+
+
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
             "rescan": do_rescan, "harvest": do_harvest,
             "music_probe": do_music_probe, "music_fetch": do_music_fetch,
             "clip": do_clip, "audit": do_audit,
-            "chat_repair": do_chat_repair}
+            "chat_repair": do_chat_repair, "pull": do_pull}
 
 _stop = False
 
@@ -2084,8 +2142,13 @@ def preflight(config: dict, kinds, *, loud: bool = True) -> bool:
     # master off the media root and writes the cut into quarantine, so
     # `ls-jobs --kinds clip` used to pass preflight without checking either
     # root and then fail on the job.
+    # `pull` writes the first copy of a file straight into the entry's
+    # directory under the media root, which is the one thing `audit` beside it
+    # never does -- an audit only reads. A worker that took a pull without
+    # this would pass preflight and then die on the download, after the
+    # bandwidth had been spent.
     need_media = bool({"promote", "purge", "rescan", "music_fetch",
-                       "harvest", "clip"} & set(kinds))
+                       "harvest", "clip", "pull"} & set(kinds))
     need_q = bool({"promote", "fetch", "clip"} & set(kinds))
     # A clip has a THIRD root and this check only knew two of them, so the bug
     # the `clip` entries above were added to prevent happened again one root

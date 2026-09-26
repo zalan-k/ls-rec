@@ -331,18 +331,52 @@ def scan_nas(config: dict, index: int) -> dict:
 #  ID RESOLUTION
 # ═══════════════════════════════════════════════════════════════════════════
 #
-#  Priority: CLI override → entry URL → NAS filename → cache (by index)
-#            → cache (by date, with auto-refresh if stale)
+#  Priority: CLI override → entry URL → NAS filename → archive capture
+#            → cache (by index) → cache (by date, with auto-refresh if stale)
+#
+#  The archive sits above the cache and below the filename for one reason:
+#  the three above it are STATEMENTS of identity — somebody typed this id,
+#  here or in the vault or into a filename — and the two below it are
+#  GUESSES, a cache row that claims an index or happens to fall on the same
+#  day. A stream broadcast from somebody else's channel is in neither cache,
+#  so a date guess there is not a weaker answer than the pasted URL, it is a
+#  wrong one.
 
 # Refreshed at most once per run. The correction below wants a cache that has
 # heard of this id, and a sweep over two hundred entries must not mean two
 # hundred trips to Helix for the same answer.
 _TW_REFRESHED = False
 
+# ls_archive.PLATFORM the other way round: "YT" → "youtube".
+_UNPLATFORM = {v: k for k, v in ls_archive.PLATFORM.items()}
+
+
+def archive_ids(seen: dict | None) -> dict[str, str]:
+    """{platform: remote_id} out of an `/api/ingest/lookup` response.
+
+    Pure, and takes the response rather than fetching one, because the two
+    callers that matter already have it in hand: the worker reads claims
+    through the same lookup before it inspects anything.
+
+    This is the only path by which an id a human typed into the WEBSITE
+    reaches the recorder's side of the house. Without it, a capture added in
+    the UI — right URL, id extracted, row written — is invisible here, and
+    the audit goes on reporting the stream as never recorded and offering to
+    give up on it. That is the archive and the Pi being two archives.
+    """
+    out = {}
+    for cap in (((seen or {}).get("stream") or {}).get("captures") or []):
+        remote = str(cap.get("remote_id") or "").strip()
+        plat = _UNPLATFORM.get(str(cap.get("platform") or "").strip().upper())
+        if remote and plat:
+            out[plat] = remote
+    return out
+
 
 def resolve_id(config: dict, cache: list[dict], platform: str,
                entry: dict, nas: dict,
-               cli_override: str | None = None) -> tuple[str | None, str | None]:
+               cli_override: str | None = None,
+               arch_ids: dict[str, str] | None = None) -> tuple[str | None, str | None]:
     """Resolve video ID for a platform, correcting a Twitch STREAM id.
 
     Everything upstream of this — the Obsidian entry, the NAS filename, and for
@@ -357,7 +391,8 @@ def resolve_id(config: dict, cache: list[dict], platform: str,
     that broadcast, the VOD's id is the answer.
     """
     global _TW_REFRESHED
-    vid, src = _resolve_id_raw(config, cache, platform, entry, nas, cli_override)
+    vid, src = _resolve_id_raw(config, cache, platform, entry, nas, cli_override,
+                               arch_ids)
     if platform != "twitch" or not vid:
         return vid, src
 
@@ -454,7 +489,8 @@ def unpublished_vod(cache: list[dict], platform: str, video_id: str | None) -> b
 
 def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
                     entry: dict, nas: dict,
-                    cli_override: str | None = None) -> tuple[str | None, str | None]:
+                    cli_override: str | None = None,
+                    arch_ids: dict[str, str] | None = None) -> tuple[str | None, str | None]:
     """Where an id is looked for, in order. See resolve_id for the correction."""
     tag = "yt" if platform == "youtube" else "tw"
 
@@ -474,7 +510,12 @@ def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
         if vid:
             return vid, "nas"
 
-    # 4. Cache by obsidian_index
+    # 4. The archive's capture row — a URL somebody entered on the website
+    arch = (arch_ids or {}).get(platform)
+    if arch:
+        return arch, "archive"
+
+    # 5. Cache by obsidian_index
     target_index = entry.get("_index")
     if target_index is not None:
         for vod in cache:
@@ -482,7 +523,7 @@ def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
                     and vod.get("obsidian_index") == int(target_index)):
                 return vod["id"], "cache (index)"
 
-    # 5. Cache by date (auto-refresh if stale)
+    # 6. Cache by date (auto-refresh if stale)
     if entry["date_obj"]:
         target_index = entry.get("_index")
 
@@ -759,70 +800,234 @@ def _download_files(config: dict, missing: list[dict],
         print("  Nothing selected.")
         return False
 
-    nas_path = config["nas_path"]
     any_success = False
-
     for m in selected:
-        url = m["url"]
-        platform = m["platform"]
-        dl_type = m["type"]
+        got = _pull_one(config, index, m)
+        print(f"  {'✔' if got['ok'] else '✗'} {got['why']}")
+        any_success = any_success or got["ok"]
 
-        # Probe for filename construction
-        data = ls_common.ytdlp_probe(config, url, playlist_items="1")
-        if data:
-            title = data.get("title") or "Unknown"
-            vid = data.get("id", "unknown")
-            release_ts = data.get("release_timestamp")
-            upload_date = data.get("upload_date", "")
-            if release_ts:
-                ts = datetime.datetime.fromtimestamp(release_ts).strftime(
-                    "%Y-%m-%d_%H-%M",
-                )
-            elif upload_date:
-                ts = (f"{upload_date[:4]}-{upload_date[4:6]}"
-                      f"-{upload_date[6:]}_00-00")
-            else:
-                ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
-            safe_title = sanitize_filename(f"{title} [{vid}] @ {ts}")
-        else:
-            safe_title = sanitize_filename(f"unknown @ {datetime.datetime.now()}")
+    return any_success
 
-        safe_title = f"{int(index):03d}_{safe_title}"
-        print(f"\n  ↓ {m['label']}: {safe_title}")
 
-        if dl_type == "video":
-            cmd = ls_common.ytdlp_vod_cmd(
-                config, url, f"{safe_title}.%(ext)s",
+#  How long one pull may run before it is abandoned. A VOD is hours of video,
+#  so this is not `archive_fetch_timeout_s`, which governs a pasted clip and is
+#  sized for one. There is a number at all -- rather than None -- because a job
+#  holds a lease it cannot renew while this runs.
+PULL_TIMEOUT_S = 7200
+
+
+def _pull_stem(config: dict, index: int, url: str) -> str:
+    """The name a file pulled for entry #index is written under.
+
+    Asked of the PLATFORM rather than assembled from what is on disk, because
+    the case this exists for is that nothing is on disk: a broadcast from a
+    collab partner's channel has no local file to take a name from, which is
+    exactly why its chat could never be fetched.
+
+    The `[id]` is not decoration. `scan_nas` skips any file it cannot read a
+    video id out of, so a pull named without one lands on the NAS and is
+    invisible to every sweep after it.
+    """
+    data = ls_common.ytdlp_probe(config, url, playlist_items="1")
+    if data:
+        title = data.get("title") or "Unknown"
+        vid = data.get("id", "unknown")
+        release_ts = data.get("release_timestamp")
+        upload_date = data.get("upload_date", "")
+        if release_ts:
+            ts = datetime.datetime.fromtimestamp(release_ts).strftime(
+                "%Y-%m-%d_%H-%M",
             )
-            subprocess.run(cmd, cwd=nas_path)
-            any_success = True
+        elif upload_date:
+            ts = (f"{upload_date[:4]}-{upload_date[4:6]}"
+                  f"-{upload_date[6:]}_00-00")
+        else:
+            ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+        stem = sanitize_filename(f"{title} [{vid}] @ {ts}")
+    else:
+        stem = sanitize_filename(f"unknown @ {datetime.datetime.now()}")
+    return f"{int(index):03d}_{stem}"
 
-        elif dl_type == "chat":
+
+def _pull_one(config: dict, index: int, item: dict, *,
+              timeout: int | None = None) -> dict:
+    """Download ONE missing file. Asks nothing, prints nothing a job cannot
+    carry home. Returns {"ok", "file", "why"}.
+
+    Split out of `_download_files` rather than written beside it: the terminal
+    and the panel must not be able to drift into pulling different things
+    under different names, and the name is most of what a pull IS.
+
+    IT CHECKS THAT A FILE LANDED, which is the one thing the loop this came
+    out of never did -- it set success unconditionally after `subprocess.run`,
+    so a yt-dlp that exited 1 without writing a byte reported as a download.
+    Harmless at a terminal, where the failure is on screen above the summary.
+    Not harmless from a panel, where that is the whole of the answer.
+    """
+    url = item["url"]
+    platform = item["platform"]
+    what = item["type"]
+    timeout = PULL_TIMEOUT_S if timeout is None else timeout
+    nas_path = config["nas_path"]
+    if not nas_path or not os.path.isdir(nas_path):
+        return {"ok": False, "file": None, "why": "the NAS is not mounted"}
+
+    # Before the name, which costs a network round trip to build: a Twitch
+    # chat needs a downloader this machine may not have, and spending a probe
+    # to find that out means the answer arrives slower and says the wrong
+    # thing about why.
+    tdl = config.get("twitch_downloader_cli")
+    if what == "chat" and platform == "twitch" and not (tdl and os.path.exists(tdl)):
+        return {"ok": False, "file": None,
+                "why": "twitch_downloader_cli is not configured; "
+                       "a Twitch chat cannot be pulled without it"}
+
+    stem = _pull_stem(config, index, url)
+    print(f"\n  ↓ {item['label']}: {stem}")
+
+    try:
+        if what == "video":
+            cmd = ls_common.ytdlp_vod_cmd(config, url, f"{stem}.%(ext)s")
+            subprocess.run(cmd, cwd=nas_path, timeout=timeout)
+            # Whatever container it settled on, and never a fragment: the
+            # format string above can merge to mkv when a remux fails, and
+            # `.f140.m4a` is an intermediate `scan_nas` skips for good reason.
+            got = [f for f in glob.glob(os.path.join(nas_path, glob.escape(stem) + ".*"))
+                   if os.path.splitext(f)[1].lower() in ls_common.VIDEO_EXTS
+                   and not re.search(r"\.f\d+\.\w+$", f)
+                   and os.path.getsize(f) > 0]
+            if not got:
+                return {"ok": False, "file": None,
+                        "why": "nothing came back — no video file was written"}
+            name = os.path.basename(max(got, key=os.path.getsize))
+            return {"ok": True, "file": name,
+                    "why": f"{name} — {os.path.getsize(os.path.join(nas_path, name)) / 2**30:.1f} GB"}
+
+        if what == "chat":
             # Under the offline-pull name in both branches, which is beside any
             # capture rather than over it. See ls_common.OFFLINE_PULL_TAG: a
             # pull is one capture among however many the entry has, and the
             # merge is what decides between them.
-            pull = ls_common.offline_pull_name(safe_title)
-            tdl = config.get("twitch_downloader_cli")
-            if platform == "twitch" and tdl and os.path.exists(tdl):
+            pull = ls_common.offline_pull_name(stem)
+            final = os.path.join(nas_path, pull)
+            if platform == "twitch":
                 vod_id = url.rstrip("/").split("/")[-1]
-                subprocess.run([
-                    tdl, "chatdownload", "--id", vod_id,
-                    "-o", os.path.join(nas_path, pull),
-                ])
+                subprocess.run([tdl, "chatdownload", "--id", vod_id, "-o", final],
+                               timeout=timeout)
             else:
-                cmd = ls_common.ytdlp_chat_cmd(
-                    config, url, f"{safe_title}.%(ext)s",
-                )
-                subprocess.run(cmd, cwd=nas_path)
-                # Rename .live_chat.json → the pull name
-                lc = os.path.join(nas_path, f"{safe_title}.live_chat.json")
-                final = os.path.join(nas_path, pull)
+                cmd = ls_common.ytdlp_chat_cmd(config, url, f"{stem}.%(ext)s")
+                subprocess.run(cmd, cwd=nas_path, timeout=timeout)
+                lc = os.path.join(nas_path, f"{stem}.live_chat.json")
                 if os.path.exists(lc):
-                    os.rename(lc, final)
-            any_success = True
+                    os.replace(lc, final)
 
-    return any_success
+            if not os.path.exists(final) or os.path.getsize(final) == 0:
+                if os.path.exists(final):
+                    os.remove(final)
+                return {"ok": False, "file": None,
+                        "why": "nothing came back — a broadcast id cannot be "
+                               "downloaded from, and a muted or deleted VOD has "
+                               "no chat to give"}
+            # Parsed before it is kept, on the same bar as `_backfill_tw_chat`:
+            # a file that does not read as chat is worse than no file, because
+            # every later sweep sees a chat on disk and stops asking.
+            try:
+                got = ls_chat.convert_file(final)
+            except (OSError, ValueError, json.JSONDecodeError) as e:
+                os.remove(final)
+                return {"ok": False, "file": None, "why": f"the pull does not parse: {e}"}
+            if not got.messages:
+                os.remove(final)
+                return {"ok": False, "file": None,
+                        "why": "the pull has no messages in it"}
+            return {"ok": True, "file": pull,
+                    "why": f"{pull} — {len(got.messages):,} messages"}
+
+        return {"ok": False, "file": None, "why": f"nothing here pulls a {what!r}"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "file": None,
+                "why": f"gave up after {timeout // 60} minutes"}
+    except OSError as e:
+        return {"ok": False, "file": None, "why": f"{type(e).__name__}: {e}"}
+
+
+def pull(config: dict, index: int, platform: str, what: str,
+         cache: list[dict] | None = None) -> dict:
+    """Fetch a file this machine never recorded, because somebody said to.
+
+    The sibling of `repair`, and the gap beside it. `repair` mends a capture
+    that is HERE and short; this gets one that was never here at all -- the
+    ordinary shape of a collab, where `ls-rec watch` was given one link and
+    the other platform's broadcast exists only as a URL somebody pasted in
+    afterwards. Until this, that URL could be entered, stored, resolved, and
+    then acted on by nobody: the panel's only answers were "there was no
+    broadcast" and "I did not keep it", and both of them are false.
+
+    `what` is "video", "chat", or "both" -- "both" being the answer to the one
+    question that covers a platform with nothing from it at all.
+
+    Returns {"ran", "changed", "why", "files"}. `ran` False with a `why` is
+    the honest no-op, not a failure.
+    """
+    if platform not in ("youtube", "twitch"):
+        return {"ran": False, "changed": False, "files": [],
+                "why": f"unknown platform {platform!r}"}
+    if what not in ("video", "chat", "both"):
+        return {"ran": False, "changed": False, "files": [],
+                "why": f"nothing here pulls a {what!r}"}
+
+    entry = ls_common.obsidian_parse_entry(config, index)
+    if not entry["found"]:
+        return {"ran": False, "changed": False, "files": [],
+                "why": f"entry #{index} not found"}
+    entry["_index"] = index
+    cache = ls_common.load_cache() if cache is None else cache
+    nas = scan_nas(config, index)
+    # The same five sources the audit uses, in the same order -- including the
+    # archive, which is where the URL for a broadcast on somebody else's
+    # channel lives and the only place it can have come from.
+    arch_ids = archive_ids(ls_archive.lookup(config, idx=index)
+                           if ls_archive.enabled(config) else None)
+    vid, _src = resolve_id(config, cache, platform, entry, nas, None, arch_ids)
+    if not vid:
+        return {"ran": False, "changed": False, "files": [],
+                "why": f"no {platform} id for #{index}, so there is nothing to "
+                       f"fetch from — paste the VOD link on the capture first"}
+
+    yt_id = vid if platform == "youtube" else None
+    tw_id = vid if platform == "twitch" else None
+    want = {"video", "chat"} if what == "both" else {what}
+    # Through `_identify_missing` rather than a url built here, so a pull can
+    # never fetch something already on disk: the audit's idea of missing and
+    # this one are the same idea.
+    todo = [m for m in _identify_missing(config, nas, yt_id, tw_id)
+            if m["type"] in want]
+    if not todo:
+        # Not a failure. The entry is in the state the asker wanted it in, and
+        # the merge below may still have something to do.
+        done = finish(config, index, cache=cache)
+        return {"ran": False, "changed": done["changed"], "files": [],
+                "why": f"the {platform} {'/'.join(sorted(want))} is already here"}
+
+    files, why = [], []
+    for m in todo:
+        got = _pull_one(config, index, m)
+        why.append(f"{m['label']}: {got['why']}")
+        if got["ok"]:
+            files.append(got["file"])
+
+    # Whatever landed, finish what can be finished -- the merge is what makes
+    # a pulled chat count as this entry's chat, and a pull nobody merged is a
+    # file on a NAS that the next sweep reports as a second capture.
+    changed = False
+    try:
+        done = finish(config, index, cache=cache)
+        changed = done["changed"]
+    except Exception as e:
+        why.append(f"the merge afterwards failed: {type(e).__name__}: {e}")
+
+    return {"ran": bool(files), "changed": changed, "files": files,
+            "why": "; ".join(why)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2758,6 +2963,12 @@ def _finding(level: str, check: str, message: str, *,
     twitch_user_id is not set" is the whole value of that finding and there is
     no shortening of it that keeps that.
     """
+    # A `question=None` is how a caller says "no question here" when whether
+    # there is one is conditional. Dropped rather than carried, so `detail`
+    # never holds a key whose value means the key is not there -- a panel
+    # drawing answer buttons off `detail.question` would draw an empty row.
+    if "question" in detail and detail["question"] is None:
+        del detail["question"]
     return {"level": level, "check": check, "platform": platform,
             "message": message, "short": short or message, "detail": detail}
 
@@ -2810,10 +3021,20 @@ def _asked(kind: str, prefix: str | None, message: str, answers: list[str]) -> d
 
 
 def _disk_findings(config: dict, nas: dict, entry: dict,
-                   claims: dict | None = None) -> list[dict]:
-    """Is the file here, and if not, is that a decision or a loss?"""
+                   claims: dict | None = None,
+                   ids: dict | None = None) -> list[dict]:
+    """Is the file here, and if not, is that a decision or a loss?
+
+    `ids` is the resolution's {platform: (id, source)}, and all it decides is
+    whether `fetch` is among the answers offered. A question that offers to go
+    and get something must know there is somewhere to get it FROM: the only
+    answers a missing file used to have were "there was no broadcast" and "I
+    did not keep it", and on an entry whose VOD link is sitting right there
+    both of them are false.
+    """
     out = []
     claims = claims or {}
+    ids = ids or {}
     # A claim carrying NO platform is about the broadcast as a whole, so it
     # answers for both. "There was no stream that day" and "I kept none of it"
     # are things somebody says once rather than twice, and the archive has
@@ -2855,6 +3076,11 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
         ask_once = (nothing_here and not declined and not located_id
                     and not entry.get(f"{prefix}_video_x")
                     and not entry.get(f"{prefix}_chat_x"))
+        #  Whether there is anywhere to fetch FROM. An id and a platform is
+        #  the whole requirement -- the URL is built from them -- and it is
+        #  the difference between a question a person can act on and one they
+        #  can only file a fact against.
+        can_fetch = bool((ids.get(platform) or (None,))[0])
         if ask_once:
             out.append(_finding(
                 "warn", "disk", f"nothing from {label} was recorded for this entry",
@@ -2863,10 +3089,13 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
                     "nothing_recorded", prefix,
                     f"Nothing from {label} was recorded for this entry. Was "
                     f"there a broadcast on {label}?",
-                    #  Order is the order a person meets them in: the common
-                    #  answer first, then the one that needs a link, then the
-                    #  one that says a file existed and was let go.
-                    ["no_broadcast", "identified", "declined"])))
+                    #  Order is the order a person meets them in: fetch first
+                    #  when there is something to fetch, because it is the one
+                    #  that ENDS the question rather than describing it, then
+                    #  the common answer, then the one that needs a link, then
+                    #  the one that says a file existed and was let go.
+                    (["fetch"] if can_fetch else [])
+                    + ["no_broadcast", "identified", "declined"])))
             continue
         # VIDEO. The `.×` in the vault is a person saying "I did not keep
         # this" — both platforms get recorded and one master is usually
@@ -2876,18 +3105,32 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
             out.append(_finding("ok", "disk", f"{label} video on disk",
                                 platform=prefix, short="video on disk",
                                 file=nas[f"{prefix}_video"]))
-        elif located_id:
-            #  Somebody said where it is. Absent and accounted for — a note,
-            #  and it carries the id so the entry can link out to the video
-            #  rather than merely stop complaining about it.
-            out.append(_finding("note", "disk",
-                                f"{label} was not recorded; the video is {located_id}",
-                                platform=prefix, short="not recorded",
-                                state="lost", remote_id=located_id))
         elif entry.get(f"{prefix}_video_x") or declined:
             out.append(_finding("note", "disk", f"{label} video deliberately not kept",
                                 platform=prefix, short="video not kept",
                                 state="declined"))
+        elif located_id:
+            #  Somebody said where it is. Absent and accounted for — a note,
+            #  and it carries the id so the entry can link out to the video
+            #  rather than merely stop complaining about it.
+            #
+            #  And now an OFFER, because "the video is over there" stopped
+            #  being the end of the sentence the moment a pull could be
+            #  queued from a panel. Still a note: nothing is wrong with this
+            #  entry, there is simply something that could be done about it.
+            #  `declined` is what ends the asking, which is why it is now
+            #  checked ABOVE this rather than below — answering it under the
+            #  old order filed a fact that changed nothing and the question
+            #  came back on the next sweep.
+            out.append(_finding("note", "disk",
+                                f"{label} was not recorded; the video is {located_id}",
+                                platform=prefix, short="not recorded",
+                                state="lost", remote_id=located_id,
+                                question=_asked(
+                                    "located_not_here", prefix,
+                                    f"The {label} broadcast is {located_id} and "
+                                    f"nothing from it is here. Pull it?",
+                                    ["fetch", "declined"]) if can_fetch else None))
         else:
             # Missing, and nothing anywhere says why. That is the one case
             # worth asking about rather than reporting every sweep: deleting
@@ -2899,8 +3142,10 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
                                 question=_asked(
                                     "video_missing", prefix,
                                     f"The {label} video is not here. Was it "
-                                    f"kept and lost, or deliberately not kept?",
-                                    ["declined", "no_broadcast", "identified"])))
+                                    f"kept and lost, or deliberately not kept?"
+                                    + (" It can be pulled." if can_fetch else ""),
+                                    (["fetch"] if can_fetch else [])
+                                    + ["declined", "no_broadcast", "identified"])))
 
         # CHAT. Deep storage counts as present: the merge folded it in and
         # moved it on purpose, and calling that missing is the single most
@@ -2913,16 +3158,17 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
         elif _chat_accounted(nas, prefix):
             out.append(_finding("ok", "disk", f"{label} chat folded into the merged file",
                                 platform=prefix, short="chat merged", state="kept"))
-        elif located_id:
-            #  The same answer covers the chat. A broadcast nobody recorded
-            #  has no chat log either, and asking about it separately is the
-            #  second question this change exists to stop asking.
-            out.append(_finding("note", "disk", f"{label} chat was not recorded",
-                                platform=prefix, short="not recorded", state="lost"))
         elif entry.get(f"{prefix}_chat_x") or declined:
             out.append(_finding("note", "disk", f"{label} chat deliberately not kept",
                                 platform=prefix, short="chat not kept",
                                 state="declined"))
+        elif located_id:
+            #  The same answer covers the chat. A broadcast nobody recorded
+            #  has no chat log either, and asking about it separately is the
+            #  second question this change exists to stop asking — so the
+            #  offer above covers both, and this stays the quiet note it was.
+            out.append(_finding("note", "disk", f"{label} chat was not recorded",
+                                platform=prefix, short="not recorded", state="lost"))
         else:
             out.append(_finding("warn", "disk", f"{label} chat missing",
                                 platform=prefix, short="chat MISSING",
@@ -2931,8 +3177,11 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
                                     "chat_missing", prefix,
                                     f"The {label} chat is not here and was not "
                                     f"folded into a merged file. Was there a "
-                                    f"broadcast on {label} at all?",
-                                    ["declined", "no_broadcast"])))
+                                    f"broadcast on {label} at all?"
+                                    + (" The VOD's chat can be pulled."
+                                       if can_fetch else ""),
+                                    (["fetch"] if can_fetch else [])
+                                    + ["declined", "no_broadcast"])))
     return out
 
 
@@ -3448,7 +3697,8 @@ def inspect(config: dict, index: int, *,
             yt_override: str | None = None,
             tw_override: str | None = None,
             cache: list[dict] | None = None,
-            claims: list[dict] | None = None) -> dict:
+            claims: list[dict] | None = None,
+            archive: dict | None = None) -> dict:
     """Everything an audit knows about one entry. Prints nothing, asks nothing.
 
     The return value is the whole of what the CLI renders, what a job report
@@ -3463,6 +3713,13 @@ def inspect(config: dict, index: int, *,
     # optional so `inspect` still works from a terminal with no archive
     # reachable — the same reason it takes `cache` rather than loading one.
     known = _claims_index(claims)
+    # And what it holds for the captures, which is where an id entered on the
+    # website lives. Fetched here only when the caller did not already have a
+    # lookup in hand; the worker does, and a second round trip for the same
+    # answer is a second thing to keep in step.
+    if archive is None and ls_archive.enabled(config):
+        archive = ls_archive.lookup(config, idx=int(index))
+    arch_ids = archive_ids(archive)
 
     entry = ls_common.obsidian_parse_entry(config, index)
     if not entry["found"]:
@@ -3482,12 +3739,14 @@ def inspect(config: dict, index: int, *,
 
     ids = {}
     if not entry.get("no_yt"):
-        ids["youtube"] = resolve_id(config, cache, "youtube", entry, nas, yt_override)
+        ids["youtube"] = resolve_id(config, cache, "youtube", entry, nas,
+                                    yt_override, arch_ids)
     if not entry.get("no_tw"):
-        ids["twitch"] = resolve_id(config, cache, "twitch", entry, nas, tw_override)
+        ids["twitch"] = resolve_id(config, cache, "twitch", entry, nas,
+                                   tw_override, arch_ids)
     out["ids"] = ids
 
-    out["findings"] = (_disk_findings(config, nas, entry, known)
+    out["findings"] = (_disk_findings(config, nas, entry, known, ids)
                        + _platform_findings(cache, ids, entry)
                        + _assignment_findings(cache, ids, entry))
     # Lifted out flat for a caller that wants the questions and not the whole
@@ -4021,10 +4280,15 @@ def cmd_archive(config: dict, index: int, *, entry: dict | None = None,
             nas = scan_nas(config, index)
         if cache is None:
             cache = ls_common.load_cache()
+        # Only reached by `--archive` on its own; the audit resolves first and
+        # hands both ids down. Enabled is already checked above, so the lookup
+        # is one call on a path that is about to make several.
+        arch_ids = ({} if (yt_id or tw_id)
+                    else archive_ids(ls_archive.lookup(config, idx=index)))
         if yt_id is None and not entry.get("no_yt"):
-            yt_id, _ = resolve_id(config, cache, "youtube", entry, nas, None)
+            yt_id, _ = resolve_id(config, cache, "youtube", entry, nas, None, arch_ids)
         if tw_id is None and not entry.get("no_tw"):
-            tw_id, _ = resolve_id(config, cache, "twitch", entry, nas, None)
+            tw_id, _ = resolve_id(config, cache, "twitch", entry, nas, None, arch_ids)
 
         stream_fields, caps = _archive_inputs(
             config, cache, entry, nas, index, yt_id, tw_id)
