@@ -1130,6 +1130,24 @@ def do_rescan(config: dict, job: dict):
                         found["remote_duration_s"] = int(round(float(data["duration"])))
                     except (TypeError, ValueError):
                         pass
+                # AND WHEN IT BEGAN, which is the number this probe went and
+                # got and then threw away. `stream_start_epoch(data)` reads
+                # `release_timestamp` -- the platform's own word for when the
+                # broadcast started, second-accurate, and rank 80 in the
+                # witness table under a slot nothing has ever filled.
+                #
+                # On an entry whose recording was pulled rather than made
+                # here, this is the ONLY witness there will ever be to that
+                # number: no recorder dump, no log, no live chat. Without it
+                # the filename answers -- a minute-accurate stamp about when
+                # a FILE was written -- and the broadcast start and the
+                # recording start come out as the same number from the same
+                # source, one of which is a guess wearing the other's clothes.
+                start = ls_common.stream_start_epoch(data)
+                if start:
+                    found["remote_start_wall"] = int(start)
+                if isinstance(data.get("title"), str) and data["title"].strip():
+                    found["remote_title"] = data["title"].strip()[:300]
             elif why == "gone":
                 found["alive"] = 0
             else:
