@@ -2831,6 +2831,43 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
         # Checked once here so both the video and the chat branch below can ask
         # the same question of either source.
         declined = all_declined or (platform, "declined") in claims
+        #  AND THE ANSWER THAT SAYS WHERE IT IS. `identified` has been offered
+        #  since the questions existed, accepted by the archive, stored — and
+        #  read by nothing. It appeared exactly once in this whole file: the
+        #  line that offered it. So answering it deleted the question, changed
+        #  no finding, and the next sweep asked again, for ever.
+        #
+        #  What it means is not "I have this file". It means the broadcast
+        #  happened, this machine never recorded it, and THAT is the video: a
+        #  stream watched on one platform and only asked for on the other,
+        #  which is the ordinary case when `ls-rec watch` is given one link.
+        #  Absent locally and accounted for, which is a note and not a warning.
+        located = claims.get((platform, "identified")) or {}
+        located_id = (located.get("value") or "").strip() or None
+
+        #  NOTHING AT ALL from this platform, which is one fact and was being
+        #  reported as two. A platform nobody recorded has no video AND no
+        #  chat, and asking separately about each produced two questions on
+        #  one entry whose only honest answers were the same answer — and
+        #  neither of them offered the one a person actually has.
+        nothing_here = not (nas.get(f"{prefix}_video") or nas.get(f"{prefix}_chat")
+                            or _chat_accounted(nas, prefix))
+        ask_once = (nothing_here and not declined and not located_id
+                    and not entry.get(f"{prefix}_video_x")
+                    and not entry.get(f"{prefix}_chat_x"))
+        if ask_once:
+            out.append(_finding(
+                "warn", "disk", f"nothing from {label} was recorded for this entry",
+                platform=prefix, short="not recorded", state="lost",
+                question=_asked(
+                    "nothing_recorded", prefix,
+                    f"Nothing from {label} was recorded for this entry. Was "
+                    f"there a broadcast on {label}?",
+                    #  Order is the order a person meets them in: the common
+                    #  answer first, then the one that needs a link, then the
+                    #  one that says a file existed and was let go.
+                    ["no_broadcast", "identified", "declined"])))
+            continue
         # VIDEO. The `.×` in the vault is a person saying "I did not keep
         # this" — both platforms get recorded and one master is usually
         # enough — and until the archive had a word for it, every audit
@@ -2839,6 +2876,14 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
             out.append(_finding("ok", "disk", f"{label} video on disk",
                                 platform=prefix, short="video on disk",
                                 file=nas[f"{prefix}_video"]))
+        elif located_id:
+            #  Somebody said where it is. Absent and accounted for — a note,
+            #  and it carries the id so the entry can link out to the video
+            #  rather than merely stop complaining about it.
+            out.append(_finding("note", "disk",
+                                f"{label} was not recorded; the video is {located_id}",
+                                platform=prefix, short="not recorded",
+                                state="lost", remote_id=located_id))
         elif entry.get(f"{prefix}_video_x") or declined:
             out.append(_finding("note", "disk", f"{label} video deliberately not kept",
                                 platform=prefix, short="video not kept",
@@ -2868,6 +2913,12 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
         elif _chat_accounted(nas, prefix):
             out.append(_finding("ok", "disk", f"{label} chat folded into the merged file",
                                 platform=prefix, short="chat merged", state="kept"))
+        elif located_id:
+            #  The same answer covers the chat. A broadcast nobody recorded
+            #  has no chat log either, and asking about it separately is the
+            #  second question this change exists to stop asking.
+            out.append(_finding("note", "disk", f"{label} chat was not recorded",
+                                platform=prefix, short="not recorded", state="lost"))
         elif entry.get(f"{prefix}_chat_x") or declined:
             out.append(_finding("note", "disk", f"{label} chat deliberately not kept",
                                 platform=prefix, short="chat not kept",
