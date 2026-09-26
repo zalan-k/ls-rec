@@ -1926,6 +1926,27 @@ def do_audit(config: dict, job: dict):
         "captures": caps,
     }
 
+    # THE READ-BACK. What the archive holds, field by field, with this
+    # machine's verdict on each one: agrees, differs, or cannot tell.
+    #
+    # Carried beside the plan rather than instead of it, because they answer
+    # different questions and only one of them is finished. The plan says
+    # "here is what I would write"; this says "here is what you have, and
+    # whether I can corroborate it" -- and nothing acts on it yet. That is
+    # deliberate: the panel renders it first, and a person decides whether
+    # the shape is right before anything is allowed to write through it.
+    #
+    # Never fatal. An archive too old to send a `state` block gets a report
+    # exactly as it always did.
+    try:
+        st = (seen or {}).get("state")
+        if st:
+            plan["state"] = ls_audit.evaluate(
+                config, idx, st, cache=got.get("cache"),
+                nas=got.get("nas"), timings=got.get("timings"))
+    except Exception as e:
+        logger.warning("audit %s: could not read back: %s", idx, e)
+
     # The MEASUREMENTS, which until now never left this machine. An audit's
     # findings say what is wrong; its measurements are what somebody reads to
     # decide whether a run went well — the two platform clocks, the durations,

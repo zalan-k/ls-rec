@@ -135,7 +135,33 @@ def analyze_chat_file(filepath: str) -> dict:
                             timestamps.append(int(ts_raw) / 1_000_000.0)
                         except Exception:
                             pass
-        except json.JSONDecodeError:
+            # ── The OTHER Twitch spelling: what TwitchDownloaderCLI writes ──
+            #
+            # A JSON OBJECT with a `comments` array, not the recorder's array
+            # of rows with a microsecond `timestamp`. Nothing here recognised
+            # it, so it fell through to the YouTube JSONL branch below, which
+            # split a pretty-printed object into lines, parsed exactly one of
+            # them, and answered: 1 message.
+            #
+            # That is the shape EVERY offline pull arrives in, which made the
+            # panel report a 560-message Twitch chat as holding one. Nobody
+            # would keep a file the audit says is empty, and the audit was
+            # describing a perfectly good one.
+            #
+            # Delegated to ls_chat rather than parsed again here: it owns the
+            # format, it already knows all three spellings, and a fourth
+            # partial parser in this file is how there came to be two.
+            elif isinstance(data, dict) and isinstance(data.get("comments"), list):
+                parsed_as_array = True
+                result["format"] = "twitch"
+                conv = ls_chat.convert_file(filepath)
+                messages = list(conv.messages)
+                # `ts` is ms from the source's own zero, which for this shape
+                # is `content_offset_seconds` -- the same quantity the branch
+                # above derives, in the same units, so `last_secs` means the
+                # same thing to every caller either way.
+                timestamps = [m.ts / 1000.0 for m in messages if m.ts is not None]
+        except (json.JSONDecodeError, ValueError, OSError):
             pass
 
         # ── Try YouTube: JSONL ─────────────────────────────────────────────
@@ -568,6 +594,207 @@ def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENTRY BUILDER
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  READ-BACK
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  The audit used to run in one direction: derive from the files, post the
+#  result, and never once look at what the archive already held. A derivation
+#  that was wrong therefore could not be noticed -- it simply became the new
+#  value. That is how `started_at` on #747 moved two hours and slid every chat
+#  message off the video.
+#
+#  So the archive sends what it holds FIRST, and the recorder's job stops
+#  being "work out the truth" and becomes "agree, disagree, or say I cannot
+#  tell". Three verdicts, not two, and the third is the important one: the
+#  length check has always been able to say "these two disagree and I am not
+#  deciding", and it is the best-behaved check in the file. Everything else
+#  had to answer, so everything else could be wrong quietly.
+#
+#  Nothing here writes. Nothing here proposes a `derived` field -- those are
+#  consequences of the measurements below them, and a derivation you can
+#  accept independently of its inputs is how a row becomes internally
+#  inconsistent.
+
+#  agrees   the archive's value and this machine's evidence match
+#  differs  they do not, and there IS evidence for another value
+#  unknown  no local evidence, or the witnesses conflict. Nothing proposed,
+#           and the archive's value stands. A deleted video file lands here,
+#           which is the difference between "the number is gone" and "the
+#           number is fine, I just cannot re-check it from here".
+AGREES, DIFFERS, UNKNOWN = "agrees", "differs", "unknown"
+
+#  How close counts as the same, per field. A wall time measured off a
+#  filename is good to the minute; a duration off ffprobe is good to a second
+#  and the platform rounds. Zero means exact.
+_EVAL_TOL = {
+    "remote_start_wall": 2,
+    "local_start_wall": 2,
+    "file_duration_s": 2,
+    "remote_duration_s": 2,
+    "local_start_precision_s": 0,
+}
+
+
+def _verdict(field, held, saw, *, why=None, source=None, tol=None):
+    """One field, compared. `saw` None means there was nothing to compare."""
+    out = {"field": field, "currently": held, "verdict": UNKNOWN,
+           "proposed": None, "why": why, "source": source}
+    if saw is None:
+        out["why"] = why or "nothing here measures this"
+        return out
+    tol = _EVAL_TOL.get(field, 0) if tol is None else tol
+    same = (abs(held - saw) <= tol
+            if isinstance(held, (int, float)) and isinstance(saw, (int, float))
+            and not isinstance(held, bool) and not isinstance(saw, bool)
+            else (held is not None and str(held) == str(saw)))
+    if same:
+        out["verdict"] = AGREES
+        return out
+    out["verdict"] = DIFFERS
+    out["proposed"] = saw
+    if held is None:
+        out["why"] = why or "the archive holds nothing for this"
+    return out
+
+
+def _cap_evidence(config, cache, nas, prefix, platform, timings):
+    """{field: (value, source)} for one platform, from files on this machine.
+
+    Only what was actually SEEN. A key absent here means no evidence, which
+    `_verdict` turns into `unknown` rather than into a proposal of None --
+    proposing None would clear a column the recorder measured once and can
+    never measure again.
+    """
+    out = {}
+    t = (timings or {}).get(prefix) or {}
+    nas_root = config.get("nas_path", "")
+
+    vid, _src = None, None
+    for f in (nas.get(f"{prefix}_video"), nas.get(f"{prefix}_chat")):
+        if f:
+            vid = ls_common.extract_video_id_from_filename(f)
+            if vid:
+                if platform == "twitch":
+                    vid = vid.lstrip("v") or vid
+                out["remote_id"] = (vid, f"the filename of {f}")
+                break
+
+    if nas.get(f"{prefix}_video"):
+        out["video_path"] = (ls_archive.archive_path(config, nas[f"{prefix}_video"]),
+                             "the file on the NAS")
+    if nas.get(f"{prefix}_chat"):
+        out["chat_path"] = (ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
+                            "the file on the NAS")
+
+    if t.get("stream_start_epoch_ms"):
+        out["remote_start_wall"] = (t["stream_start_epoch_ms"] // 1000,
+                                    t.get("stream_start_source") or "measured here")
+    if t.get("record_start_epoch_ms"):
+        out["local_start_wall"] = (t["record_start_epoch_ms"] // 1000,
+                                   t.get("record_start_source") or "measured here")
+        out["local_start_precision_s"] = (
+            60 if t.get("record_start_accuracy") == "minute" else 1,
+            "how precisely the recording start could be read")
+    if t.get("measured_duration_s"):
+        out["file_duration_s"] = (int(t["measured_duration_s"]), "ffprobe")
+
+    row = ls_common.find_vod(cache, vid, platform) if vid else None
+    if row and row.get("duration_secs"):
+        out["remote_duration_s"] = (int(row["duration_secs"]),
+                                    f"what {platform} says about {vid}")
+    return out
+
+
+def evaluate(config: dict, index: int, state: dict, *,
+             cache: list[dict] | None = None,
+             nas: dict | None = None,
+             timings: dict | None = None) -> dict:
+    """Agree or disagree with every measured field the archive sent.
+
+    `state` is the archive's `/api/ingest/lookup` -> `state` block: its own
+    values, plus a manifest saying which of them are measurements and which
+    are consequences of measurements.
+
+    Writes nothing, proposes nothing for a `derived` field, and answers for
+    every field it was sent -- including the ones it cannot check, which come
+    back `unknown` with the archive's value still on them.
+
+    `drift` is the other half of the manifest's point. A field the archive
+    sends that this file has no check for, or a check this file has for a
+    field the archive did not send, is the two ends having moved apart -- the
+    same failure as a job kind missing from one of four lists, and the same
+    remedy: say so out loud, on every run, rather than let it be silent.
+    """
+    man = (state or {}).get("manifest") or {}
+    s_kinds = man.get("stream") or {}
+    c_kinds = man.get("capture") or {}
+    out = {"manifest_version": man.get("version"),
+           "reference": (state or {}).get("reference"),
+           "stream": [], "captures": [],
+           "drift": {"sent_but_unchecked": [], "checked_but_unsent": []}}
+    if not man:
+        out["drift"]["sent_but_unchecked"] = ["(the archive sent no manifest)"]
+        return out
+
+    cache = ls_common.load_cache() if cache is None else cache
+    nas = scan_nas(config, index) if nas is None else nas
+
+    held_s = (state or {}).get("stream") or {}
+    for field, kind in sorted(s_kinds.items()):
+        if kind == "derived":
+            out["stream"].append({
+                "field": field, "currently": held_s.get(field), "kind": "derived",
+                "verdict": UNKNOWN, "proposed": None, "source": None,
+                "why": "derived from the measurements below it"})
+            continue
+        # Stream-level measurements are next round's work; answered honestly
+        # rather than left out, so the drift check below stays meaningful.
+        out["stream"].append({
+            "field": field, "currently": held_s.get(field), "kind": "measured",
+            "verdict": UNKNOWN, "proposed": None, "source": None,
+            "why": "no check for this yet"})
+        out["drift"]["sent_but_unchecked"].append(f"stream.{field}")
+
+    known = {"remote_id", "video_path", "chat_path", "remote_start_wall",
+             "local_start_wall", "local_start_precision_s", "file_duration_s",
+             "remote_duration_s"}
+    for field in sorted(known - set(c_kinds)):
+        out["drift"]["checked_but_unsent"].append(f"capture.{field}")
+
+    for cap in ((state or {}).get("captures") or []):
+        plat = _UNPLATFORM.get(str(cap.get("platform") or "").strip().upper())
+        prefix = {"youtube": "yt", "twitch": "tw"}.get(plat)
+        saw = (_cap_evidence(config, cache, nas, prefix, plat, timings)
+               if prefix else {})
+        rows = []
+        for field, kind in sorted(c_kinds.items()):
+            held = cap.get(field)
+            if kind == "derived":
+                rows.append({"field": field, "currently": held, "kind": "derived",
+                             "verdict": UNKNOWN, "proposed": None, "source": None,
+                             "why": "derived from the measurements above it"})
+                continue
+            if field not in known:
+                rows.append({"field": field, "currently": held, "kind": "measured",
+                             "verdict": UNKNOWN, "proposed": None, "source": None,
+                             "why": "no check for this yet"})
+                out["drift"]["sent_but_unchecked"].append(f"capture.{field}")
+                continue
+            got = saw.get(field)
+            v = _verdict(field, held, got[0] if got else None,
+                         source=got[1] if got else None,
+                         why=None if got else (
+                             "the platform this came from is not one this "
+                             "recorder knows" if not prefix else
+                             "nothing on the NAS measures this"))
+            v["kind"] = "measured"
+            rows.append(v)
+        out["captures"].append({"id": cap.get("id"), "platform": cap.get("platform"),
+                                "fields": rows})
+    return out
+
 
 def _title_from_filename(filename: str) -> str:
     """Extract clean title from NAS filename."""
