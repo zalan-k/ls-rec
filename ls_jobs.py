@@ -48,7 +48,9 @@ import errno
 import glob
 import json
 import logging
+import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -815,6 +817,198 @@ def _explain(raw: str) -> str:
     return raw
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  X, THROUGH THE EMBED ENDPOINT
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `cdn.syndication.twimg.com/tweet-result` is what renders somebody else's
+# embedded post on a third-party page. No account, no cookies, no API key, and
+# it is what the "twitter video downloader" sites have always used. It answers
+# with the post as JSON: the video variants, and -- the part that matters here
+# -- `mediaDetails`, which lists the PICTURES.
+#
+# Two things come out of that.
+#
+# The first is the 1-in-10. yt-dlp already knows this endpoint
+# (`--extractor-args twitter:api=syndication`) but only falls back to it on an
+# HTTP 429: read `_extract_status` in its twitter extractor and every other
+# failure re-raises. So a GraphQL shape change, a legacy 404, a guest handed
+# incomplete JSON -- the common ones -- never reach the road that would have
+# worked. `do_fetch` asks for it explicitly instead.
+#
+# The second is the pictures, and it retires an instruction this file has been
+# giving people: right-click the image, copy the IMAGE address, paste THAT.
+# That is awkward on a desktop and cannot be done at all on a phone, and it was
+# only ever necessary because yt-dlp has no image support. The post link is now
+# enough. `pbs.twimg.com` stays on the allowlist for anyone who does have a
+# direct link -- this adds a road, it does not close one.
+#
+# What it will not do: age-gated and NSFW posts come back empty, and so do
+# protected accounts and deleted posts. Those keep the answers `_EXPLAIN`
+# already gives them. It is an embed endpoint rather than a promise, so the
+# day it stops answering, everything here fails soft and yt-dlp's own sentence
+# is what the person reads.
+
+_X_HOSTS = ("twitter.com", "x.com")
+_X_STATUS_RE = re.compile(r"/status(?:es)?/(\d{5,25})")
+#  Which picture, when a post has several and somebody opened one. X writes it
+#  into the address as you tap through the gallery, which is the one gesture
+#  that works the same on a phone as on a desktop.
+_X_PHOTO_RE = re.compile(r"/photo/(\d{1,3})")
+_X_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+#  Enough base-36 places to carry the fraction. See `_x_token`.
+_X_TOKEN_PLACES = 24
+#  Where a picture is allowed to come from. The endpoint's answer is REMOTE
+#  DATA -- it names a url and this machine is about to fetch it -- so it is
+#  checked against the host it is supposed to be on before anything is
+#  downloaded, exactly as a pasted link would be. Without this, a spoofed or
+#  compromised response is an arbitrary download with extra steps.
+_X_MEDIA_HOST = "pbs.twimg.com"
+
+
+def _is_x(host: str | None) -> bool:
+    """One of X's own names for itself, on a dot boundary like allowed_host."""
+    h = str(host or "").lower().rstrip(".")
+    return any(h == a or h.endswith("." + a) for a in _X_HOSTS)
+
+
+def x_post_id(url: str) -> str | None:
+    """The numeric id out of a post link, or None if that is not what this is.
+
+    The HOST is half the question. `/status/123` is a path shape, not a
+    trademark, and reading an id out of one on some other site would hand the
+    embed endpoint a number that means nothing there. `do_fetch` has already
+    checked the host by the time it calls this, so the check here is the
+    second lock — and the one that will still be here when something else
+    calls it.
+    """
+    try:
+        u = urllib.parse.urlparse(str(url or ""))
+    except ValueError:
+        return None
+    if not _is_x(u.hostname):
+        return None
+    m = _X_STATUS_RE.search(u.path)
+    return m.group(1) if m else None
+
+
+def _x_token(twid: str) -> str:
+    """The `token` an embed sends alongside the post id.
+
+    X's own embed script derives it from the id, and this is that derivation:
+
+        ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '')
+
+    The SHAPE of that rather than the string to its last digit. JavaScript
+    prints the shortest base-36 that round-trips to the same double, and
+    matching it exactly is a page of float formatting for a value that is
+    reportedly not checked at all -- a random number is said to work just as
+    well. So the cost of being a digit out in the tail is one retry, which
+    `_x_status` already makes for the endpoint's own intermittency. If X ever
+    starts checking, this is the single function to fix and the line above is
+    the specification.
+    """
+    v = (int(twid) / 1e15) * math.pi
+    whole, frac = int(v), v - int(v)
+    out = []
+    while whole:
+        whole, d = divmod(whole, 36)
+        out.append(_X_ALPHABET[d])
+    out.reverse()
+    for _ in range(_X_TOKEN_PLACES):
+        frac *= 36
+        d = int(frac)
+        out.append(_X_ALPHABET[d])
+        frac -= d
+    #  The point is never written rather than written and then taken out,
+    #  which is the same string and one fewer thing to get wrong. The zeros
+    #  still have to go, and that is not cosmetic -- it is part of the value.
+    return "".join(out).replace("0", "")
+
+
+def _x_status(twid: str, timeout: int = 20) -> dict | None:
+    """The post as the embed endpoint sees it, or None if it would not say.
+
+    Twice, with a different token the second time. That is the documented
+    workaround for the endpoint going quiet -- it is intermittent rather than
+    broken -- and it doubles as the safety net under `_x_token` not matching
+    JavaScript to the last digit.
+    """
+    for token in (_x_token(twid), f"{random.getrandbits(48):x}"):
+        url = "https://cdn.syndication.twimg.com/tweet-result?" + urllib.parse.urlencode(
+            {"id": twid, "token": token, "lang": "en"})
+        #  Googlebot because that is what the endpoint answers most freely to,
+        #  and because an embed is public by definition.
+        req = urllib.request.Request(url, headers={"user-agent": "Googlebot"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                #  Capped. This is meant to be a few KB of JSON and an
+                #  unbounded read of a remote body is not something to do on
+                #  the strength of what it is meant to be.
+                body = r.read(1 << 20)
+            doc = json.loads(body.decode("utf-8", "replace"))
+        except Exception as e:
+            logger.info("x embed: %s", f"{type(e).__name__}: {e}"[:200])
+            continue
+        if isinstance(doc, dict) and doc.get("__typename") != "TweetTombstone":
+            return doc
+    return None
+
+
+def _x_orig(media_url: str) -> str | None:
+    """A picture at the size it was uploaded, or None if it is not X's to serve.
+
+    `name` is the resizer, and whatever it currently says is whatever the
+    timeline happened to want. `orig` is the upload, and an archive that kept
+    the other thing would be an archive of thumbnails.
+    """
+    try:
+        u = urllib.parse.urlparse(str(media_url or ""))
+    except ValueError:
+        return None
+    if u.scheme != "https" or (u.hostname or "").lower().rstrip(".") != _X_MEDIA_HOST:
+        return None
+    q = urllib.parse.parse_qs(u.query)
+    q["name"] = ["orig"]
+    return urllib.parse.urlunparse(u._replace(query=urllib.parse.urlencode(q, doseq=True)))
+
+
+def x_pictures(url: str) -> tuple[list[str], str | None]:
+    """Every picture on a post, biggest size — or a sentence saying why not.
+
+    `([], None)` is "no answer", not "no pictures", and the difference is the
+    point: the caller keeps yt-dlp's own words for the failure rather than
+    replacing a real diagnosis with this one's silence.
+    """
+    twid = x_post_id(url)
+    if not twid:
+        return [], None
+    doc = _x_status(twid)
+    if not doc:
+        return [], None
+    pics = []
+    for m in (doc.get("mediaDetails") or []):
+        if isinstance(m, dict) and m.get("type") == "photo":
+            got = _x_orig(m.get("media_url_https"))
+            if got:
+                pics.append(got)
+    if not pics:
+        return [], None
+    #  One picture is the common case and simply works. Several is a question
+    #  only the person who pasted it can answer, and taking the first silently
+    #  would file one of four with nothing afterwards to say a choice was made.
+    #  Tapping the picture you want is the gesture that works on a phone, and
+    #  it puts the answer in the address.
+    m = _X_PHOTO_RE.search(urllib.parse.urlparse(url).path)
+    want = int(m.group(1)) if m else None
+    if want and 1 <= want <= len(pics):
+        return [pics[want - 1]], None
+    if len(pics) > 1:
+        return [], (f"that post has {len(pics)} pictures on it — open the one "
+                    f"you want and paste that link instead (it ends /photo/2)")
+    return pics, None
+
+
 def probe_duration(config: dict, url: str) -> float | None:
     """Seconds, or None when the host will not say."""
     try:
@@ -949,7 +1143,7 @@ def do_fetch(config: dict, job: dict):
             if secs and secs > max_s:
                 return ("failed", None,
                         f"that is {_mmss(secs)} long; the cap is {_mmss(max_s)}")
-            r = _ytdlp_run(config, [
+            args = [
                 "--no-warnings", "--no-playlist", "--no-progress",
                 # Nothing above 1080p: the archive re-encodes everything it
                 # keeps, and pulling 4K to throw the pixels away is minutes of
@@ -959,21 +1153,44 @@ def do_fetch(config: dict, job: dict):
                 # Belt to the probe's braces, for a host that reports a size
                 # but no duration.
                 "--max-filesize", f"{max_bytes}",
-                "-o", stem + ".%(ext)s", url], timeout)
+                "-o", stem + ".%(ext)s", url]
+            r = _ytdlp_run(config, args, timeout)
+            #  The second ask, and the whole of the X fix. yt-dlp reaches the
+            #  embed endpoint by itself only on an HTTP 429 and re-raises every
+            #  other failure, so the road that would have worked is never taken
+            #  for the failures that actually happen. Asking for it by name
+            #  costs one more process on a download that has already failed.
+            if r.returncode != 0 and _is_x(host):
+                r = _ytdlp_run(
+                    config, ["--extractor-args", "twitter:api=syndication"] + args, timeout)
             if r.returncode != 0:
-                return ("failed", None, _explain(
-                    _tail(r.stderr) or _tail(r.stdout) or f"yt-dlp exited {r.returncode}"))
-            found = sorted(glob.glob(stem + ".*"), key=os.path.getsize, reverse=True)
-            if not found:
-                # --max-filesize aborts by writing nothing at all, which is
-                # otherwise indistinguishable from a silent success.
-                return ("failed", None, f"nothing came back — it may be over {_mb(max_bytes)}")
-            tmp = found[0]
-            for extra in found[1:]:
-                try:
-                    os.remove(extra)
-                except OSError:
-                    pass
+                said = (_tail(r.stderr) or _tail(r.stdout)
+                        or f"yt-dlp exited {r.returncode}")
+                #  Nothing found a video, which on X is as likely to mean the
+                #  post has PICTURES on it as that anything went wrong. That is
+                #  a question yt-dlp cannot answer -- it has no image support
+                #  at all -- and the embed endpoint can.
+                pic, why = x_pictures(url) if _is_x(host) else ([], None)
+                if why:
+                    return ("failed", None, why)
+                if not pic:
+                    return ("failed", None, _explain(said))
+                tmp = stem + _direct_ext(pic[0])
+                err = _direct_download(pic[0], tmp, max_bytes, timeout)
+                if err:
+                    return ("failed", None, err)
+            else:
+                found = sorted(glob.glob(stem + ".*"), key=os.path.getsize, reverse=True)
+                if not found:
+                    # --max-filesize aborts by writing nothing at all, which is
+                    # otherwise indistinguishable from a silent success.
+                    return ("failed", None, f"nothing came back — it may be over {_mb(max_bytes)}")
+                tmp = found[0]
+                for extra in found[1:]:
+                    try:
+                        os.remove(extra)
+                    except OSError:
+                        pass
 
         ext = os.path.splitext(tmp)[1].lower()
         if ext not in KEEP_EXT:
