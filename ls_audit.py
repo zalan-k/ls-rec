@@ -794,6 +794,26 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
         saw("chat_path", ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
             "the file on the NAS")
 
+    #  `kept` ONLY, and never `declined`.
+    #
+    #  This machine can see a file. It cannot see a DECISION: the `.x` marker
+    #  in an Obsidian line is the only record that somebody chose not to keep
+    #  a copy, and it is not in `nas`. So the absence of a file is left as
+    #  `unknown` here -- the archive's own `declined` stays on the row with
+    #  nothing contradicting it, which is right, because the vault said it and
+    #  this did not look at the vault.
+    #
+    #  The presence of a file is worth saying out loud even so. A capture
+    #  marked `declined` or `lost` whose file is sitting on the NAS is a
+    #  disagreement a person should see, and until these two joined the
+    #  read-back the archive had no way to be told.
+    if nas.get(f"{prefix}_video"):
+        saw("video_state", "kept", "the file is on the NAS")
+    if nas.get(f"{prefix}_chat") or _chat_accounted(nas, prefix):
+        saw("chat_state", "kept",
+            "the file is on the NAS" if nas.get(f"{prefix}_chat")
+            else "this platform's messages are in the merged chat")
+
     if t.get("stream_start_epoch_ms"):
         saw("remote_start_wall", t["stream_start_epoch_ms"] // 1000,
             t.get("stream_start_source") or "measured here",
@@ -819,9 +839,15 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
         saw("file_duration_s", int(t["measured_duration_s"]), "ffprobe",
             ls_witness.FILE_DURATION)
 
+    #  `duration`, not `duration_secs`. The cache and the timings sidecar are
+    #  two different files with two different spellings for the same idea, and
+    #  this read had the sidecar's -- so it never once matched a cache row and
+    #  `remote_duration_s` came back unknown on every entry, permanently.
+    #  Every writer of a cache row (ls_common.refresh_*_cache, ls_rec, the
+    #  `cache inject` commands) writes `duration`; nothing writes the other.
     row = ls_common.find_vod(cache, vid, platform) if vid else None
-    if row and row.get("duration_secs"):
-        saw("remote_duration_s", int(row["duration_secs"]),
+    if row and row.get("duration"):
+        saw("remote_duration_s", int(row["duration"]),
             f"what {platform} says about {vid}")
     return out
 
@@ -878,7 +904,7 @@ def evaluate(config: dict, index: int, state: dict, *,
 
     known = {"remote_id", "video_path", "chat_path", "remote_start_wall",
              "local_start_wall", "local_start_precision_s", "file_duration_s",
-             "remote_duration_s"}
+             "remote_duration_s", "video_state", "chat_state"}
     for field in sorted(known - set(c_kinds)):
         out["drift"]["checked_but_unsent"].append(f"capture.{field}")
 
