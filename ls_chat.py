@@ -67,8 +67,8 @@ def is_derived(filename: str) -> bool:
 
 @dataclass
 class Msg:
-    type: str                       # chat superchat sub resub gift raid pinned
-                                    # ban notice
+    type: str                       # chat superchat sub resub gift giftitem
+                                    # raid pinned ban notice
     ts: int                         # ms from source zero
     abs_ms: Optional[int] = None    # epoch ms
     id: Optional[str] = None
@@ -100,11 +100,25 @@ class Msg:
     # messages and memberships carry these, so they cost nothing on the
     # ordinary line of chat.
     colors: Optional[dict] = None
+    # type='giftitem' only: YouTube's paid item-gifts -- a flower, a bag of
+    # ketchup chips -- which are NOT a gifted membership. That is type='gift',
+    # a different transaction with a different renderer, and conflating the
+    # two would have the archive announce a subscription for a dog treat.
+    #
+    # The value is the asset's key and nothing else. Its picture and its
+    # description live in the converter's `gifts` registry, for the same
+    # reason an emote carries a token rather than a URL.
+    #
+    # There is no amount here and there never will be: the dump states no
+    # price. These are countable, not totalable, and a hardcoded jewel table
+    # would be wrong within a year of being written.
+    item: Optional[str] = None
 
 
 _OPTIONAL = ("id", "author", "badges", "text", "amount", "currency", "tier",
              "months", "count", "recipient", "viewers", "pinned_by", "user",
-             "duration", "notice", "params", "system_message", "colors")
+             "duration", "notice", "params", "system_message", "colors",
+             "item")
 
 
 def serialize(m: Msg, origin: str = "") -> dict:
@@ -362,6 +376,8 @@ class Converter:
         self.emotes: dict[str, dict] = {}
         # key -> {"title": ..., "url"|"icon"|"set"+"version": ...}; see _badge().
         self.badges: dict[str, dict] = {}
+        # key -> {"url": ..., "alt": ...}; see _gift_asset().
+        self.gifts: dict[str, dict] = {}
         self.deletions: dict[str, int] = {}
         self.bans: dict[str, int] = {}
         self.zero_ms: Optional[int] = None
@@ -444,6 +460,28 @@ class Converter:
                 cur[k] = v
         return cur
 
+    def _gift_asset(self, key: str, url: Optional[str] = None,
+                    alt: Optional[str] = None):
+        """Note a gift's picture and what it is a picture OF.
+
+        The third registry, and it exists for the same reason as the first
+        two: a message that carried the address itself would repeat one string
+        eight times in a single stream, and the copy is what rots.
+
+        `alt` comes from the accessibility label, which is the only place the
+        dump ever says what the picture shows -- there is no name field. It is
+        worth keeping because a gift whose file has gone is still a readable
+        row: "sent a gift: Image of a red flower" beats a dead <img>.
+
+        Merged, not assigned, for the reason _emote() merges.
+        """
+        cur = self.gifts.setdefault(key, {})
+        if url and not cur.get("url"):
+            cur["url"] = url
+        if alt and not cur.get("alt"):
+            cur["alt"] = alt
+        return cur
+
     def result(self) -> dict:
         return {
             "metadata": {
@@ -456,6 +494,7 @@ class Converter:
                 **self.meta,
                 "emotes": self.emotes,
                 "badges": self.badges,
+                "gifts": self.gifts,
             },
             "messages": [serialize(m) for m in self.messages],
         }
@@ -841,8 +880,8 @@ def _yt_colors(r: dict) -> Optional[dict]:
     return out or None
 
 
-def _yt_thumb(node) -> Optional[str]:
-    """The largest URL in one of YouTube's `{thumbnails: [...]}` blocks.
+def _yt_best(items) -> Optional[str]:
+    """The largest URL in a list of `{url, width, height}`.
 
     Largest, because these are 24px and 48px and the archive keeps the file
     once — a picture can be scaled down later and cannot be scaled up. Chosen
@@ -850,11 +889,58 @@ def _yt_thumb(node) -> Optional[str]:
     convention, not a promise, and a convention is not worth betting two
     hundred entries of emotes and badges on.
     """
-    thumbs = ((node or {}).get("thumbnails")) or []
-    best = max((t for t in thumbs if t.get("url")),
+    best = max((t for t in items or [] if t.get("url")),
                key=lambda t: (t.get("width") or 0) * (t.get("height") or 0),
                default=None)
     return best.get("url") if best else None
+
+
+def _yt_thumb(node) -> Optional[str]:
+    """The largest URL in one of YouTube's `{thumbnails: [...]}` blocks."""
+    return _yt_best(((node or {}).get("thumbnails")) or [])
+
+
+# Not every gift is a .png. The animated ones — `six_seven.webp`,
+# `cat_jammin.webp` — arrive as WebP, and a key that kept the extension would
+# file one gift under two spellings and then have the harvester write a WebP
+# out as `six_seven.webp.png`, which its own magic-byte check would reject.
+_GIFT_EXT = (".png", ".webp", ".gif", ".jpg", ".jpeg")
+
+
+def _gift_key(url: Optional[str]) -> Optional[str]:
+    """A gift's asset name, which is the only stable identity it has.
+
+    `.../gift/assets/one_of_a_kind.png=w320-h320` -> `one_of_a_kind`. The
+    dump carries no id and no name for a gift; the filename is it. Kept whole
+    where the name is odd (`silver_star_v2_320x320`) because it is an opaque
+    key, not something to parse twice.
+
+    The FORMAT is deliberately not recorded beside it: the registry keeps the
+    URL, the URL states the extension, and a second copy of that is one more
+    thing that can disagree with the first.
+    """
+    if not url:
+        return None
+    last = url.rsplit("/", 1)[-1].split("=", 1)[0]
+    low = last.lower()
+    for ext in _GIFT_EXT:
+        if low.endswith(ext):
+            return last[:-len(ext)] or None
+    return last or None
+
+
+def _gift_alt(label: Optional[str]) -> Optional[str]:
+    """What the gift is a picture of, out of the accessibility label.
+
+    `@someone sent a gift, Image of a red flower` — everything before the
+    comma names the SENDER, so a registry keyed by gift cannot keep it: one
+    flower would get a separate entry per person who sent one. A YouTube
+    handle cannot contain a comma or a space, so the first `, ` is the seam.
+    """
+    if not label:
+        return None
+    head, sep, tail = label.partition(", ")
+    return (tail if sep else head).strip() or None
 
 
 def _yt_emote_url(e: dict) -> Optional[str]:
@@ -863,6 +949,18 @@ def _yt_emote_url(e: dict) -> Optional[str]:
 
 class YtdlpConverter(Converter):
     platform, fmt = "youtube", YTDLP
+
+    def __init__(self):
+        super().__init__()
+        # `updateOrAddInteractivityWidgetAction` means exactly what it says:
+        # one gift can arrive two or three times, at the same offset or
+        # seconds apart, as YouTube re-states a widget still on screen. Three
+        # rows where one flower was sent, unless they are collapsed here.
+        #
+        # merge() would also catch them on (platform, id) -- but `convert` is
+        # a command in its own right and its output is an artifact, so the
+        # count has to be right before it ever reaches a merge.
+        self._widgets: set[str] = set()
 
     def convert(self, path):
         zeros = []
@@ -927,6 +1025,16 @@ class YtdlpConverter(Converter):
                     return fn(item[key], ts)
         elif "addBannerToLiveChatCommand" in act:
             return self._banner(act["addBannerToLiveChatCommand"] or {}, ts)
+        # Two spellings for one event, the way remove*/mark*AsDeleted below
+        # are two spellings for one deletion. A single stream carries both:
+        # 17 of one and 4 of the other in the file this was written against,
+        # with nothing to tell them apart but the key.
+        elif ("updateOrAddInteractivityWidgetAction" in act
+                or "addInteractivityWidgetAction" in act):
+            key = ("updateOrAddInteractivityWidgetAction"
+                   if "updateOrAddInteractivityWidgetAction" in act
+                   else "addInteractivityWidgetAction")
+            return self._widget((act[key] or {}).get("widgetRenderer") or {}, ts)
         # remove* is the live form, mark*AsDeleted the replay form. A
         # post-hoc download only ever carries the latter, so handling just
         # the live pair meant post-hoc conversions flagged zero deletions.
@@ -1061,6 +1169,49 @@ class YtdlpConverter(Converter):
                    badges=self._badges(r) or None, tier=1, count=1,
                    recipient={"id": r.get("authorExternalChannelId", ""),
                               "name": self._author(r)["name"]})
+
+    def _widget(self, renderer, ts) -> Optional[Msg]:
+        """A gift — the paid item kind, not the membership kind.
+
+        Everything this needs is stated except the time: there is no
+        `timestampUsec` anywhere in a gift widget, so `abs_ms` stays None and
+        finalize() fills it from the zero like any other source that cannot
+        place itself. Which also means a gift can never CONTRIBUTE to the
+        zero, and that is the right way round.
+
+        Returns None for any widget that is not a gift. Polls and whatever
+        else YouTube hangs off this action are not chat and are not money.
+        """
+        wr = renderer.get("interactivityWidgetRenderer") or {}
+        content = wr.get("content") or {}
+        g = content.get("giftAttributionItemViewModel")
+        if not g:
+            return None
+        wid = g.get("id") or wr.get("id")
+        if wid:
+            if wid in self._widgets:
+                return None
+            self._widgets.add(wid)
+
+        # The author's channel id is NOT on the view model; it is down in the
+        # element renderer's compatibility block, which is the only part of
+        # this shape that speaks the old chat vocabulary.
+        compat = (content.get("elementRenderer") or {}).get(
+            "compatibilityOptions") or {}
+        name = (g.get("authorName") or {}).get("content") or ""
+
+        url = _yt_best(((g.get("attributionImage") or {}).get("sources")) or [])
+        # Protocol-relative, alone among YouTube's image URLs in this file.
+        if url and url.startswith("//"):
+            url = "https:" + url
+        key = _gift_key(url)
+        if key:
+            self._gift_asset(key, url=url, alt=_gift_alt(g.get("giftA11yLabel")))
+
+        return Msg(type="giftitem", ts=ts, abs_ms=self._abs(g), id=wid,
+                   author={"id": compat.get("liveChatAuthorExternalChannelId", ""),
+                           "name": name[1:] if name.startswith("@") else name},
+                   item=key)
 
     def _banner(self, cmd, ts) -> Optional[Msg]:
         banner = (cmd.get("bannerRenderer") or {}).get("liveChatBannerRenderer") or {}
@@ -1264,6 +1415,7 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
 
     emotes: dict[str, dict] = {}
     badges: dict[str, dict] = {}
+    gifts: dict[str, dict] = {}
     for c in convs:
         # Nested by platform: the ID namespaces differ, so a renderer needs
         # the origin to resolve one. Also fewer bytes than prefixed keys.
@@ -1274,6 +1426,7 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
         # whichever converter happened to run second decide, silently.
         _fold(emotes.setdefault(c.platform, {}), c.emotes)
         _fold(badges.setdefault(c.platform, {}), c.badges)
+        _fold(gifts.setdefault(c.platform, {}), c.gifts)
 
     # complete > unknown > none: if any source for a platform could see
     # moderation, that platform's history is as good as its best source.
@@ -1330,6 +1483,7 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
                         for p, c in zip(paths, convs)],
             "emotes": emotes,
             "badges": badges,
+            "gifts": gifts,
         },
         "messages": out,
     }

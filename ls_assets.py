@@ -17,12 +17,18 @@ addresses them (`/media/thumb/emotes/twitch/25.png`):
     badges/index.json
     badges/twitch/<set>_<version>.png
     badges/youtube/<key>.png
+    gifts/index.json
+    gifts/youtube/<key>.png           or .webp, where the gift animates
 
-Everything the renderer reads is a `.png` at a path it can derive from the
-merged file alone, which is the whole reason for that rule: the merged file
-names an emote and the renderer must be able to turn that name into a URL
-without asking anything else. Twitch's animated emotes are fetched as both —
-the still for today, the .gif sitting there for whenever the renderer wants it.
+Everything the renderer reads sits at a path it can derive from the merged
+file alone, which is the whole reason for that rule: the merged file names an
+emote and the renderer must be able to turn that name into a URL without
+asking anything else. Emotes and badges are always `.png`. A gift is not —
+YouTube serves the animated ones as WebP and the extension comes off the URL,
+so a gift is the one tree where the index is the authority on the filename
+rather than the convention being. Twitch's animated emotes are fetched as
+both — the still for today, the .gif sitting there for whenever the renderer
+wants it.
 
 Credentials: Twitch EMOTES need none, because the id is the address. Twitch
 BADGES do — their images live behind Helix, keyed by set and version — so
@@ -62,7 +68,8 @@ TWITCH_EMOTE = "https://static-cdn.jtvnw.net/emoticons/v2/{id}/{fmt}/dark/3.0"
 # Google's image hosts take a size on the end of the URL — `=w48-h48-c-k-nd` —
 # and the dump offers 24 and 48. Cutting it off asks for the original, which is
 # what a 4x screenshot needs and what the 48px one cannot be scaled up to.
-_GOOGLE_IMG = ("ggpht.com", "googleusercontent.com")
+# gstatic serves the gift assets and takes the same `=w320-h320` suffix.
+_GOOGLE_IMG = ("ggpht.com", "googleusercontent.com", "gstatic.com")
 
 
 def _full_size(url: str) -> str | None:
@@ -78,6 +85,9 @@ def _full_size(url: str) -> str | None:
 # broken image that looks exactly like a real one on disk.
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 GIF_MAGIC = (b"GIF87a", b"GIF89a")
+# RIFF<4 bytes of length>WEBP. The length sits in the middle, so this is
+# checked in two pieces rather than as one prefix.
+WEBP_MAGIC = (b"RIFF", b"WEBP")
 
 
 # ── the lookup ─────────────────────────────────────────────────────────────
@@ -148,6 +158,9 @@ def _get(url: str, headers: dict | None = None) -> tuple[str, object]:
 def _looks_like(body: bytes, kind: str) -> bool:
     if kind == "png":
         return body.startswith(PNG_MAGIC)
+    if kind == "webp":
+        return (body.startswith(WEBP_MAGIC[0])
+                and body[8:12] == WEBP_MAGIC[1])
     return any(body.startswith(m) for m in GIF_MAGIC)
 
 
@@ -270,6 +283,33 @@ def _badge_targets(platform: str, key: str, rec: dict,
     return None
 
 
+def _gift_targets(platform: str, key: str,
+                  rec: dict) -> tuple[str, str, list[tuple[str, str]]] | None:
+    """YouTube's paid item-gifts. One host, one directory, public addresses —
+    so unlike an emote or a member badge, nothing here is lost when the raw
+    dump leaves. It is fetched anyway for the same reason the rest is: the
+    archive should not need gstatic to be up, or to still be serving a gift
+    YouTube has retired, to draw a row from 2026.
+
+    The extension comes off the URL rather than being assumed. The animated
+    ones are WebP, and writing one out as `.png` would fail the magic check
+    below and tombstone a picture that answered perfectly well.
+    """
+    if platform != "youtube" or not rec.get("url"):
+        return None
+    url = rec["url"]
+    ext = "png"
+    name = url.rsplit("/", 1)[-1].split("=", 1)[0].lower()
+    for cand in ("webp", "gif", "png"):
+        if name.endswith("." + cand):
+            ext = cand
+            break
+    rel = f"gifts/youtube/{key}.{ext}"
+    big = _full_size(url)
+    return (f"youtube/{key}", rel,
+            ([(big, ext)] if big else []) + [(url, ext)])
+
+
 # ── the sweep ──────────────────────────────────────────────────────────────
 
 def _fetch_one(root: str, rel: str, attempts: list[tuple[str, str]]) -> str:
@@ -301,7 +341,7 @@ def harvest(config: dict, header: dict, *, force: bool = False) -> dict:
     and a stack trace are the two things nobody wants.
     """
     out = {"emotes_new": 0, "emotes_gone": 0, "badges_new": 0, "badges_gone": 0,
-           "skipped": 0}
+           "gifts_new": 0, "gifts_gone": 0, "skipped": 0}
     root = ls_archive.media_root(config)
     if not root:
         print("  ⚠ assets: no media root — set archive_media_root or check "
@@ -313,7 +353,11 @@ def harvest(config: dict, header: dict, *, force: bool = False) -> dict:
     down = False
 
     for tree, source in (("emotes", header.get("emotes") or {}),
-                         ("badges", header.get("badges") or {})):
+                         ("badges", header.get("badges") or {}),
+                         # Absent from every merged file written before gifts
+                         # were read at all, which `or {}` makes a no-op
+                         # rather than a crash on the whole harvest.
+                         ("gifts", header.get("gifts") or {})):
         if down:
             break
         idx = load_index(root, tree)
@@ -331,6 +375,7 @@ def harvest(config: dict, header: dict, *, force: bool = False) -> dict:
                         print("  ⚠ assets: no Twitch credentials, so badge "
                               "images are skipped (emotes are not affected)")
                 target = (_emote_targets(platform, rec) if tree == "emotes"
+                          else _gift_targets(platform, key, rec) if tree == "gifts"
                           else _badge_targets(platform, key, rec, helix))
                 if not target:
                     out["skipped"] += 1
@@ -377,7 +422,7 @@ def harvest(config: dict, header: dict, *, force: bool = False) -> dict:
         print("  ⚠ assets: nothing answered — no network from here. Nothing "
               "was recorded as missing; run `ls_assets.py <merged>` later.")
     say = []
-    for tree in ("emotes", "badges"):
+    for tree in ("emotes", "badges", "gifts"):
         if out[f"{tree}_new"] or out[f"{tree}_gone"]:
             say.append(f"{out[f'{tree}_new']} {tree}"
                        + (f" ({out[f'{tree}_gone']} unavailable)"
