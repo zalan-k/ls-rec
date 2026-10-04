@@ -79,7 +79,6 @@ class Msg:
     purged: bool = False             # author banned later, history struck
     amount: Optional[float] = None
     currency: Optional[str] = None
-    hearted: bool = False
     tier: Optional[int] = None
     months: Optional[int] = None
     count: Optional[int] = None
@@ -135,8 +134,6 @@ def serialize(m: Msg, origin: str = "") -> dict:
         d["deleted"] = True
     if m.purged:
         d["purged"] = True
-    if m.hearted:
-        d["hearted"] = True
     return d
 
 
@@ -1107,12 +1104,26 @@ class YtdlpConverter(Converter):
     def _superchat(self, r, ts) -> Msg:
         amount, currency = parse_amount(
             (r.get("purchaseAmountText") or {}).get("simpleText", ""))
-        hearted = bool((r.get("creatorHeartButton") or {})
-                       .get("creatorHeartViewModel", {}).get("heartedHoverText"))
+        # NO HEART, and it is not an omission. This used to read
+        # `creatorHeartButton` -> `creatorHeartViewModel` -> `heartedHoverText`,
+        # which is part of the BUTTON rather than of its state: it is the text
+        # to show IF the message is hearted, and YouTube ships it on every paid
+        # message whether she pressed it or not. So every superchat in the
+        # archive claimed a heart it had no way of knowing about.
+        #
+        # There is nothing better to read. The viewmodel carries both icons,
+        # both labels -- "Heart" and "Remove heart" -- and an
+        # `engagementStateKey`, an opaque handle into the client's own
+        # engagement store. The state lives behind that key and a chat dump
+        # does not contain it. Measured on a real capture: 21 paid messages,
+        # 21 with the button, 21 with the hover text, no `isHearted` anywhere.
+        #
+        # An archive that cannot know whether the heart was given says nothing
+        # rather than saying yes every time.
         return Msg(type="superchat", ts=ts, abs_ms=self._abs(r), id=r.get("id"),
                    author=self._author(r), badges=self._badges(r) or None,
                    text=self._runs((r.get("message") or {}).get("runs")) or None,
-                   amount=amount, currency=currency, hearted=hearted,
+                   amount=amount, currency=currency,
                    colors=_yt_colors(r))
 
     def _sticker(self, r, ts) -> Msg:
