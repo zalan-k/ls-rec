@@ -1233,10 +1233,22 @@ def _pull_stem(config: dict, index: int, url: str, vid: str) -> str:
     """
     data = ls_common.ytdlp_probe(config, url, playlist_items="1")
     title = (data or {}).get("title") or "Unknown"
-    release_ts = (data or {}).get("release_timestamp")
+    # Through stream_start_epoch, which prefers `release_timestamp` and
+    # falls back to `timestamp`. Reading release_timestamp alone is how a
+    # VOD that carries only `timestamp` collapses to _00-00: the
+    # second-precision answer is sitting in the same dict, unread. Entry
+    # 379 is the case — `timestamp` present, and nothing used it, so the
+    # only surviving witness to its start was the download time baked into
+    # its filename, 35 hours after the broadcast.
+    #
+    # `fromtimestamp` stays LOCAL on purpose. The filename convention is a
+    # wall clock in the recorder's own offset, and the archive parses it
+    # back as wall time in `tz_offset_min` — `05:47` only resolves to
+    # 1760525220 because the two agree. UTC here would shift every name.
+    start_ts = ls_common.stream_start_epoch(data or {})
     upload_date = (data or {}).get("upload_date", "")
-    if release_ts:
-        ts = datetime.datetime.fromtimestamp(release_ts).strftime("%Y-%m-%d_%H-%M")
+    if start_ts:
+        ts = datetime.datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d_%H-%M")
     elif upload_date and len(str(upload_date)) == 8:
         ts = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}_00-00"
     else:
@@ -1471,10 +1483,22 @@ def cmd_inject(config: dict, url: str | None = None):
             return _inject_manual(cache)
 
         platform = "twitch" if "twitch.tv" in url else "youtube"
-        release_ts = data.get("release_timestamp")
+        # Through stream_start_epoch, which prefers `release_timestamp` and
+        # falls back to `timestamp`. Reading release_timestamp alone is how a
+        # VOD that carries only `timestamp` collapses to the moment you ran it: the
+        # second-precision answer is sitting in the same dict, unread. Entry
+        # 379 is the case — `timestamp` present, and nothing used it, so the
+        # only surviving witness to its start was the download time baked into
+        # its filename, 35 hours after the broadcast.
+        #
+        # `fromtimestamp` stays LOCAL on purpose. The filename convention is a
+        # wall clock in the recorder's own offset, and the archive parses it
+        # back as wall time in `tz_offset_min` — `05:47` only resolves to
+        # 1760525220 because the two agree. UTC here would shift every name.
+        start_ts = ls_common.stream_start_epoch(data)
         upload_date = data.get("upload_date", "")
-        if release_ts:
-            start = datetime.datetime.fromtimestamp(release_ts).isoformat()
+        if start_ts:
+            start = datetime.datetime.fromtimestamp(start_ts).isoformat()
         elif upload_date:
             start = datetime.datetime.strptime(upload_date, "%Y%m%d").isoformat()
         else:
@@ -1487,6 +1511,18 @@ def cmd_inject(config: dict, url: str | None = None):
             "start_time": start,
             "channel":    data.get("channel") or data.get("uploader") or "unknown",
             "duration":   data.get("duration"),
+            # The field `broadcast_started_at` is actually read from. Without it a VOD
+            # the LIVE recorder never saw has no broadcast start at all — ls_rec.py is
+            # the only other writer — so the audit falls back to the record start, which
+            # is parsed out of the filename. On a backfilled VOD that filename holds the
+            # DOWNLOAD time: entry 379 showed 05:47 as its broadcast start, 35 hours
+            # after the broadcast, and no amount of correcting the archive would shift
+            # it, because this was the thing nothing ever wrote.
+            # It is also the YouTube zero that the chat merge falls back to — see
+            # _chat_zero_fallbacks — so one missing key moved both the start and the
+            # chat axis. None is skipped by upsert_vod, so an absent epoch stays absent
+            # rather than being written as a guess.
+            "stream_start_epoch_ms": start_ts * 1000 if start_ts else None,
         }
     else:
         return _inject_manual(cache)
@@ -4228,6 +4264,67 @@ def worst(findings: list[dict]) -> str:
                default="ok")
 
 
+def _entry_from_archive(base: dict, archive: dict | None,
+                        arch_ids: dict[str, str]) -> dict | None:
+    """The entry the vault WOULD have carried, built from the archive row.
+
+    A stream born on the website has no vault line, and `inspect` used to stop
+    at that — which made the one case a person most needs help with the one
+    case that refuses to run: files sitting on the NAS, an id typed into the
+    UI, and no way to ask whether the three agree. Everything needed was
+    already in hand two lines earlier, in the lookup the worker had done
+    anyway.
+
+    ONLY for a stream that never had a vault line. `origin` decides, and the
+    distinction is not pedantry: a `web` stream has no line because nobody
+    wrote one, while a `vault` stream with no line has LOST one, and that is a
+    finding rather than a gap to paper over. Synthesising for the second would
+    replace a real alarm with a clean report.
+
+    Returns None when the archive cannot furnish a date, so the caller's own
+    refusal still happens for a genuinely unknown entry.
+
+    NOT A VAULT WITNESS. These fields come from the archive, so every
+    archive-against-vault comparison downstream agrees by construction and
+    proves nothing. `_synthetic` is how inspect() knows to say so.
+    """
+    st = (archive or {}).get("stream") or {}
+    if str(st.get("origin") or "vault").strip().lower() == "vault":
+        return None
+    started = st.get("started_at")
+    if not started:
+        return None
+
+    tz_min = int(st.get("tz_offset_min") or 0)
+    # The inverse of _vault_epoch, and deliberately written against it: the
+    # vault stores a WALL-CLOCK reading and the offset says where it was read,
+    # so the reading is the instant shifted into that offset. Getting this
+    # backwards would move every synthesised entry by twice the offset, which
+    # on a UTC-5 archive is a ten-hour error that still looks like a date.
+    wall = datetime.datetime.utcfromtimestamp(int(started) + tz_min * 60)
+    hh, mm = divmod(abs(tz_min), 60)
+    sign = "-" if tz_min < 0 else "+"
+    tz_str = f"(GMT{sign}{hh})" if not mm else f"(GMT{sign}{hh}:{mm:02d})"
+
+    entry = dict(base)
+    entry["found"] = True
+    entry["_synthetic"] = True
+    entry["date_obj"] = wall
+    entry["date_str"] = wall.strftime("%Y.%m.%d %H:%M")
+    entry["tz_str"] = tz_str
+    if st.get("duration_s"):
+        entry["duration_str"] = _seconds_to_hhmmss(int(st["duration_s"]))
+    # The ids the website knows. `no_yt`/`no_tw` are left alone at their
+    # defaults rather than set from whether an id is present: an absent id
+    # means "not recorded here", which is a question for the audit, while
+    # `no_yt` asserts the broadcast never happened — a claim the archive is
+    # not making and this must not invent on its behalf.
+    for key, plat in (("yt_id", "youtube"), ("tw_id", "twitch")):
+        if arch_ids.get(plat):
+            entry[key] = arch_ids[plat]
+    return entry
+
+
 def inspect(config: dict, index: int, *,
             yt_override: str | None = None,
             tw_override: str | None = None,
@@ -4258,10 +4355,17 @@ def inspect(config: dict, index: int, *,
 
     entry = ls_common.obsidian_parse_entry(config, index)
     if not entry["found"]:
-        out["reason"] = f"entry #{index} not found"
-        return out
+        entry = _entry_from_archive(entry, archive, arch_ids)
+        if entry is None:
+            out["reason"] = f"entry #{index} not found"
+            return out
     entry["_index"] = index
     out["entry"] = entry
+    # Which of the two the fields came from. On the report rather than inferred
+    # from `_synthetic` by every reader in turn, because a caller deciding how
+    # much to trust a clean audit needs this and should not have to know the
+    # private key that carries it.
+    out["entry_source"] = "archive" if entry.get("_synthetic") else "vault"
     if not entry["date_obj"]:
         out["reason"] = f"cannot parse the date for #{index}"
         out["findings"].append(_finding("bad", "assignment", out["reason"],
@@ -4284,6 +4388,19 @@ def inspect(config: dict, index: int, *,
     out["findings"] = (_disk_findings(config, nas, entry, known, ids)
                        + _platform_findings(cache, ids, entry)
                        + _assignment_findings(cache, ids, entry))
+    if entry.get("_synthetic"):
+        # FIRST, and a finding rather than a flag on the side, because the
+        # thing it is warning about is the absence of alarms: three witnesses
+        # became two, so an audit with nothing to say here is quieter than it
+        # has earned. Note and not warn — the setup is legitimate, it is the
+        # reading of a clean result that needs the caveat.
+        out["findings"].insert(0, _finding(
+            "note", "assignment",
+            f"#{entry['_index']} has no vault entry, so the archive stood in "
+            f"for one: its date, timezone and duration were taken as given "
+            f"and only the files and the platforms were checked against them",
+            short="no vault line",
+            entry_source="archive", question=None))
     # Lifted out flat for a caller that wants the questions and not the whole
     # report — the plan that goes home, and eventually the panel. They stay on
     # their findings too, because the finding is where the context is.

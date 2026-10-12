@@ -730,10 +730,22 @@ def refresh_youtube_cache(config: dict, cache: list[dict], *,
         vid = data.get("id")
         if not vid:
             continue
-        release_ts = data.get("release_timestamp")
+        # Through stream_start_epoch, which prefers `release_timestamp` and
+        # falls back to `timestamp`. Reading release_timestamp alone is how a
+        # VOD that carries only `timestamp` collapses to midnight of its upload day: the
+        # second-precision answer is sitting in the same dict, unread. Entry
+        # 379 is the case — `timestamp` present, and nothing used it, so the
+        # only surviving witness to its start was the download time baked into
+        # its filename, 35 hours after the broadcast.
+        #
+        # `fromtimestamp` stays LOCAL on purpose. The filename convention is a
+        # wall clock in the recorder's own offset, and the archive parses it
+        # back as wall time in `tz_offset_min` — `05:47` only resolves to
+        # 1760525220 because the two agree. UTC here would shift every name.
+        start_ts = stream_start_epoch(data)
         upload_date = data.get("upload_date", "")
-        if release_ts:
-            start_time = datetime.datetime.fromtimestamp(release_ts).isoformat()
+        if start_ts:
+            start_time = datetime.datetime.fromtimestamp(start_ts).isoformat()
         elif upload_date:
             start_time = datetime.datetime.strptime(upload_date, "%Y%m%d").isoformat()
         else:
@@ -745,6 +757,18 @@ def refresh_youtube_cache(config: dict, cache: list[dict], *,
             "start_time": start_time,
             "channel":    data.get("channel") or config["youtube_handle"],
             "duration":   data.get("duration"),
+            # The field `broadcast_started_at` is actually read from. Without it a VOD
+            # the LIVE recorder never saw has no broadcast start at all — ls_rec.py is
+            # the only other writer — so the audit falls back to the record start, which
+            # is parsed out of the filename. On a backfilled VOD that filename holds the
+            # DOWNLOAD time: entry 379 showed 05:47 as its broadcast start, 35 hours
+            # after the broadcast, and no amount of correcting the archive would shift
+            # it, because this was the thing nothing ever wrote.
+            # It is also the YouTube zero that the chat merge falls back to — see
+            # _chat_zero_fallbacks — so one missing key moved both the start and the
+            # chat axis. None is skipped by upsert_vod, so an absent epoch stays absent
+            # rather than being written as a guess.
+            "stream_start_epoch_ms": start_ts * 1000 if start_ts else None,
         })
     return True
 
