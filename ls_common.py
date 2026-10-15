@@ -491,9 +491,24 @@ def load_cache(path: str | None = None) -> list[dict]:
 
 
 def save_cache(cache: list[dict], path: str | None = None) -> None:
+    """tmp + rename, the same as _write_lines_atomic does for the vault.
+
+    This was a plain truncate-and-write, which is the one shape that can lose
+    the whole file: there are about ten call sites, one of them inside the
+    audit JOB handler, so a write can land while the recorder is mid-stream and
+    nothing anywhere takes a lock. A torn write leaves every VOD this archive
+    has ever learned about as half a line of JSON, and load_cache answers an
+    unparseable file with `[]` -- silently, by design, because every caller's
+    next move is better than a crash. Which means the loss would show up as
+    "the audit cannot find any platform start", days later, on every entry.
+    Not a lock, and not a claim to be one: two writers still interleave and the
+    last one wins. What this removes is the window where NEITHER wins.
+    """
     path = path or CACHE_PATH
-    with open(path, "w") as f:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
         json.dump({"vods": cache}, f, indent=2)
+    os.replace(tmp, path)
 
 
 def upsert_vod(cache: list[dict], vod: dict) -> dict:

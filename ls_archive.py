@@ -1003,6 +1003,13 @@ PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
             # A single kind would have to be either approved twice or trusted
             # once, and neither is what the archive means.
             "music_probe", "music_fetch",
+            # What a STREAM's page says, asked before the entry exists. The
+            # archive cannot ask -- it never talks to another site -- and until
+            # this kind existed the only way an old broadcast got a real start
+            # was a human running `--inject` at a terminal and knowing to.
+            # Entry 379 is what that cost: filed 6h41m early, and the download
+            # time in its filename stood in as its broadcast start for days.
+            "probe",
             # The three checks `ls-audit <idx>` runs, asked for from the
             # website instead of from a terminal on this machine. It could not
             # live anywhere else: it reads the NAS, runs ffprobe, and asks

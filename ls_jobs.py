@@ -1851,6 +1851,103 @@ def do_music_probe(config: dict, job: dict):
     return ("done", None, None, found)
 
 
+def do_probe(config: dict, job: dict):
+    """What a stream's page says about itself, before the entry exists.
+
+    Returns (status, result_path, error, found). Facts and no file, the same
+    shape as do_music_probe, for a consumer that is different in one way that
+    matters: the archive has no ROW to put these on. A human is looking at a
+    half-filled form and these are what fill it, so they go back on the job
+    and the form reads them from there.
+
+    NOTHING IS GUESSED. `stream_start_epoch` prefers `release_timestamp` and
+    falls back to `timestamp`; if a page carries neither, `started_at` comes
+    back None and the form asks the human. The three sites that used to do
+    this each had their own fallback -- midnight of the upload day, `_00-00`,
+    `datetime.now()` -- and every one of them produced a number that looked
+    like a measurement. A missing start is a question, not a value.
+
+    The cache write is the POINT, not a side effect. `broadcast_started_at` is
+    read from exactly one field, `stream_start_epoch_ms`, and before this only
+    ls_rec wrote it -- so a VOD the recorder never saw go live could not have a
+    broadcast start at all, and the audit fell back to the record time parsed
+    out of the filename. On a backfilled VOD that filename holds the DOWNLOAD
+    time. Writing the cache here is what lets the audit corroborate a start
+    instead of being expected to discover one.
+    """
+    url = str(job.get("url") or "").strip()
+    if not url:
+        # The archive refuses this on enqueue; said again here because a job
+        # can be made by something other than that endpoint.
+        return ("failed", None, "a probe needs a url", None)
+
+    platform = "twitch" if "twitch.tv" in url else "youtube"
+    # Cookied with the anonymous-first fallback, same as the music prober: a
+    # bare probe draws a bot check often enough that a plain call would report
+    # working pages as broken.
+    data, why = ls_common.ytdlp_probe(config, url, timeout=45, with_reason=True)
+    if data is None:
+        if why == "gone":
+            return ("failed", None,
+                    "that video is gone — taken down, private, or region-locked", None)
+        if why == "offline":
+            return ("failed", None, "that link is a stream that is not on right now", None)
+        return ("failed", None, "could not read that page", None)
+
+    vid = str(data.get("id") or "").strip() or None
+    secs = data.get("duration")
+    start_ts = ls_common.stream_start_epoch(data)
+    found = {
+        "id": vid,
+        "platform": platform,
+        "title": (str(data.get("title") or "").strip() or None),
+        "channel": (str(data.get("channel") or data.get("uploader") or "").strip() or None),
+        "started_at": start_ts,
+        "duration_s": int(secs) if isinstance(secs, (int, float)) and secs > 0 else None,
+        # Which key answered, so the form can say "YouTube's own broadcast
+        # start" rather than presenting both with equal confidence. A
+        # `timestamp` on a live VOD is the publish moment and is usually the
+        # same instant; on a plain upload it is not a broadcast start at all,
+        # which is what `was_live` is here to let the reader see.
+        "start_source": ("release_timestamp" if data.get("release_timestamp")
+                         else "timestamp" if data.get("timestamp") else None),
+        "was_live": bool(data.get("was_live")),
+        # Carried because they are free once the page is read, and unused for
+        # now: importing them is a separate decision about the timeline, where
+        # they belong in lane 1 underneath the lane-0 block for the game.
+        "chapters": [
+            {"start_time": c.get("start_time"), "end_time": c.get("end_time"),
+             "title": str(c.get("title") or "")[:200]}
+            for c in (data.get("chapters") or [])[:200]
+            if isinstance(c, dict)
+        ],
+    }
+
+    if vid:
+        # Read-modify-write on an unlocked file, which is what every other
+        # cache writer here does, including the audit handler. save_cache is
+        # atomic as of the same change that added this, so the worst case is a
+        # concurrent writer winning rather than the file being lost.
+        cache = ls_common.load_cache()
+        ls_common.upsert_vod(cache, {
+            "id": vid, "platform": platform,
+            "title": found["title"], "channel": found["channel"],
+            "duration": found["duration_s"],
+            # Local, matching refresh_youtube_cache: `start_time` is read back
+            # as a wall clock in the recorder's own offset.
+            "start_time": (datetime.datetime.fromtimestamp(start_ts).isoformat()
+                           if start_ts else None),
+            "stream_start_epoch_ms": start_ts * 1000 if start_ts else None,
+        })
+        ls_common.save_cache(cache)
+
+    logger.info("probe %s: %s%s start=%s", vid or "?",
+                (found["title"] or "")[:60],
+                f" ({_mmss(secs)})" if secs else "",
+                found["started_at"] or "unknown")
+    return ("done", None, None, found)
+
+
 def do_music_fetch(config: dict, job: dict):
     """An approved song into the media tree.
 
@@ -2320,7 +2417,7 @@ def do_pull(config: dict, job: dict):
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
             "rescan": do_rescan, "harvest": do_harvest,
             "music_probe": do_music_probe, "music_fetch": do_music_fetch,
-            "clip": do_clip, "audit": do_audit,
+            "clip": do_clip, "audit": do_audit, "probe": do_probe,
             "chat_repair": do_chat_repair, "pull": do_pull}
 
 _stop = False
