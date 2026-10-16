@@ -2552,17 +2552,33 @@ def _backfill_tw_chat(config: dict, item: dict) -> bool:
     if base.endswith(ls_common.OFFLINE_PULL_TAG):
         base = base[: -len(ls_common.OFFLINE_PULL_TAG)]
     out = os.path.join(nas_path, ls_common.offline_pull_name(base))
-    tmp = os.path.join(nas_path, f".{base}.pull.tmp")
+    # `.json`, not merely `.tmp`. TwitchDownloaderCLI validates the output
+    # extension while it is still parsing its arguments and refuses anything it
+    # does not recognise as a chat file, so a `.tmp` never reached the network
+    # at all: it wrote nothing, fell into the branch below, and that branch
+    # blamed the video id. The leading dot is what keeps this out of the NAS
+    # scans, and both of those key on a leading `NNN_`, so the suffix is free.
+    tmp = os.path.join(nas_path, f".{base}.pull.tmp.json")
 
     print(f"\n  ↓ VOD chat: {os.path.basename(out)}")
-    subprocess.run([tdl, "chatdownload", "--id", str(item["video_id"]),
-                    "-o", tmp])
+    r = subprocess.run([tdl, "chatdownload", "--id", str(item["video_id"]),
+                        "-o", tmp], capture_output=True, text=True)
 
-    if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+    if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
         if os.path.exists(tmp):
             os.remove(tmp)
-        print("  ✗ Nothing came back. A broadcast id cannot be downloaded "
-              "from —\n    check `ls-audit --tw-ids` if this id starts with 3.")
+        # WHAT IT SAID, before any theory about why. What used to stand here
+        # was a guess printed as a finding -- that an id beginning with 3 is a
+        # broadcast id -- and it was wrong about this one for as long as the
+        # real reason sat unread in a stderr nobody captured. The theory is
+        # still offered, after the facts, and only when it applies.
+        said = (r.stderr or "") + "\n" + (r.stdout or "")
+        why = next((ln.strip() for ln in reversed(said.splitlines())
+                    if ln.strip() and not ln.strip().startswith("at ")), "")
+        print("  ✗ Nothing came back" + (f": {why}" if why else "."))
+        if str(item["video_id"]).startswith("3"):
+            print("    That id starts with 3, so it may be a broadcast id rather "
+                  "than a VOD id — `ls-audit --tw-ids` resolves it.")
         return False
 
     try:
