@@ -2467,57 +2467,94 @@ def _tw_chat_shortfall(config: dict, cache: list[dict], nas: dict,
 
 def _backfill_yt_chat(config: dict, item: dict) -> bool:
     """
-    Download the post-hoc chat and merge it into the live capture.
+    Pull the replay chat down BESIDE the capture already held.
 
-    The merge is refused if it would shrink the file, so a bad download
-    cannot destroy the partial capture already held.
+    BESIDE, NOT OVER, which is what `_backfill_tw_chat` has always done and
+    what this used to get wrong. It merged the download into the live file
+    with `merge_yt_chats.py` and then deleted the download — which has two
+    costs.
+
+    The first is that it cannot run at all once the raw has been folded into a
+    merged chat and moved to deep storage: there is no live file left to merge
+    into, so the one entry most likely to need a repair is the one where this
+    did nothing. Entry #778 is that case.
+
+    The second is that it consumed its own evidence. A live capture and a
+    replay download are two different witnesses — the live one has messages
+    that were deleted after being seen, the replay has the waiting room the
+    recorder was not yet attached for — and folding one into the other left a
+    file that was neither, with no way back.
+
+    So: it lands under the offline-pull name, as a second capture, and the
+    merge unions it with everything else including archived raws. One shape
+    for both platforms, and the thing on disk stays what it was downloaded as.
+
+    #778 is what the waiting room is worth: its replay chat starts 1h32m
+    before the broadcast did, because YouTube opens the room early and the
+    recorder only polls every ten minutes.
     """
     nas_path = config["nas_path"]
     if not item["video_id"]:
         print("  ✗ No YouTube ID; cannot backfill.")
         return False
 
-    live = item["chat_path"]
-    base = os.path.splitext(item["chat_file"])[0]
-    posthoc = os.path.join(nas_path, f"{base}.posthoc.json")
-    written = os.path.join(nas_path, f"{base}.posthoc.live_chat.json")
+    # The capture may itself be an earlier pull. One tag is enough; two would
+    # read as a pull of a pull. Same guard as the Twitch side.
+    base = os.path.splitext(item.get("chat_file") or "")[0]
+    if base.endswith(ls_common.OFFLINE_PULL_TAG):
+        base = base[: -len(ls_common.OFFLINE_PULL_TAG)]
+    # NO CHAT FILE AT ALL is the whole point of this rewrite: once the raw is
+    # archived there is no capture to be named after, so the name is built from
+    # the entry and the id instead.
+    # NOTHING TO BE NAMED AFTER. `index` rides in the item for exactly this:
+    # the shortfall dicts did not carry one, so `repair` puts it there — a
+    # stem built from the entry and the id is the only name available once the
+    # raw it would have been named beside is in deep storage.
+    if not base:
+        if not item.get("index"):
+            print("  ✗ No chat file and no entry number to name one after.")
+            return False
+        base = _pull_stem(config, item["index"],
+                          ls_common.build_stream_url(config, "youtube",
+                                                     item["video_id"]),
+                          item["video_id"])
+    out = os.path.join(nas_path, ls_common.offline_pull_name(base))
+    # yt-dlp decides the extension; `--write-subs --sub-langs live_chat` lands
+    # it as `.live_chat.json` beside whatever template it was given.
+    tmp_stem = f".{base}.replay"
+    written = os.path.join(nas_path, f"{tmp_stem}.live_chat.json")
 
-    print(f"\n  ↓ Post-hoc chat: {base}.posthoc.json")
+    print(f"\n  ↓ Replay chat: {os.path.basename(out)}")
     url = ls_common.build_stream_url(config, "youtube", item["video_id"])
     subprocess.run(ls_common.ytdlp_chat_cmd(
-        config, url, f"{base}.posthoc.%(ext)s"), cwd=nas_path)
+        config, url, f"{tmp_stem}.%(ext)s"), cwd=nas_path)
 
-    if os.path.exists(written):
-        os.rename(written, posthoc)
-    if not os.path.exists(posthoc):
-        print("  ✗ No post-hoc chat produced (replay chat may be disabled).")
+    if not os.path.exists(written) or os.path.getsize(written) == 0:
+        if os.path.exists(written):
+            os.remove(written)
+        print("  ✗ No replay chat produced (replay chat may be disabled).")
         return False
 
-    def _lines(path):
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                return sum(1 for ln in f if ln.strip())
-        except OSError:
-            return 0
+    # Parsed before it is kept, the same bar the Twitch pull holds: a file that
+    # does not read as chat is worse than no file, because every later sweep
+    # sees a chat on disk and stops asking.
+    try:
+        got = ls_chat.convert_file(written)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        os.remove(written)
+        print(f"  ✗ Downloaded chat does not parse ({e}); discarded.")
+        return False
+    if not got.messages:
+        os.remove(written)
+        print("  ✗ Downloaded chat has no messages; discarded.")
+        return False
 
-    tmp = live + ".merging"
-    r = subprocess.run([sys.executable,
-                        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     "merge_yt_chats.py"),
-                        live, posthoc, "-o", tmp])
-
-    if r.returncode == 0 and os.path.exists(tmp) and _lines(tmp) >= _lines(live):
-        print(f"  merged {_lines(live):,} + {_lines(posthoc):,} "
-              f"→ {_lines(tmp):,} lines")
-        os.replace(tmp, live)
-        os.remove(posthoc)
-        print(f"  ✔ {item['chat_file']}")
-        return True
-
-    if os.path.exists(tmp):
-        os.remove(tmp)
-    print("  ✗ Merge failed or would shrink the file; both kept for manual merge.")
-    return False
+    os.replace(written, out)
+    first = got.messages[0].abs_ms
+    print(f"  ✔ {os.path.basename(out)}  ({len(got.messages):,} messages)")
+    if first:
+        print(f"    earliest message {_iso(first)}")
+    return True
 
 
 def _tdl_said(r) -> str:
@@ -4573,7 +4610,7 @@ def finish(config: dict, index: int,
 
 
 def repair(config: dict, index: int, platform: str,
-           cache: list[dict] | None = None) -> dict:
+           cache: list[dict] | None = None, *, force: bool = False) -> dict:
     """Run the one repair `finish()` declined, because somebody said yes.
 
     The other half of the rule. `finish()` refuses to download because nobody
@@ -4619,6 +4656,46 @@ def repair(config: dict, index: int, platform: str,
                       f"VOD {fixed}.")
                 tw_id = fixed
         short = _tw_chat_shortfall(config, cache, nas, tw_id, index)
+    if not short and force:
+        #  A PERSON PRESSED THE BUTTON. The shortfall checks decide whether the
+        #  audit should ASK about a chat; they were never fit to decide whether
+        #  somebody may fetch one. `_yt_chat_shortfall`'s only measurement is
+        #  `duration - last`, so a chat that ends on time and is missing its
+        #  HEAD — which every YouTube live capture is, because the waiting room
+        #  opens before the recorder attaches — reads as perfectly healthy and
+        #  the button did nothing while reporting success.
+        #
+        #  Entry #778: 1h32m of waiting room sitting in the replay, a Fetch
+        #  that returned `ran: False`, and nothing on screen saying so.
+        pre = "yt" if platform == "youtube" else "tw"
+        vid = yt_id if platform == "youtube" else tw_id
+        #  THE ID, WHEREVER IT STILL IS. `yt_id` above is read from the live
+        #  chat file's name, and once that raw has been folded into a merged
+        #  chat and moved to deep storage there is no such file — so the entry
+        #  that most needs a repair is the one where the id came back None and
+        #  the backfill stopped at "No YouTube ID". The video and the archived
+        #  raw carry the same `[id]` in their own names.
+        if not vid:
+            for cand in ([nas.get(f"{pre}_video")]
+                         + list(nas.get(f"{pre}_chats_archived") or [])):
+                if not cand:
+                    continue
+                vid = ls_common.extract_video_id_from_filename(cand)
+                if vid:
+                    print(f"  ℹ id {vid}, from {cand}")
+                    break
+        if platform == "twitch" and vid:
+            fixed, corrected = ls_common.twitch_correct_id(cache, vid.lstrip("v") or vid)
+            if corrected:
+                print(f"  ℹ {vid} is a broadcast id; the cache says it became "
+                      f"VOD {fixed}.")
+                vid = fixed
+        short = {"platform": platform, "why": ["asked"],
+                 "chat_file": nas.get(f"{pre}_chat"),
+                 "video_id": vid}
+        short["chat_path"] = (os.path.join(config.get("nas_path", ""),
+                                           short["chat_file"])
+                              if short["chat_file"] else None)
     if not short:
         # Not a failure. The entry is in the state the asker wanted it in, and
         # the merge below may still have something to do.
@@ -4626,6 +4703,11 @@ def repair(config: dict, index: int, platform: str,
         return {"ran": False, "changed": done["changed"],
                 "deferred": done["deferred"],
                 "why": f"the {platform} chat is no longer short"}
+
+    #  The entry number travels with the item. A backfill that has no capture
+    #  to sit beside — the raw folded in and archived — has nothing else to
+    #  build a filename from.
+    short.setdefault("index", index)
 
     run = _backfill_yt_chat if platform == "youtube" else _backfill_tw_chat
     ok = bool(run(config, short))

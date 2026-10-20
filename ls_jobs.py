@@ -2344,7 +2344,12 @@ def do_chat_repair(config: dict, job: dict):
                         "the give-up ledger", None)
             return ("done", None, None,
                     {"idx": idx, "platform": platform, "action": action})
-        out = ls_audit.repair(config, idx, platform)
+        #  `force` comes from the panel's own button, which is not the audit
+        #  asking — see `repair`. Absent (an answer to a question the audit
+        #  raised) leaves the shortfall checks in charge, which is right:
+        #  they are what raised it.
+        out = ls_audit.repair(config, idx, platform,
+                              force=bool(payload.get("force")))
     except Exception as e:
         logger.exception("chat repair %s %s failed", idx, platform)
         return ("failed", None, f"{type(e).__name__}: {e}", None)
