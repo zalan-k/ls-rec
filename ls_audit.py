@@ -1735,9 +1735,18 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
     # The chat file itself — exact, and it works for the whole back catalogue.
     # What the zero MEANS depends on the format, which is why the routing
     # lives in `read_chat_zero` rather than in an `if` here.
+    #
+    # Except for the one thing the format cannot say. A YouTube live capture
+    # and a YouTube download are the same format and the same derived zero,
+    # and they answer different questions — the download's offsets run from
+    # the video's start, the capture's from where yt-dlp attached. The name is
+    # what separates them, so the name is read here and the ROUTING still
+    # happens there: `ls_witness` takes values off a disk and never a path.
     if chat_file:
         zero, zsrc = ls_chat.peek_zero(os.path.join(nas_root, chat_file))
-        ws += ls_witness.read_chat_zero(zero, zsrc)
+        ws += ls_witness.read_chat_zero(
+            zero, zsrc,
+            posthoc=ls_common.OFFLINE_PULL_TAG in os.path.basename(chat_file))
 
     # The recorder log — second accurate, but only the recent past: it is
     # written to the daemon's working directory and rolls over after a few

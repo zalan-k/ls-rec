@@ -288,7 +288,14 @@ def peek_zero(path: str, max_lines: int = 20000) -> tuple[Optional[int], str]:
     Derive a capture's zero from the head of the file, without parsing it all.
 
     Returns (epoch_ms, source). The source says what the zero *means*:
-        yt:timestampUsec      broadcast start (videoOffsetTimeMsec is video-relative)
+        yt:timestampUsec      depends on which program wrote the file — a
+                              download's `videoOffsetTimeMsec` runs from the
+                              video's start and gives the BROADCAST start, a
+                              live capture's runs from where yt-dlp attached
+                              and gives the RECORD start. This function cannot
+                              tell them apart and does not try; see
+                              `ls_witness.read_chat_zero`, whose caller
+                              decides from the filename.
         tdc:created_at        broadcast start (VOD start)
         irc:tmi_sent_ts       record start (offsets are relative to the recorder)
         irc:time_in_seconds   broadcast start (a chat-downloader VOD pull)

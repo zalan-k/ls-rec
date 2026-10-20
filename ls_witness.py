@@ -358,23 +358,56 @@ def read_sidecar(doc: dict | None) -> list[dict]:
 
 #  Which question a chat file's zero answers depends on the format it is in,
 #  and that is not a detail — it is the same split as `start_time`'s, one
-#  level down. A YouTube replay stamp and a Twitch downloader stamp are wall
-#  clocks and so answer when the BROADCAST began; an IRC capture's first
-#  message is the moment the recorder attached and answers when RECORDING
-#  did. Reading either as the other is hours wrong on a waiting room.
-_CHAT_ABSOLUTE = ("yt:timestampUsec", "tdc:created_at")
+#  level down. A Twitch downloader stamp is a wall clock against the VOD and
+#  so answers when the BROADCAST began; an IRC capture's first message is the
+#  moment the recorder attached and answers when RECORDING did. Reading either
+#  as the other is hours wrong on a waiting room.
+_CHAT_ABSOLUTE = ("tdc:created_at",)
 _CHAT_RELATIVE = ("irc:tmi_sent_ts",)
 
+#  AND FOR YOUTUBE IT DEPENDS ON WHICH PROGRAM WROTE THE FILE, which is the
+#  one case the format cannot answer: a live capture and a post-hoc download
+#  are both yt-dlp JSONL carrying `timestampUsec` and `videoOffsetTimeMsec`,
+#  and `peek_zero` derives the same zero from both — the first minus the
+#  second. They do not mean the same thing.
+#
+#  A DOWNLOAD's offsets run from the video's t=0, so the zero is the broadcast
+#  start. A LIVE CAPTURE's run from where yt-dlp attached, so the zero is the
+#  moment the recorder attached — exactly what `irc:tmi_sent_ts` means on the
+#  Twitch side, which is why Twitch never produced this warning and YouTube
+#  produced it on nearly every entry.
+#
+#  Entry #774 is the measurement, and it is not subtle: recorder and cache
+#  both 08:04:15 off the live probe, chat 08:13:43, and the entry's own record
+#  start 08:13:41 — two seconds from the chat and nine and a half minutes from
+#  the broadcast. The recorder polls YouTube every ten minutes. The video is
+#  whole regardless, because `--live-from-start` rebuilds it: 08:04:15 plus
+#  the file's 3:55:59 lands on Twitch's end. It is the chat, and only the
+#  chat, that begins where the recorder did.
+#
+#  `posthoc` is the caller's to establish, from the filename
+#  (`ls_common.OFFLINE_PULL_TAG`). This module takes values read off a disk
+#  and never a path, so it is not this function's to look up — and it defaults
+#  to False because a capture is the ordinary case and a mislabelled live
+#  capture answering the record start is a harmless duplicate, while a
+#  mislabelled download answering the broadcast start is ten minutes of error
+#  wearing a measurement's precision.
+_YT_CHAT = "yt:timestampUsec"
 
-def read_chat_zero(zero_ms, zsrc: str) -> list[dict]:
-    """`ls_chat.peek_zero`'s answer, routed by what its format means."""
+
+def read_chat_zero(zero_ms, zsrc: str, *, posthoc: bool = False) -> list[dict]:
+    """`ls_chat.peek_zero`'s answer, routed by what its format means.
+
+    `posthoc` says this file was downloaded after the stream rather than
+    captured during it, which for YouTube decides which question it answers.
+    """
     if not zero_ms or not zsrc:
         return []
     label = f"chat ({zsrc})"
-    if zsrc in _CHAT_ABSOLUTE:
+    if zsrc in _CHAT_ABSOLUTE or (zsrc == _YT_CHAT and posthoc):
         return [witness(BROADCAST_START, zero_ms, "chat:absolute", PRECISE,
                         label=label)]
-    if zsrc in _CHAT_RELATIVE:
+    if zsrc in _CHAT_RELATIVE or zsrc == _YT_CHAT:
         return [witness(RECORD_START, zero_ms, "chat:relative", PRECISE,
                         label=label)]
     #  A format nobody has taught this what it means. Declining beats routing
@@ -445,40 +478,8 @@ NONE = "none"
 #  different question, and conflating them is what put the warning there.
 CLOCK_SLOP_S = 10
 
-#  AND THE SAME ARGUMENT, ONE SIZE UP, FOR A CHAT FILE'S ZERO.
-#
-#  `CLOCK_SLOP_S` was set from entry #716, where the gap between the cache and
-#  the chat was three seconds, and ten looked like generous room around it. It
-#  is not: the gap is not jitter between two readings of one instant, it is the
-#  distance between two different instants, and nothing bounds that at three
-#  seconds.
-#
-#  A chat zero is anchored to the media timeline — `timestampUsec` minus
-#  `videoOffsetTimeMsec`, so t=0 of the video — and the platform's broadcast
-#  start is when its ingest went live. Those are the same event only if the
-#  first published fragment begins at the instant of going live, and it does
-#  not: YouTube publishes the first fragment when it has one, and
-#  `--live-from-start` reconstructs from there.
-#
-#  Entry 2026-10-16 is the measurement: recorder and cache both 11:02:08 — one
-#  witness spelled twice, off the live probe — and the chat 11:02:43. Thirty-
-#  five seconds, in the direction the anchor predicts, reported as a warning
-#  on essentially every entry in the archive.
-#
-#  Two minutes, chosen as a ceiling on that anchor rather than tuned to the one
-#  observation: `_TRUNCATION_FLOOR_S` already states this archive's view that
-#  under five minutes is not a start worth a person's time, and anything that
-#  is — a capture that joined late, a mismatched stream — clears two minutes
-#  by a wide margin. It governs this pair and nothing else; every other pair
-#  keeps the ten-second floor.
-TIMELINE_SLOP_S = 120
 
-#  The sources whose answer to a clock question is a media timeline and not the
-#  event the question asks about.
-_TIMELINE_ANCHORED = ("chat:absolute",)
-
-
-def tolerance_s(claim: str, witnesses: list[dict]) -> int:
+def tolerance_s(witnesses: list[dict]) -> int:
     """How far apart two measurements may be and still be the same one.
 
     The COARSEST witness sets it, over a floor. Two sources one minute apart
@@ -487,21 +488,17 @@ def tolerance_s(claim: str, witnesses: list[dict]) -> int:
     numbers, and the difference is what they were able to measure, which is
     exactly what `precision_s` is for.
 
-    The floor is what `precision_s` cannot express: see `CLOCK_SLOP_S`, and
-    `TIMELINE_SLOP_S` for the pair that needs more of it.
+    The floor is what `precision_s` cannot express: see `CLOCK_SLOP_S`.
 
-    THE FLOOR AND NOT THE PRECISION, deliberately. A chat zero is stated to
-    the millisecond and `precision_s` is the right answer to "how finely can
-    this source state a number" — coarsening it there would be a lie about the
-    reading, and would also make every back-catalogue entry whose only witness
-    is its chat file report that its broadcast start is "only known to the
-    minute". What is uncertain is not the number, it is which event it names.
+    A WIDER FLOOR IS NOT THE ANSWER TO A WITNESS IN THE WRONG WITNESS BOX,
+    and for a while this had one. Entry #774 reported its broadcast start
+    disputed by 9m29s — the recorder and the cache both 08:04:15, the chat
+    08:13:43 — and a floor wide enough to cover that would have covered a
+    capture that joined ten minutes late, which is the thing the warning is
+    for. The chat was not a poor measurement of the broadcast start. It was an
+    exact measurement of something else; see `read_chat_zero`.
     """
-    floor = (TIMELINE_SLOP_S
-             if claim in (BROADCAST_START, RECORD_START)
-             and any(w["source"] in _TIMELINE_ANCHORED for w in witnesses)
-             else CLOCK_SLOP_S)
-    return max([w["precision_s"] for w in witnesses] + [floor])
+    return max([w["precision_s"] for w in witnesses] + [CLOCK_SLOP_S])
 
 
 def settle(claim: str, witnesses: list[dict]) -> dict:
@@ -560,7 +557,7 @@ def settle(claim: str, witnesses: list[dict]) -> dict:
         scale = 1000 if claim in (BROADCAST_START, RECORD_START) else 1
         vals = [w["value"] / scale for w in vouching]
         spread = int(round(max(vals) - min(vals)))
-        agreement = AGREE if spread <= tolerance_s(claim, vouching) else DISAGREE
+        agreement = AGREE if spread <= tolerance_s(vouching) else DISAGREE
 
     return {"claim": claim, "value": best["value"], "source": best["source"],
             "precision_s": best["precision_s"], "agreement": agreement,
