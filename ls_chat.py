@@ -1424,6 +1424,31 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             out.append(d)
     out.sort(key=lambda d: d["abs_ms"])
 
+    #  WHAT EACH SOURCE ACTUALLY CONTRIBUTED, per platform.
+    #
+    #  `messages` beside it is the converter's own count, taken before the
+    #  merge — so it includes what was deduped away and what had no absolute
+    #  time to be placed by. These three are measured from `out`, which is the
+    #  file: `kept` is how many of this source's messages are IN it, and the
+    #  span is where they start and stop.
+    #
+    #  Needed because a merged chat answers nothing about its parts otherwise.
+    #  Entry #775 had YouTube covering 1:02 of a 5:50 broadcast and Twitch
+    #  covering all of it, and the archive could only say "folded into the
+    #  merged file" about both — the one number that separated a healthy
+    #  capture from a broken one was computed here and thrown away.
+    #
+    #  `out` is already sorted, so first and last are the ends of each run.
+    spans: dict[str, dict] = {}
+    for d in out:
+        o = d.get("origin")
+        if o is None:
+            continue
+        e = spans.setdefault(o, {"kept": 0, "first_abs_ms": d["abs_ms"],
+                                 "last_abs_ms": d["abs_ms"]})
+        e["kept"] += 1
+        e["last_abs_ms"] = d["abs_ms"]
+
     emotes: dict[str, dict] = {}
     badges: dict[str, dict] = {}
     gifts: dict[str, dict] = {}
@@ -1490,7 +1515,12 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             "sources": [{"file": os.path.basename(p), "platform": c.platform,
                          "format": c.fmt, "messages": len(c.messages),
                          "zero_ms": c.zero_ms, "zero_source": c.zero_src,
-                         "skipped_lines": c.skipped}
+                         "skipped_lines": c.skipped,
+                         #  `**spans.get(...)` rather than three explicit keys:
+                         #  a source that contributed nothing to the file gets
+                         #  none of them, which says the question was not
+                         #  answerable rather than that the answer was zero.
+                         **spans.get(c.platform, {})}
                         for p, c in zip(paths, convs)],
             "emotes": emotes,
             "badges": badges,

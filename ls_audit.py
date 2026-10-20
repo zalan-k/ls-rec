@@ -2520,6 +2520,29 @@ def _backfill_yt_chat(config: dict, item: dict) -> bool:
     return False
 
 
+def _tdl_said(r) -> str:
+    """The one line of TwitchDownloaderCLI's output worth repeating.
+
+    stderr first, because that is where it puts the reason, and the FIRST
+    meaningful line of it: a .NET failure leads with the exception and follows
+    with stack frames, so reading from the end returns `at ...Program.Main`.
+
+    Two kinds of noise are dropped. Frames, and the version banner — which it
+    prints on every run, success or failure, and which reading from the end of
+    a merged stdout produced as the explanation for a download that failed. A
+    banner offered as a cause is worse than no cause: it looks like an answer.
+    """
+    for stream in (r.stderr, r.stdout):
+        for ln in (stream or "").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("at "):
+                continue
+            if ln.startswith("TwitchDownloaderCLI ") and "Copyright" in ln:
+                continue
+            return ln
+    return ""
+
+
 def _backfill_tw_chat(config: dict, item: dict) -> bool:
     """
     Pull the VOD's chat down BESIDE the capture already held.
@@ -2569,16 +2592,24 @@ def _backfill_tw_chat(config: dict, item: dict) -> bool:
             os.remove(tmp)
         # WHAT IT SAID, before any theory about why. What used to stand here
         # was a guess printed as a finding -- that an id beginning with 3 is a
-        # broadcast id -- and it was wrong about this one for as long as the
+        # broadcast id -- and it was wrong about one failure for as long as the
         # real reason sat unread in a stderr nobody captured. The theory is
         # still offered, after the facts, and only when it applies.
-        said = (r.stderr or "") + "\n" + (r.stdout or "")
-        why = next((ln.strip() for ln in reversed(said.splitlines())
-                    if ln.strip() and not ln.strip().startswith("at ")), "")
-        print("  ✗ Nothing came back" + (f": {why}" if why else "."))
+        #
+        # THE ID IS PART OF THE FACTS, and the most useful part. It is parsed
+        # out of the chat FILENAME (`repair` -> extract_video_id_from_filename),
+        # not from the cache or the vault, so correcting it in either of those
+        # changes nothing here and the old message gave no hint of that.
+        print(f"  ✗ Nothing came back for id {item['video_id']}"
+              + (f": {_tdl_said(r)}" if _tdl_said(r)
+                 else f" (the downloader exited {r.returncode} without "
+                      "writing anything)"))
+        print(f"    It was read out of the filename: {item['chat_file']}")
         if str(item["video_id"]).startswith("3"):
-            print("    That id starts with 3, so it may be a broadcast id rather "
-                  "than a VOD id — `ls-audit --tw-ids` resolves it.")
+            print("    That id starts with 3, so it is probably a broadcast id "
+                  "rather than a VOD\n    id — `ls-audit --tw-ids` resolves it. "
+                  "Renaming the file is what\n    fixes it; the cache and the "
+                  "vault are not consulted here.")
         return False
 
     try:
@@ -4121,6 +4152,50 @@ def media_report(config: dict, got: dict) -> dict:
         "archived_raws": (len(nas.get("yt_chats_archived", []))
                           + len(nas.get("tw_chats_archived", []))),
     }
+
+    #  WHAT EACH PLATFORM PUT INTO THAT FILE.
+    #
+    #  Once a raw is folded in and archived, the per-platform row could say
+    #  nothing but "merged" — and that is the row where a broken capture shows.
+    #  Entry #775: YouTube covered 1:02 of a 5:50 broadcast and Twitch covered
+    #  all of it, and the report said the same three words about both.
+    #
+    #  A second header read of a file already read above. Cheap — `read_header`
+    #  stops at the metadata and never touches the messages — and it keeps
+    #  `_merged_chat_meta` returning database columns and nothing else, which
+    #  is what its callers spread into stream_fields.
+    head = ls_chat.read_header(os.path.join(nas_root, merged),
+                               MERGED_CHAT_HEAD_BYTES) or {}
+    by_plat: dict[str, dict] = {}
+    for src in head.get("sources", []):
+        code = ls_archive.PLATFORM.get(str(src.get("platform", "")).strip().lower())
+        kept = src.get("kept")
+        #  `not isinstance(bool)` because True is an int in Python and would
+        #  sail through as a count of one.
+        if not code or not isinstance(kept, int) or isinstance(kept, bool):
+            continue
+        #  SUMMED, not replaced. One platform can contribute two sources to a
+        #  merge — a live dump and a post-hoc pull of the same broadcast — and
+        #  the row is about the platform, not about either file.
+        cur = by_plat.setdefault(code.lower(),
+                                 {"count": 0, "first_ms": None, "last_ms": None})
+        cur["count"] += kept
+        for key, col, pick in (("first_abs_ms", "first_ms", min),
+                               ("last_abs_ms", "last_ms", max)):
+            v = src.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                cur[col] = v if cur[col] is None else pick(cur[col], v)
+
+    for row in platforms:
+        chat = row.get("chat") or {}
+        if chat.get("state") != "merged":
+            continue
+        got = by_plat.get(row.get("platform"))
+        #  Absent rather than zeroed when the file predates this: a merge
+        #  written before `kept` existed cannot answer, and saying `0 msgs`
+        #  about it would be a lie rather than a gap.
+        if got:
+            chat.update(got)
     return out
 
 
@@ -4528,6 +4603,21 @@ def repair(config: dict, index: int, platform: str,
     else:
         tw_id = (ls_common.extract_video_id_from_filename(nas["tw_chat"])
                  if nas.get("tw_chat") else None)
+        # THE SAME CORRECTION THE WITNESS PASS ALREADY MAKES, which this path
+        # did not. `_platform_witnesses` runs every filename id through
+        # `twitch_correct_id` before believing it, because a capture taken
+        # while the broadcast was live is named after the BROADCAST, and the
+        # VOD it became has a different number. A repair read the raw filename
+        # instead and handed a broadcast id to TwitchDownloaderCLI, which
+        # cannot download from one -- so correcting the id in the cache, which
+        # is exactly where this correction is looked up, changed nothing and
+        # looked like it should have.
+        if tw_id:
+            fixed, corrected = ls_common.twitch_correct_id(cache, tw_id.lstrip("v") or tw_id)
+            if corrected:
+                print(f"  ℹ {tw_id} is a broadcast id; the cache says it became "
+                      f"VOD {fixed}.")
+                tw_id = fixed
         short = _tw_chat_shortfall(config, cache, nas, tw_id, index)
     if not short:
         # Not a failure. The entry is in the state the asker wanted it in, and
