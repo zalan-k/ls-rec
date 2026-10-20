@@ -1395,7 +1395,27 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
 
     out, seen, dupes, unplaced = [], set(), 0, 0
     said = {}                    # (platform, author, text) -> [abs_ms, ...]
-    for c in convs:
+    #  WHAT EACH SOURCE ACTUALLY CONTRIBUTED.
+    #
+    #  Accumulated here, as the messages are appended, because `out` cannot
+    #  answer it: a merged record carries its `origin` platform and not the
+    #  file it came from. Reading it back off `out` and keying by platform —
+    #  which is what this did — gave every source row of a platform the whole
+    #  platform's figure, and `media_report` sums those rows because one
+    #  platform legitimately contributes two sources: a live dump and a
+    #  post-hoc pull of the same broadcast. Entry #778: 1,286 YouTube messages
+    #  in a 2,190-message file, reported as 2,572 against Twitch's 904.
+    #
+    #  WHO GETS CREDIT FOR A SHARED MESSAGE IS THE ORDER `paths` CAME IN —
+    #  dedupe keeps the first copy, so a live capture listed before a replay
+    #  pull keeps everything they both saw and the pull's figure is what it
+    #  added. That is the useful way round, and it is the caller's to choose.
+    #
+    #  `kept` is always present, so an old file that cannot answer stays
+    #  distinguishable from a source that contributed nothing. The span keys
+    #  are not: there is no first message to name when nothing was kept.
+    mine: list[dict] = [{"kept": 0} for _ in convs]
+    for c, got in zip(convs, mine):
         for m in c.messages:
             if m.abs_ms is None:
                 unplaced += 1
@@ -1422,32 +1442,13 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
             d.pop("ts", None)
             d.pop("id", None)
             out.append(d)
+            got["kept"] += 1
+            lo, hi = got.get("first_abs_ms"), got.get("last_abs_ms")
+            if lo is None or m.abs_ms < lo:
+                got["first_abs_ms"] = m.abs_ms
+            if hi is None or m.abs_ms > hi:
+                got["last_abs_ms"] = m.abs_ms
     out.sort(key=lambda d: d["abs_ms"])
-
-    #  WHAT EACH SOURCE ACTUALLY CONTRIBUTED, per platform.
-    #
-    #  `messages` beside it is the converter's own count, taken before the
-    #  merge — so it includes what was deduped away and what had no absolute
-    #  time to be placed by. These three are measured from `out`, which is the
-    #  file: `kept` is how many of this source's messages are IN it, and the
-    #  span is where they start and stop.
-    #
-    #  Needed because a merged chat answers nothing about its parts otherwise.
-    #  Entry #775 had YouTube covering 1:02 of a 5:50 broadcast and Twitch
-    #  covering all of it, and the archive could only say "folded into the
-    #  merged file" about both — the one number that separated a healthy
-    #  capture from a broken one was computed here and thrown away.
-    #
-    #  `out` is already sorted, so first and last are the ends of each run.
-    spans: dict[str, dict] = {}
-    for d in out:
-        o = d.get("origin")
-        if o is None:
-            continue
-        e = spans.setdefault(o, {"kept": 0, "first_abs_ms": d["abs_ms"],
-                                 "last_abs_ms": d["abs_ms"]})
-        e["kept"] += 1
-        e["last_abs_ms"] = d["abs_ms"]
 
     emotes: dict[str, dict] = {}
     badges: dict[str, dict] = {}
@@ -1516,12 +1517,16 @@ def merge(paths: list[str], ref="youtube", zeros: Optional[dict] = None,
                          "format": c.fmt, "messages": len(c.messages),
                          "zero_ms": c.zero_ms, "zero_source": c.zero_src,
                          "skipped_lines": c.skipped,
-                         #  `**spans.get(...)` rather than three explicit keys:
-                         #  a source that contributed nothing to the file gets
-                         #  none of them, which says the question was not
-                         #  answerable rather than that the answer was zero.
-                         **spans.get(c.platform, {})}
-                        for p, c in zip(paths, convs)],
+                         #  `messages` above is the converter's own count,
+                         #  taken before the merge, so it includes what was
+                         #  deduped away and what had no absolute time to be
+                         #  placed by. `kept` and the span beside it are this
+                         #  file's share of the merge. Entry #775 had YouTube
+                         #  covering 1:02 of a 5:50 broadcast and Twitch
+                         #  covering all of it, and the archive could only say
+                         #  "folded into the merged file" about both.
+                         **got}
+                        for p, c, got in zip(paths, convs, mine)],
             "emotes": emotes,
             "badges": badges,
             "gifts": gifts,
