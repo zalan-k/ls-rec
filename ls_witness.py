@@ -445,8 +445,40 @@ NONE = "none"
 #  different question, and conflating them is what put the warning there.
 CLOCK_SLOP_S = 10
 
+#  AND THE SAME ARGUMENT, ONE SIZE UP, FOR A CHAT FILE'S ZERO.
+#
+#  `CLOCK_SLOP_S` was set from entry #716, where the gap between the cache and
+#  the chat was three seconds, and ten looked like generous room around it. It
+#  is not: the gap is not jitter between two readings of one instant, it is the
+#  distance between two different instants, and nothing bounds that at three
+#  seconds.
+#
+#  A chat zero is anchored to the media timeline — `timestampUsec` minus
+#  `videoOffsetTimeMsec`, so t=0 of the video — and the platform's broadcast
+#  start is when its ingest went live. Those are the same event only if the
+#  first published fragment begins at the instant of going live, and it does
+#  not: YouTube publishes the first fragment when it has one, and
+#  `--live-from-start` reconstructs from there.
+#
+#  Entry 2026-10-16 is the measurement: recorder and cache both 11:02:08 — one
+#  witness spelled twice, off the live probe — and the chat 11:02:43. Thirty-
+#  five seconds, in the direction the anchor predicts, reported as a warning
+#  on essentially every entry in the archive.
+#
+#  Two minutes, chosen as a ceiling on that anchor rather than tuned to the one
+#  observation: `_TRUNCATION_FLOOR_S` already states this archive's view that
+#  under five minutes is not a start worth a person's time, and anything that
+#  is — a capture that joined late, a mismatched stream — clears two minutes
+#  by a wide margin. It governs this pair and nothing else; every other pair
+#  keeps the ten-second floor.
+TIMELINE_SLOP_S = 120
 
-def tolerance_s(witnesses: list[dict]) -> int:
+#  The sources whose answer to a clock question is a media timeline and not the
+#  event the question asks about.
+_TIMELINE_ANCHORED = ("chat:absolute",)
+
+
+def tolerance_s(claim: str, witnesses: list[dict]) -> int:
     """How far apart two measurements may be and still be the same one.
 
     The COARSEST witness sets it, over a floor. Two sources one minute apart
@@ -455,9 +487,21 @@ def tolerance_s(witnesses: list[dict]) -> int:
     numbers, and the difference is what they were able to measure, which is
     exactly what `precision_s` is for.
 
-    The floor is what `precision_s` cannot express: see `CLOCK_SLOP_S`.
+    The floor is what `precision_s` cannot express: see `CLOCK_SLOP_S`, and
+    `TIMELINE_SLOP_S` for the pair that needs more of it.
+
+    THE FLOOR AND NOT THE PRECISION, deliberately. A chat zero is stated to
+    the millisecond and `precision_s` is the right answer to "how finely can
+    this source state a number" — coarsening it there would be a lie about the
+    reading, and would also make every back-catalogue entry whose only witness
+    is its chat file report that its broadcast start is "only known to the
+    minute". What is uncertain is not the number, it is which event it names.
     """
-    return max([w["precision_s"] for w in witnesses] + [CLOCK_SLOP_S])
+    floor = (TIMELINE_SLOP_S
+             if claim in (BROADCAST_START, RECORD_START)
+             and any(w["source"] in _TIMELINE_ANCHORED for w in witnesses)
+             else CLOCK_SLOP_S)
+    return max([w["precision_s"] for w in witnesses] + [floor])
 
 
 def settle(claim: str, witnesses: list[dict]) -> dict:
@@ -516,7 +560,7 @@ def settle(claim: str, witnesses: list[dict]) -> dict:
         scale = 1000 if claim in (BROADCAST_START, RECORD_START) else 1
         vals = [w["value"] / scale for w in vouching]
         spread = int(round(max(vals) - min(vals)))
-        agreement = AGREE if spread <= tolerance_s(vouching) else DISAGREE
+        agreement = AGREE if spread <= tolerance_s(claim, vouching) else DISAGREE
 
     return {"claim": claim, "value": best["value"], "source": best["source"],
             "precision_s": best["precision_s"], "agreement": agreement,

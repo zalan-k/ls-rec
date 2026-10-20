@@ -3848,6 +3848,21 @@ _CLAIM_SAYS = {
     ls_witness.BROADCAST_DURATION: "the broadcast's length",
 }
 
+#  THE COMPACT LABEL, SPELLED OUT RATHER THAN SLICED OFF THE SENTENCE.
+#
+#  It was `said.split()[-1]`, which collapses four claims into two words: both
+#  starts came out "start disputed" and both lengths "length disputed". So the
+#  one-line form of the finding — which is the form a person scanning a sweep
+#  reads — could not say whether the broadcast start or the recording start was
+#  in dispute, and `_length_findings` was independently emitting its own
+#  "length disputed" for a third thing.
+_CLAIM_SHORT = {
+    ls_witness.BROADCAST_START: "broadcast start",
+    ls_witness.RECORD_START: "record start",
+    ls_witness.FILE_DURATION: "file length",
+    ls_witness.BROADCAST_DURATION: "broadcast length",
+}
+
 #  Below this, a file shorter than the broadcast is the ordinary tail — a
 #  capture joined late or stopped at the end card. Above it, something was
 #  truncated and that is worth a person's time. Five minutes is a guess made
@@ -3907,7 +3922,8 @@ def _witness_findings(timings: dict) -> list[dict]:
                     "warn", "assignment",
                     f"{label}: witnesses disagree about {said} by "
                     f"{_seconds_to_hhmmss(s.get('spread_s') or 0)} — {who}",
-                    platform=prefix, short=f"{said.split()[-1]} disputed",
+                    platform=prefix,
+                    short=f"{_CLAIM_SHORT.get(claim, claim)} disputed",
                     claim=claim, spread_s=s.get("spread_s")))
             elif (claim == ls_witness.BROADCAST_START
                   and s.get("agreement") == ls_witness.SINGLE
@@ -3925,7 +3941,8 @@ def _witness_findings(timings: dict) -> list[dict]:
                     "note", "assignment",
                     f"{label}: {said} is only known to the minute, from "
                     f"{(s.get('best') or {}).get('label') or s.get('source')}",
-                    platform=prefix, short=f"{said.split()[-1]} to the minute",
+                    platform=prefix,
+                    short=f"{_CLAIM_SHORT.get(claim, claim)} to the minute",
                     claim=claim))
 
         #  Nobody could say when it began. On Twitch that number cannot be
