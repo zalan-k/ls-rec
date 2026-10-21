@@ -926,15 +926,21 @@ def _x_token(twid: str) -> str:
     return "".join(out).replace("0", "")
 
 
-def _x_status(twid: str, timeout: int = 20) -> dict | None:
+def _x_status(twid: str, timeout: int = 20, tries: int = 2) -> dict | None:
     """The post as the embed endpoint sees it, or None if it would not say.
 
     Twice, with a different token the second time. That is the documented
     workaround for the endpoint going quiet -- it is intermittent rather than
     broken -- and it doubles as the safety net under `_x_token` not matching
     JavaScript to the last digit.
+
+    `tries` exists because the two callers want different things. Getting the
+    PICTURES is the job: without them the fetch has failed, so it is worth
+    asking twice and waiting. Reading the post's HASHTAGS happens when the
+    file is already on disk and is a bonus -- forty seconds of retries for a
+    bonus is forty seconds the next job waits.
     """
-    for token in (_x_token(twid), f"{random.getrandbits(48):x}"):
+    for token in (_x_token(twid), f"{random.getrandbits(48):x}")[:max(1, tries)]:
         url = "https://cdn.syndication.twimg.com/tweet-result?" + urllib.parse.urlencode(
             {"id": twid, "token": token, "lang": "en"})
         #  Googlebot because that is what the endpoint answers most freely to,
@@ -973,17 +979,52 @@ def _x_orig(media_url: str) -> str | None:
     return urllib.parse.urlunparse(u._replace(query=urllib.parse.urlencode(q, doseq=True)))
 
 
-def x_pictures(url: str) -> tuple[list[str], str | None]:
-    """Every picture on a post, biggest size — or a sentence saying why not.
+def x_post(url: str, *, timeout: int = 20, tries: int = 2) -> dict | None:
+    """The post behind a link, fetched once, or None if it is not one.
+
+    One fetch and several readers. The pictures and the hashtags are two keys
+    of the same few KB of JSON, and the first version of the hashtag side asked
+    for the document a second time -- two requests to the same endpoint, in the
+    same job, for the same post.
+    """
+    twid = x_post_id(url)
+    return _x_status(twid, timeout=timeout, tries=tries) if twid else None
+
+
+def x_hashtags(doc: dict | None) -> list[str]:
+    """The hashtags the post carries, in the order it carries them.
+
+    From `entities`, which is the post's own index of them, rather than from a
+    regex over the text: the endpoint has already decided where a hashtag
+    starts and ends, and the archive is about to look each one up in a table an
+    editor wrote. Guessing differently here would mean guessing differently
+    from X.
+
+    REMOTE DATA, and nothing downstream forgets it. Anybody can put any word in
+    a post. What nobody outside this archive can do is decide what a word
+    MEANS here -- an unmapped hashtag attaches nothing, the rule never mints,
+    and the row it lands on is waiting for review either way. Capped and
+    bounded all the same, because this is somebody else's text.
+    """
+    out: list[str] = []
+    for h in ((doc or {}).get("entities") or {}).get("hashtags") or []:
+        if not isinstance(h, dict):
+            continue
+        text = str(h.get("text") or "").strip().lstrip("#")
+        if text and len(text) <= 100 and text.lower() not in (x.lower() for x in out):
+            out.append(text)
+        if len(out) >= 60:
+            break
+    return out
+
+
+def x_pictures_in(doc: dict | None, url: str) -> tuple[list[str], str | None]:
+    """Every picture on a post already in hand, biggest size -- or why not.
 
     `([], None)` is "no answer", not "no pictures", and the difference is the
     point: the caller keeps yt-dlp's own words for the failure rather than
     replacing a real diagnosis with this one's silence.
     """
-    twid = x_post_id(url)
-    if not twid:
-        return [], None
-    doc = _x_status(twid)
     if not doc:
         return [], None
     pics = []
@@ -1007,6 +1048,12 @@ def x_pictures(url: str) -> tuple[list[str], str | None]:
         return [], (f"that post has {len(pics)} pictures on it — open the one "
                     f"you want and paste that link instead (it ends /photo/2)")
     return pics, None
+
+
+def x_pictures(url: str) -> tuple[list[str], str | None]:
+    """The pictures on a post, fetching it first. One call, for callers that
+    want nothing else out of the document."""
+    return x_pictures_in(x_post(url), url)
 
 
 def probe_duration(config: dict, url: str) -> float | None:
@@ -1104,7 +1151,13 @@ def _scraps(q: str, job_id: str) -> None:
 
 
 def do_fetch(config: dict, job: dict):
-    """A url into quarantine. Returns (status, result_path, error)."""
+    """A url into quarantine. Returns (status, result_path, error, findings).
+
+    The findings are the post's own words, when it had any: the archive matches
+    them against a table an editor wrote and tags the row accordingly. Facts
+    and not a verdict -- this worker does not know what `#artcoholic` means and
+    should not.
+    """
     url = str(job.get("url") or "").strip()
     snip = str(job.get("snippet_id") or "").strip()
     q = quarantine_dir(config)
@@ -1129,6 +1182,10 @@ def do_fetch(config: dict, job: dict):
     timeout = int(setting(config, "archive_fetch_timeout_s"))
     stem = os.path.join(q, f"{PART}{job['id']}")
     _scraps(q, job["id"])
+
+    #  The post, if this is one, fetched at most once however many readers it
+    #  has. See `x_post`.
+    xdoc = None
 
     try:
         if host in DIRECT_HOSTS:
@@ -1170,7 +1227,9 @@ def do_fetch(config: dict, job: dict):
                 #  post has PICTURES on it as that anything went wrong. That is
                 #  a question yt-dlp cannot answer -- it has no image support
                 #  at all -- and the embed endpoint can.
-                pic, why = x_pictures(url) if _is_x(host) else ([], None)
+                if _is_x(host):
+                    xdoc = x_post(url)
+                pic, why = x_pictures_in(xdoc, url) if xdoc else ([], None)
                 if why:
                     return ("failed", None, why)
                 if not pic:
@@ -1191,6 +1250,12 @@ def do_fetch(config: dict, job: dict):
                         os.remove(extra)
                     except OSError:
                         pass
+                #  The video arrived, so nothing here needs the embed endpoint
+                #  -- except the post's words, which are a bonus on a job that
+                #  has already succeeded. One try and a short timeout: the
+                #  next job should not wait on a nicety.
+                if _is_x(host):
+                    xdoc = x_post(url, timeout=8, tries=1)
 
         ext = os.path.splitext(tmp)[1].lower()
         if ext not in KEEP_EXT:
@@ -1216,9 +1281,14 @@ def do_fetch(config: dict, job: dict):
         if not dest:
             return ("failed", None, "could not name the file safely")
         os.replace(tmp, dest)
+        tags = x_hashtags(xdoc)
         logger.info(f"fetch {host}: {final}, {_mb(got)}"
-                    + (f", {_mmss(secs)}" if secs else ""))
-        return ("done", final, None)
+                    + (f", {_mmss(secs)}" if secs else "")
+                    + (f", {len(tags)} hashtags" if tags else ""))
+        #  Four only when there is something to say. `handle` answers in three
+        #  and the loop pads it, so a post with no hashtags on it reports
+        #  exactly what it did before.
+        return ("done", final, None, {"hashtags": tags}) if tags else ("done", final, None)
 
     except subprocess.TimeoutExpired:
         return ("failed", None, f"it was still going after {timeout // 60} minutes")
