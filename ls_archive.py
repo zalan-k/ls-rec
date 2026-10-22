@@ -390,7 +390,9 @@ def flush_pending_ids(config: dict) -> int:
 def post_start(config: dict, *, platform: str, video_id: str, title: str,
                url: str, obsidian_index: int | None,
                broadcast_started_at: int | None,
-               record_started_at: int) -> dict | None:
+               record_started_at: int,
+               frame_zero_at: int | None = None,
+               frame_zero_precision_s: int | None = None) -> dict | None:
     """A recording has begun. Creates the stream, or joins the one the other
     platform already made.
 
@@ -398,6 +400,17 @@ def post_start(config: dict, *, platform: str, video_id: str, title: str,
     the record start. They differ by however long the probe took to notice, and
     the archive would rather hold NULL — meaning "nobody measured this" — than a
     number that looks measured.
+
+    THREE CLOCKS, and the third one is new. `record_started_at` is when this
+    process began pulling bytes. `frame_zero_at` is the wall time of media t=0
+    in the file it is writing, which under --live-from-start is the broadcast
+    start and nowhere near the record start. The archive's `local_start_wall`
+    is defined as frame zero and was being filled from the record start -- so
+    every from-start capture's local clock was the poll interval late, and
+    every seek computed from it landed that far early.
+
+    Both are sent. The archive prefers frame zero and falls back to the record
+    start, so a recorder that has not been updated keeps working as it did.
     """
     body = {
         "platform": PLATFORM.get(platform, platform.upper()[:2]),
@@ -407,6 +420,10 @@ def post_start(config: dict, *, platform: str, video_id: str, title: str,
         "record_started_at": int(record_started_at),
         "tz_offset_min": _tz_offset_min(),
     }
+    if frame_zero_at:
+        body["frame_zero_at"] = int(frame_zero_at)
+    if frame_zero_precision_s:
+        body["frame_zero_precision_s"] = int(frame_zero_precision_s)
     if obsidian_index:
         body["index"] = int(obsidian_index)
     if broadcast_started_at:
@@ -620,6 +637,10 @@ _CAP_COLUMN = {
     "video_path": "video_path", "chat_path": "chat_path",
     "duration_s": "file_duration_s",
     "broadcast_started_at": "remote_start_wall",
+    #  `local_start_wall` is FRAME ZERO at the archive. The packet sends frame
+    #  zero under its own name and the archive prefers it; this map is the
+    #  AUDIT's reconciliation and keeps one key per column, or a `cap` holding
+    #  both names would plan two changes to one column.
     "record_started_at": "local_start_wall",
     # Why there is no local copy. In the plan like everything else, so the
     # first run that carries a vault `.×` across shows it as a change a person

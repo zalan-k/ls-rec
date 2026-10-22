@@ -347,6 +347,12 @@ def scan_nas(config: dict, index: int) -> dict:
             reverse=True)
         found[f"{prefix}_chats"] = chats
         found[f"{prefix}_chat"] = chats[0] if chats else None
+        #  The archived list is appended in glob order, which is whatever the
+        #  filesystem felt like. Two callers take [0] from it -- the read-back
+        #  and the platform line -- so an arbitrary order means the two can
+        #  name different files for the same entry on the same run. Sorted by
+        #  name rather than by size: these are not on this machine to stat.
+        found[f"{prefix}_chats_archived"].sort()
         if len(chats) > 1:
             print(f"    {len(chats)} {prefix} chat captures; all will be merged")
 
@@ -703,20 +709,90 @@ def _quality(t, claim):
 #  measurement and has nothing to be stale about.
 _FIELD_CLAIM = {
     "remote_start_wall": ls_witness.BROADCAST_START,
+    #  `local_start_wall` is FRAME ZERO, and which claim that corroborates
+    #  depends on the capture: the broadcast start under --live-from-start,
+    #  where the file opens at the beginning of the stream, and the record
+    #  start otherwise. `_field_claim` below answers it per capture; this entry
+    #  is the live-edge case and the fallback when nothing says.
     "local_start_wall": ls_witness.RECORD_START,
     "local_start_precision_s": ls_witness.RECORD_START,
     "file_duration_s": ls_witness.FILE_DURATION,
 }
 
 
+def _local_zero(t: dict | None) -> dict | None:
+    """What `local_start_wall` is a reading of, for one capture.
+
+    THE COLUMN IS FRAME ZERO -- "the wall time of frame 0 of OUR file". Three
+    ways to know it, in order of how much they are worth:
+
+      stated       the recorder reported `frame_zero_epoch_ms`. It knows: it
+                   chose the yt-dlp mode and watched the file open.
+      reconstructed  a from-start capture whose sidecar predates that field.
+                   The file opens at the beginning of the broadcast, so the
+                   broadcast start IS frame zero. This is the road by which an
+                   entry recorded before the fix gets corrected: the audit
+                   proposes it, and the archive's own read-diff-prompt puts it
+                   in front of somebody as before -> after.
+      the record start  a live-edge capture, where the file opens when we
+                   started pulling and the two are the same number. Also the
+                   only answer for a from-start capture whose broadcast start
+                   nobody ever measured -- in which case it is WRONG by the
+                   poll interval and there is nothing here that can fix it.
+
+    AND THE CLAIM MOVES WITH THE VALUE, which is the part worth being careful
+    about. Frame zero on a from-start pull is evidence about the broadcast
+    start; on a live-edge pull it is evidence about the record start. Filing
+    one under the other invents a disagreement between readings of two
+    different things, which is the shape of the "start disputed" noise
+    `read_chat_zero` already had to be taught to avoid.
+    """
+    if not t:
+        return None
+    from_start = bool(t.get("from_start"))
+    if t.get("frame_zero_epoch_ms"):
+        return {"ms": t["frame_zero_epoch_ms"],
+                "precision_s": t.get("frame_zero_precision_s") or 1,
+                "claim": (ls_witness.BROADCAST_START if from_start
+                          else ls_witness.RECORD_START),
+                "how": t.get("record_start_source") or "measured here"}
+    if from_start and t.get("stream_start_epoch_ms"):
+        return {"ms": t["stream_start_epoch_ms"],
+                #  Five, not one: this rests on the live probe's broadcast
+                #  start AND on yt-dlp opening at the first fragment it can
+                #  still fetch rather than at the mathematical start.
+                "precision_s": 5,
+                "claim": ls_witness.BROADCAST_START,
+                "how": "the file opens at the broadcast start"}
+    if t.get("record_start_epoch_ms"):
+        return {"ms": t["record_start_epoch_ms"],
+                "precision_s": 60 if t.get("record_start_accuracy") == "minute" else 1,
+                "claim": ls_witness.RECORD_START,
+                "how": t.get("record_start_source") or "measured here"}
+    return None
+
+
+def _field_claim(field, timings=None):
+    """Which claim a capture field is a reading of, for THIS capture.
+
+    Only one field's answer moves, for the reason `_local_zero` explains.
+    """
+    if field in ("local_start_wall", "local_start_precision_s"):
+        got = _local_zero(timings)
+        if got:
+            return got["claim"]
+    return _FIELD_CLAIM.get(field)
+
+
 def _stale_quality(t, field):
     """What the last live reading of this field said, when nothing can read it
     now. None when there is no settlement behind the field, or when the
     settlement is live and simply produced nothing this run."""
-    q = _quality(t, _FIELD_CLAIM.get(field)) if _FIELD_CLAIM.get(field) else None
+    claim = _field_claim(field, t)
+    q = _quality(t, claim) if claim else None
     if not q or not q.get("stale"):
         return None
-    st = ((t or {}).get("settled") or {}).get(_FIELD_CLAIM[field]) or {}
+    st = ((t or {}).get("settled") or {}).get(claim) or {}
     return {**q, "was": st.get("value"), "was_source": (st.get("best") or {}).get("label")}
 
 
@@ -793,6 +869,22 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
     if nas.get(f"{prefix}_chat"):
         saw("chat_path", ls_archive.archive_path(config, nas[f"{prefix}_chat"]),
             "the file on the NAS")
+    elif nas.get(f"{prefix}_chats_archived"):
+        #  THE RAW MOVED AND NOBODY TOLD THE ARCHIVE.
+        #
+        #  This branch did not exist, and the one above only fires while the
+        #  raw is still where it was recorded. The merge moves it to deep
+        #  storage -- after which `{prefix}_chat` is empty, no `chat_path`
+        #  witness was sent at all, and the archive went on holding the path
+        #  the file had before the merge. Forever: nothing else ever looks.
+        #
+        #  The visible cost is that the archive searches `raws/` for a file
+        #  that is under `raws/deep-storage/`, reads it as missing, and offers
+        #  no delete for a file that is sitting right there.
+        saw("chat_path",
+            ls_archive.archive_path(
+                config, archived_rel(config, nas[f"{prefix}_chats_archived"][0])),
+            "the raw, moved to deep storage when the merge landed")
 
     #  `kept` ONLY, and never `declined`.
     #
@@ -818,13 +910,30 @@ def _cap_evidence(config, cache, nas, prefix, platform, timings):
         saw("remote_start_wall", t["stream_start_epoch_ms"] // 1000,
             t.get("stream_start_source") or "measured here",
             ls_witness.BROADCAST_START)
-    if t.get("record_start_epoch_ms"):
-        saw("local_start_wall", t["record_start_epoch_ms"] // 1000,
-            t.get("record_start_source") or "measured here",
-            ls_witness.RECORD_START)
-        saw("local_start_precision_s",
-            60 if t.get("record_start_accuracy") == "minute" else 1,
-            "how precisely the recording start could be read")
+    #  ── FRAME ZERO, which is what `local_start_wall` is a reading of ──────
+    #
+    #  "The wall time of frame 0 of OUR file", per the column's own comment.
+    #  Under --live-from-start the file opens at the BROADCAST start, so frame
+    #  zero is that and not the moment the recorder spawned yt-dlp -- and this
+    #  proposed the spawn time, which on a YouTube capture is up to a ten
+    #  minute poll interval late. Every seek computed from it landed that far
+    #  early.
+    #
+    #  WHICH CLAIM IT CORROBORATES MOVES WITH IT. A from-start capture's frame
+    #  zero is evidence about the broadcast start; a live-edge capture's is
+    #  evidence about when we started recording. Filing it under the wrong one
+    #  would invent a disagreement between two readings of different things --
+    #  which is the shape of the "start disputed" noise `read_chat_zero`
+    #  already had to be taught to avoid.
+    #
+    #  `from_start` comes off the sidecar. A sidecar written before it existed
+    #  says nothing, and the platform is the honest fallback: every YouTube
+    #  capture this recorder makes is from-start, and no Twitch capture is.
+    zero = _local_zero(t)
+    if zero:
+        saw("local_start_wall", zero["ms"] // 1000, zero["how"], zero["claim"])
+        saw("local_start_precision_s", zero["precision_s"],
+            "how precisely the file's own zero could be read")
     #  Fresh only. A stale `file_duration` is a measurement of a file that is
     #  no longer on the NAS, and proposing one would be this machine telling
     #  the archive to adopt a number it cannot check -- about a copy somebody
@@ -1010,9 +1119,20 @@ def _chat_link_target(nas: dict, prefix: str) -> str | None:
     if nas.get(f"{prefix}_chat"):
         return nas[f"{prefix}_chat"]
     if nas.get(f"{prefix}_chats_archived"):
-        return nas.get("merged_chat") or os.path.join(
-            "deep-storage", nas[f"{prefix}_chats_archived"][0])
+        return nas.get("merged_chat") or archived_rel(
+            config, nas[f"{prefix}_chats_archived"][0])
     return None
+
+
+def archived_rel(config: dict, filename: str) -> str:
+    """Where a raw chat sits once the merge has moved it, relative to nas_path.
+
+    `chat_archive_path` is configurable and was hardcoded as "deep-storage" in
+    one of the two places that build this. They agreed until somebody changed
+    the setting, which is the kind of agreement that is not one.
+    """
+    return os.path.join(config.get("chat_archive_path") or "deep-storage",
+                        filename)
 
 
 def _build_platform_line(config: dict, tag: str, video_id: str | None,
@@ -1725,6 +1845,7 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
     #  The recorder's own sidecar, when one exists. Nothing has one yet — C1
     #  ships the writer and the back catalogue will never have them — so this
     #  is the witness that starts absent and gets denser over months.
+    side = None
     if video_file or chat_file:
         side = ls_common.read_meta(os.path.join(
             nas_root, ls_common.meta_name(
@@ -1822,6 +1943,19 @@ def _platform_timings(config: dict, cache: list[dict], nas: dict,
         "record_start_iso": _iso(record_ms),
         "record_start_source": record_src,
         "record_start_accuracy": acc(record_src),
+        #  WHICH END OF THE BROADCAST THIS FILE OPENS AT, decided once, here,
+        #  so nothing downstream guesses from the platform. The recorder states
+        #  it in its own sidecar; for one written before that field existed the
+        #  platform is the honest answer -- every YouTube capture this recorder
+        #  makes is --live-from-start and no Twitch one is.
+        "from_start": bool((side or {}).get("from_start")
+                           if (side or {}).get("from_start") is not None
+                           else platform == "youtube"),
+        #  Straight off the recorder's sidecar when it is there. Frame zero is
+        #  not a witness in its own right -- it is the same instant as one of
+        #  the two starts above, and `_local_zero` is where that is resolved.
+        "frame_zero_epoch_ms": (side or {}).get("frame_zero_epoch_ms"),
+        "frame_zero_precision_s": (side or {}).get("frame_zero_precision_s"),
         "duration_secs": duration,
         # `ffprobe` means the file on disk; `cache` means the platform's own
         # number for the broadcast. See the note above the assignment.

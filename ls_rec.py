@@ -68,6 +68,48 @@ RESTART_DELAY_S      = 15     # backoff between restart attempts
 # rather than either trusted or refused: a stream nobody can probe rotates a
 # couple of times and then completes.
 CHAT_IDLE_CAP        = 2      # empty chat segments before chat gives up
+
+
+def read_truncation(log_path: str, tail_bytes: int = 4 << 20) -> str | None:
+    """Why this part's download is short, "" if nothing says it is, None if unknown.
+
+    YT-DLP FINISHING IS NOT YT-DLP FINISHING THE JOB. When a live manifest
+    expires and cannot be renewed, it stops fetching fragments, reports
+    `Download completed`, merges what it has and exits 0. What it leaves is a
+    correct, playable, SHORT recording, and neither the exit code nor the file
+    says so.
+
+    Entry #775 is what that costs. The broadcast ended under the recorder an
+    hour in; every later restart met a finished `part01.mp4`, said `has
+    already been downloaded` and exited 0; and the truncation was first
+    noticed the next day, by an audit inferring it from a length dispute
+    against the Twitch capture. yt-dlp had said it plainly at the time, in the
+    log, and nobody read the log.
+
+    None is not False. A log that cannot be read has not been asked, and
+    filing that as "not truncated" is the same class of mistake as the one
+    above — a silence reported as an answer.
+    """
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()        # drop the partial line the seek landed in
+            text = f.read()
+    except OSError:
+        return None
+    #  The warning alone appears on transient refreshes that then succeed, so
+    #  it proves nothing by itself; `Giving up after` is what says this one
+    #  did not come back.
+    if ("Cannot find refreshed url for format" in text
+            and "Giving up after" in text):
+        return "yt-dlp could not renew the live manifest and finalised what it had"
+    if "Did not get any data blocks" in text:
+        return "yt-dlp got no data blocks from a fragment stream"
+    if "fragment not found; Skipping fragment" in text:
+        return "yt-dlp skipped fragments it could not fetch"
+    return ""
 BLIND_ROUNDS_LOUD    = 2      # inconclusive rounds before saying so once, loudly
 ASSUMED_ROTATE_MAX   = 2      # rotations allowed while liveness is only ASSUMED
 PARTNER_END_WINDOW_S = 900    # how long a sibling's clean end stays evidence
@@ -991,6 +1033,31 @@ class LivestreamRecorder:
         record_start = datetime.datetime.now()
         stream_start = info.get("stream_start_epoch")
 
+        #  ── FRAME ZERO, which is not the record start ─────────────────────
+        #
+        #  The wall time of media t=0 in the file about to be written. Under
+        #  --live-from-start -- which is every YouTube capture -- yt-dlp
+        #  rebuilds the stream from its beginning, so the file OPENS at the
+        #  broadcast start and frame zero is `stream_start`, not now. On Twitch
+        #  the file opens at the live edge and the two are the same number.
+        #
+        #  THIS IS THE BUG THIS EXISTS FOR. The archive's `local_start_wall` is
+        #  defined as "wall time of frame 0 of OUR file", and the start packet
+        #  was filling it with the moment yt-dlp was spawned. YouTube is polled
+        #  every ten minutes, so on a from-start capture that number was up to
+        #  ten minutes LATE -- and the theater, which seeks by
+        #  (note - local_start_wall), therefore landed that far EARLY. On a
+        #  real entry it was 9m29s out.
+        #
+        #  `_note_part_start` has computed this correctly for the clip timebase
+        #  all along. It simply was never the number that got reported.
+        #  `ls_common.frame_zero` is the one rule, shared with the clip
+        #  timebase in `_note_part_start` — which had it right all along while
+        #  this packet did not.
+        from_start = (platform == "youtube")
+        frame_zero, frame_zero_precision = ls_common.frame_zero(
+            from_start, stream_start, record_start.timestamp())
+
         cache = ls_common.load_cache()
         channel = (self.config["youtube_handle"] if platform == "youtube"
                 else self.config["twitch_user"])
@@ -1039,6 +1106,8 @@ class LivestreamRecorder:
                 obsidian_index=obsidian_index,
                 broadcast_started_at=stream_start,
                 record_started_at=int(record_start.timestamp()),
+                frame_zero_at=int(frame_zero),
+                frame_zero_precision_s=frame_zero_precision,
             )
         except Exception as e:
             logger.warning(f"archive start packet failed: {e}")
@@ -1081,6 +1150,11 @@ class LivestreamRecorder:
             # can be a full check_interval late, YouTube from-start is ~0.
             "_record_start_epoch": record_start.timestamp(),
             "_stream_start_epoch": float(stream_start) if stream_start else None,
+            #  Kept beside them because the sidecar reports it and the audit
+            #  reads it: the wall time of media t=0, which is the broadcast
+            #  start under --live-from-start and the spawn time otherwise.
+            "_frame_zero_epoch": frame_zero,
+            "_frame_zero_precision_s": frame_zero_precision,
             "_part_history":       [],
         }
         self._record_video(stream_key)
@@ -1350,6 +1424,22 @@ class LivestreamRecorder:
         return (platform != stream.get("platform")
                 and (time.time() - when) <= PARTNER_END_WINDOW_S)
 
+    def _part_merged(self, title: str, part_num: int) -> bool:
+        """Is this part's FINISHED video already on disk?
+
+        yt-dlp merges `partNN.f137.mp4` + `partNN.f140.mp4` into `partNN.mp4`
+        and deletes the inputs. From that moment a re-invocation against the
+        same output template can only say `has already been downloaded`.
+
+        The per-format files are deliberately NOT this. While they exist the
+        download still has `.ytdl` state to resume from, which is exactly the
+        case the from-start part pinning exists to serve — so testing for the
+        merged file and nothing else is what keeps the two apart.
+        """
+        base = os.path.join(self.config.get("output") or "",
+                            f"{title}.part{part_num:02d}")
+        return any(os.path.exists(base + ext) for ext in ls_common.VIDEO_EXTS)
+
     def _video_monitor(self, stream_key, process, log_fh, title, part_num):
         """Wait for yt-dlp exit, then classify: superseded / natural-end / failure."""
         process.wait()
@@ -1362,6 +1452,23 @@ class LivestreamRecorder:
         stream = self.active_streams.get(stream_key)
         if stream is None:
             return
+
+        #  Read BEFORE any branch below returns. A superseded or manually
+        #  stopped part still wrote a log, and what that log says about
+        #  truncation is true whatever this monitor decides to do next.
+        #  Sticky and first-wins: one short part makes the capture short, and
+        #  a later clean part does not un-say it.
+        why = read_truncation(os.path.join(
+            self.config.get("output") or "", f"{title}.part{part_num:02d}.log"))
+        if why:
+            if not stream.get("_truncated_why"):
+                stream["_truncated_why"] = why
+                logger.warning(
+                    f"Part {part_num:02d} is SHORT at source — {why}: {title}")
+        elif why == "" and "_truncated_why" not in stream:
+            #  Asked and answered clean. Distinct from never asked, which
+            #  leaves the key absent so the sidecar can say "unknown".
+            stream["_truncated_why"] = ""
 
         # Stale-monitor guard: a newer process already supersedes this one.
         if stream.get("video_process") is not process:
@@ -1394,6 +1501,28 @@ class LivestreamRecorder:
             if live:
                 elapsed = time.time() - stream.get("_part_started_ts", 0)
                 if elapsed < 30:
+                    #  PERMANENT, not pathological. A from-start part whose
+                    #  merged file is already on disk cannot be resumed: yt-dlp
+                    #  answers `has already been downloaded` and exits 0 in
+                    #  under a second, every time, for ever. Backing off and
+                    #  retrying ten times is two and a half minutes spent
+                    #  rediscovering that, and #775 spent them while the
+                    #  broadcast ran on for another three and a half hours.
+                    #
+                    #  Completing is not giving up on the stream. `_check_
+                    #  platforms` keys on `{platform}_{video_id}`, so if she
+                    #  comes back under a NEW broadcast id it is a new
+                    #  stream_key, absent from active_streams and
+                    #  recorded_keys, and starts normally as the other half of
+                    #  the same entry. Holding this one open cannot catch that
+                    #  and stops nothing else.
+                    if stream["_from_start"] and self._part_merged(title, part_num):
+                        logger.error(
+                            f"Part {part_num:02d} rc=0 instantly and its merged "
+                            f"file is already on disk — a restart cannot add "
+                            f"to it. Completing: {title}")
+                        self._handle_completion(stream_key)
+                        return
                     # Pathological: rc=0 within seconds while still live = the
                     # 642 "already downloaded" loop. Charge the budget and back
                     # off so it can't spin; give up after RESTART_MAX.
@@ -1834,12 +1963,32 @@ class LivestreamRecorder:
             "record_start_epoch_ms": int(record_ms * 1000) if record_ms else None,
             "record_start_source": "recorder" if record_ms else None,
             "record_start_accuracy": "exact" if record_ms else None,
+            #  FRAME ZERO, which the archive's `local_start_wall` is a reading
+            #  of. Reported alongside the record start rather than instead of
+            #  it: they are the same number on Twitch and up to ten minutes
+            #  apart on a from-start YouTube pull, and the audit needs to know
+            #  which it is holding. `from_start` says which axis frame zero is
+            #  ON -- the broadcast start, or the moment we began pulling.
+            "frame_zero_epoch_ms": (int(stream.get("_frame_zero_epoch") * 1000)
+                                    if stream.get("_frame_zero_epoch") else None),
+            "frame_zero_precision_s": stream.get("_frame_zero_precision_s"),
+            "from_start": bool(stream.get("_from_start")),
             "duration_secs": duration,
             # The file's length as this recorder measured it on the way out,
             # which is a different fact from the platform's number for the
             # broadcast. Labelled, because one unlabelled duration is how those
             # two came to be compared as though they were one measurement.
             "duration_source": "recorder" if duration else None,
+            #  SHORT, AND KNOWN TO BE SHORT. Without this the only evidence
+            #  a capture was truncated is its length disagreeing with another
+            #  recording of the same broadcast — which is an inference, is not
+            #  available at all when there is no second recording, and cannot
+            #  tell "this file is short" from "the other file is wrong".
+            #  `read_truncation` has yt-dlp's own words for it. None means the
+            #  log could not be read: not asked, which is not the same as no.
+            "capture_truncated": (None if stream.get("_truncated_why") is None
+                                  else bool(stream["_truncated_why"])),
+            "capture_truncated_why": stream.get("_truncated_why") or None,
             "have_video": bool(have_video),
             "have_chat": bool(have_chat),
             "files": {"video": f"{title}.mp4" if have_video else None,
@@ -1870,8 +2019,10 @@ class LivestreamRecorder:
             "num":        part_num,
             "started_ts": now,
             "from_start": from_start,
-            "zero_epoch": (stream.get("_stream_start_epoch") or now)
-                          if from_start else now,
+            #  The same rule the start packet uses, so the clip timebase and
+            #  the archive's `local_start_wall` cannot drift apart again.
+            "zero_epoch": ls_common.frame_zero(
+                from_start, stream.get("_stream_start_epoch"), now)[0],
         }
         last = hist[-1] if hist else None
         if last and last["num"] == part_num and last["from_start"] == from_start:

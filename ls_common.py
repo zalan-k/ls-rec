@@ -587,6 +587,37 @@ def is_broadcast_row(v: dict) -> bool:
 # as a capture of the same video, on the same entry, by the same rules. It also
 # says on the face of the file that its moderation history is missing, which is
 # true and worth being able to see in a folder listing.
+def frame_zero(from_start: bool, stream_start: float | None,
+               fallback: float) -> tuple[float, int]:
+    """The wall time of media t=0 in a file about to be written, and how well
+    it is known.
+
+    ONE RULE, TWO CALLERS, and they used to disagree. Under
+    `--live-from-start` yt-dlp rebuilds the stream from its beginning, so the
+    file OPENS at the broadcast start; otherwise it opens at the live edge,
+    which is the moment the process was spawned. The recorder's clip timebase
+    worked this out correctly for itself and the packet it sent the archive did
+    not -- so `capture.local_start_wall`, which is defined as this number, was
+    filled with the spawn time. YouTube is polled every ten minutes, so on
+    those entries the column was that far late and every seek computed from it
+    landed that far early. 9m29s on a real one.
+
+    The precision moves with the answer. A spawn time is this machine reading
+    its own clock, good to the second. A broadcast start rests on the live
+    probe AND on yt-dlp opening at the first fragment it can still fetch, so it
+    is given five seconds of slack rather than a confidence nobody has.
+
+    `fallback` is used whenever the broadcast start is unknown, including on a
+    from-start pull -- in which case the answer is WRONG by the poll interval
+    and nothing here can do better. Being wrong and saying "to the second" is
+    the one combination worth avoiding, so the precision stays 1 only because
+    that is what the fallback itself is worth.
+    """
+    if from_start and stream_start:
+        return float(stream_start), 5
+    return float(fallback), 1
+
+
 OFFLINE_PULL_TAG = " (offline pull)"
 
 
