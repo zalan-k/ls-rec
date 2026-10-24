@@ -1147,6 +1147,25 @@ class YtdlpConverter(Converter):
         header = r.get("headerPrimaryText") or {}
         kw = dict(ts=ts, abs_ms=self._abs(r), id=r.get("id"),
                   author=self._author(r), badges=self._badges(r) or None, tier=1,
+                  # ── THE WORDS, which this dropped for the life of the file ──
+                  #
+                  # A membership milestone card has a header the viewer did not
+                  # write ("Member for 32 months") and a message they did. This
+                  # read the header, counted the months out of it, and never
+                  # looked at `message` at all -- so every milestone in every
+                  # archive is a month count with the comment thrown away.
+                  #
+                  # Found from the other end: a reader went looking for a
+                  # milestone they remembered and the text was nowhere in the
+                  # merged file. Two of them, in fact, and both were this.
+                  #
+                  # `message` is the SAME key `_superchat` reads four methods
+                  # up, which is the whole shape of the bug: one paid-message
+                  # branch took the words and the other did not, and nothing
+                  # compared them. The Twitch side carries text on its resub
+                  # too, so this was the only road into the archive that lost
+                  # what somebody actually said.
+                  text=self._runs((r.get("message") or {}).get("runs")) or None,
                   # A membership card is two greens, and which two is the
                   # renderer's to say rather than ours to hardcode.
                   colors=_yt_colors(r))
