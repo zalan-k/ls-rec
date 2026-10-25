@@ -1080,12 +1080,21 @@ def _get_title(config: dict, cache: list[dict], video_id: str,
     return None
 
 
-def _chat_link_target(nas: dict, prefix: str) -> str | None:
+def _chat_link_target(config: dict, nas: dict, prefix: str) -> str | None:
     """What the entry's chat icon should open.
 
     The raw while it is still on the NAS; once the merge has taken it, the
     merged file — that is where this platform's messages now live, and an
     empty link would say the chat was lost.
+
+    `config` IS USED, by `archived_rel` on the last branch, and was not a
+    parameter until it raised. The call is behind `nas.get("merged_chat") or`,
+    so it only evaluates when a raw has been archived and the merged file it
+    was archived INTO is not there — a state the entries this ran on never
+    reached, because the merge is what moves a raw to deep storage and the two
+    appear together. #784 got there by having its merged chat removed from
+    under it while the archived raw stayed, and this raised a NameError from a
+    line that had been wrong the whole time.
     """
     if nas.get(f"{prefix}_chat"):
         return nas[f"{prefix}_chat"]
@@ -1195,7 +1204,7 @@ def build_entry(config: dict, cache: list[dict], index: int,
                     if yt_id else None)
         lines.append(_build_platform_line(
             config, "YT", yt_id, "youtube", yt_title,
-            nas["yt_video"], _chat_link_target(nas, "yt"),
+            nas["yt_video"], _chat_link_target(config, nas, "yt"),
             video_x=entry.get("yt_video_x", False),
             chat_x=entry.get("yt_chat_x", False),
         ))
@@ -1208,7 +1217,7 @@ def build_entry(config: dict, cache: list[dict], index: int,
                     if tw_id else None)
         lines.append(_build_platform_line(
             config, "TW", tw_id, "twitch", tw_title,
-            nas["tw_video"], _chat_link_target(nas, "tw"),
+            nas["tw_video"], _chat_link_target(config, nas, "tw"),
             video_x=entry.get("tw_video_x", False),
             chat_x=entry.get("tw_chat_x", False),
             no_url=unpublished_vod(cache, "twitch", tw_id),
