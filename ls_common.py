@@ -905,6 +905,98 @@ def build_stream_url(config: dict, platform: str, video_id: str) -> str:
     return f"https://www.twitch.tv/videos/{str(video_id).lstrip('v')}"
 
 
+def probe_vod_row(config: dict, platform: str, video_id: str) -> dict | None:
+    """Ask the PLATFORM about one id, in the cache's own shape. Or None.
+
+    The cache is fed in bulk: `refresh_youtube_cache` reads the last five or
+    ten streams off a channel page, `refresh_twitch_cache` takes a Helix page.
+    Both are the wrong shape for the question the audit actually asks, which is
+    about one id at a time and most often about an id that was never on this
+    channel at all \u2014 a guest appearance, a collab, a stream hosted by somebody
+    else. Those are never in the cache, however often it is refreshed, so
+    `find_vod` returned None and the two checks that depend on a platform
+    answer reported "not in the cache" and "assignment cannot be checked".
+
+    That is a BLIND SPOT dressed as a cached miss, and it was worst on exactly
+    the entries a person had just made by hand.
+
+    So: one id, one probe, in the shape `find_vod` returns, with the fields
+    `is_broadcast_row`, `_platform_findings` and `_assignment_findings` read.
+    `start_time` is local wall time like the bulk writers produce it, because
+    the archive parses that convention back out of filenames and a UTC string
+    here would shift every comparison.
+
+    Returns None for a probe that could not get an answer \u2014 offline, gone,
+    failed, all three. The caller must not treat that as "the id is wrong":
+    it is the same silence as a cache miss, and it is reported as one.
+    """
+    if not video_id:
+        return None
+    url = build_stream_url(config, platform, video_id)
+    data, why = ytdlp_probe(config, url, timeout=30, with_reason=True)
+    if not data:
+        _log.info("probe_vod_row: %s %s -> %s", platform, video_id, why)
+        return None
+    start_ts = stream_start_epoch(data)
+    upload_date = str(data.get("upload_date") or "")
+    if start_ts:
+        start_time = datetime.datetime.fromtimestamp(start_ts).isoformat()
+    elif upload_date:
+        try:
+            start_time = datetime.datetime.strptime(
+                upload_date, "%Y%m%d").isoformat()
+        except ValueError:
+            start_time = None
+    else:
+        start_time = None
+    row = {
+        "id": str(data.get("id") or video_id),
+        "platform": platform,
+        "title": data.get("title") or "Unknown",
+        "start_time": start_time,
+        "channel": data.get("channel") or data.get("uploader"),
+        "duration": data.get("duration"),
+        "stream_start_epoch_ms": start_ts * 1000 if start_ts else None,
+        # WHERE THIS CAME FROM, on the row, because a probed row and a bulk
+        # row are not equally trustworthy about the same field and a reader
+        # with only the row in hand cannot otherwise tell. Nothing branches on
+        # it today; it is here so a finding can say "asked Twitch just now".
+        "probed_at": int(time.time()),
+    }
+    # `id_is` only where it can be ANSWERED. A Twitch probe of a broadcast id
+    # fails -- there is no video at twitch.tv/videos/<stream id> -- so a row
+    # that came back at all is a published video, and saying so is what stops
+    # `is_broadcast_row` falling through to its pre-`id_is` heuristic and
+    # reading a probed row's missing `record_start_epoch_ms` as a verdict.
+    if platform == "twitch":
+        row["id_is"] = "video"
+    return row
+
+
+def vod_witness(config: dict, cache: list[dict], platform: str,
+                video_id: str) -> tuple[dict | None, str | None]:
+    """(row, "cache" | "live" | None) -- what the platform says about this id.
+
+    The cache first, because a sweep over two hundred entries must not be two
+    hundred round trips, and then the platform itself for an id the cache has
+    never heard of. A live answer is folded into the cache so the rest of the
+    run, and the rest of the sweep, asks once.
+
+    The pair this returns is the whole of the arrangement the audit now runs
+    on: the cache may say what a platform thinks ABOUT an id, and may no
+    longer say WHICH id an entry has. Those were one mechanism and the second
+    half of it is what let a renumbered vault note carry one stream's video
+    onto another stream's row.
+    """
+    row = find_vod(cache, video_id, platform)
+    if row is not None:
+        return row, "cache"
+    row = probe_vod_row(config, platform, video_id)
+    if row is None:
+        return None, None
+    return upsert_vod(cache, row), "live"
+
+
 def find_vod_by_stream_id(cache: list[dict], stream_id: str,
                           platform: str = "twitch") -> dict | None:
     """The VOD a live broadcast turned into, or None.

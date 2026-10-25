@@ -363,16 +363,32 @@ def scan_nas(config: dict, index: int) -> dict:
 #  ID RESOLUTION
 # ═══════════════════════════════════════════════════════════════════════════
 #
-#  Priority: CLI override → entry URL → NAS filename → archive capture
-#            → cache (by index) → cache (by date, with auto-refresh if stale)
+#  Priority: CLI override → archive capture → NAS filename
 #
-#  The archive sits above the cache and below the filename for one reason:
-#  the three above it are STATEMENTS of identity — somebody typed this id,
-#  here or in the vault or into a filename — and the two below it are
-#  GUESSES, a cache row that claims an index or happens to fall on the same
-#  day. A stream broadcast from somebody else's channel is in neither cache,
-#  so a date guess there is not a weaker answer than the pasted URL, it is a
-#  wrong one.
+#  THREE SOURCES, AND THEY USED TO BE SIX. The vault entry's URL and two cache
+#  guesses — a row claiming an index, a row falling on the same day — have been
+#  taken out, and the order of what is left has been inverted.
+#
+#  The old note here already contained the argument against itself: it called
+#  the cache lookups GUESSES and said that for a stream broadcast from somebody
+#  else's channel "a date guess is not a weaker answer than the pasted URL, it
+#  is a wrong one". The vault entry was the same kind of thing one step up.
+#  Both are a number somebody typed into a note, and a note can be renumbered:
+#  #784's URL sitting under the heading for #782 is all it took for an audit to
+#  carry one stream's video home to another stream's row, and nothing in the
+#  chain could notice, because the number WAS the identity.
+#
+#  So the archive now ranks above the filename, where the vault used to be. A
+#  capture row is a URL a person pasted into the one surface that resolves it,
+#  checks it and keeps a history of who changed it. A filename is a statement
+#  too — it is still here, and it is still what the video and chat actually
+#  belong to — but it is written by a recorder that was told a number, so when
+#  the two disagree the archive is the one that has an audit trail.
+#
+#  The cache is NOT gone from this file. It is no longer allowed to say which
+#  stream this is; it is still read for what the platform says ABOUT an id, in
+#  `_platform_findings` and `_assignment_findings`, which is where the check
+#  that catches a misfiled capture lives.
 
 # Refreshed at most once per run. The correction below wants a cache that has
 # heard of this id, and a sweep over two hundred entries must not mean two
@@ -423,7 +439,7 @@ def resolve_id(config: dict, cache: list[dict], platform: str,
     that broadcast, the VOD's id is the answer.
     """
     global _TW_REFRESHED
-    vid, src = _resolve_id_raw(config, cache, platform, entry, nas, cli_override,
+    vid, src = _resolve_id_raw(platform, nas, cli_override,
                                arch_ids)
     if platform != "twitch" or not vid:
         return vid, src
@@ -519,80 +535,35 @@ def unpublished_vod(cache: list[dict], platform: str, video_id: str | None) -> b
     return int(started) >= floor
 
 
-def _resolve_id_raw(config: dict, cache: list[dict], platform: str,
-                    entry: dict, nas: dict,
+def _resolve_id_raw(platform: str, nas: dict,
                     cli_override: str | None = None,
                     arch_ids: dict[str, str] | None = None) -> tuple[str | None, str | None]:
-    """Where an id is looked for, in order. See resolve_id for the correction."""
+    """Where an id is looked for, in order. See resolve_id for the correction.
+
+    Takes neither `config` nor `cache` nor `entry` any more, and the absence is
+    the point: a reader who sees a cache in the signature will assume it is
+    consulted, and three of the six places this used to look have been removed
+    rather than merely demoted.
+    """
     tag = "yt" if platform == "youtube" else "tw"
 
-    # 1. CLI override
+    # 1. CLI override. Still first, and deliberately: `--tw-id` is a person
+    #    saying "I know, it is this one", which is the whole repair road for a
+    #    succession or a mispaste.
     if cli_override:
         return cli_override, "cli"
 
-    # 2. URL already in obsidian entry
-    entry_id = entry.get(f"{tag}_id")
-    if entry_id:
-        return entry_id, "entry"
+    # 2. The archive's capture row — a URL somebody entered on the website.
+    arch = (arch_ids or {}).get(platform)
+    if arch and str(arch).strip():
+        return str(arch).strip(), "archive"
 
-    # 3. NAS filename
+    # 3. NAS filename.
     nas_file = nas.get(f"{tag}_video")
     if nas_file:
         vid = ls_common.extract_video_id_from_filename(nas_file)
         if vid:
             return vid, "nas"
-
-    # 4. The archive's capture row — a URL somebody entered on the website
-    arch = (arch_ids or {}).get(platform)
-    if arch:
-        return arch, "archive"
-
-    # 5. Cache by obsidian_index
-    target_index = entry.get("_index")
-    if target_index is not None:
-        for vod in cache:
-            if (vod.get("platform") == platform
-                    and vod.get("obsidian_index") == int(target_index)):
-                return vod["id"], "cache (index)"
-
-    # 6. Cache by date (auto-refresh if stale)
-    if entry["date_obj"]:
-        target_index = entry.get("_index")
-
-        def _match():
-            return ls_common.find_vod_by_date(
-                cache, platform, entry["date_obj"], claim_index=target_index,
-            )
-
-        vod = _match()
-        if vod is None:
-            newest_dates = [
-                v.get("start_time", "")[:10]
-                for v in cache if v.get("platform") == platform
-            ]
-            newest = max(newest_dates) if newest_dates else None
-            target_date = entry["date_obj"].strftime("%Y-%m-%d")
-            if newest is None or target_date > newest:
-                print(f"  ⌛ Refreshing {platform} cache...")
-                if platform == "youtube":
-                    ls_common.refresh_youtube_cache(config, cache, full=(newest is None))
-                else:
-                    ls_common.refresh_twitch_cache(config, cache, full=(newest is None))
-                ls_common.save_cache(cache)
-                vod = _match()
-
-        if vod:
-            label = "cache (date)"
-            try:
-                vdt = (datetime.datetime
-                       .fromisoformat(vod["start_time"].replace("Z", "+00:00"))
-                       .replace(tzinfo=None))
-                delta = abs(vdt - entry["date_obj"])
-                if delta > datetime.timedelta(minutes=5):
-                    label += f" (~{int(delta.total_seconds() // 60)}m off)"
-            except Exception:
-                pass
-            return vod["id"], label
 
     return None, None
 
@@ -1519,18 +1490,21 @@ def pull(config: dict, index: int, platform: str, what: str,
         return {"ran": False, "changed": False, "files": [],
                 "why": f"nothing here pulls a {what!r}"}
 
-    entry = ls_common.obsidian_parse_entry(config, index)
-    if not entry["found"]:
+    # THE ARCHIVE, not the vault. A pull used to refuse when #index had no
+    # Obsidian heading, which made the hand-made entry -- the one most likely
+    # to be missing a file -- the one that could not fetch it.
+    look = (ls_archive.lookup(config, idx=index)
+            if ls_archive.enabled(config) else None)
+    arch_ids = archive_ids(look)
+    entry = _entry_from_archive({"found": False}, look, arch_ids)
+    if entry is None:
         return {"ran": False, "changed": False, "files": [],
-                "why": f"entry #{index} not found"}
+                "why": f"#{index} is not in the archive, so there is nothing "
+                       f"here that knows what to fetch"}
     entry["_index"] = index
     cache = ls_common.load_cache() if cache is None else cache
     nas = scan_nas(config, index)
-    # The same five sources the audit uses, in the same order -- including the
-    # archive, which is where the URL for a broadcast on somebody else's
-    # channel lives and the only place it can have come from.
-    arch_ids = archive_ids(ls_archive.lookup(config, idx=index)
-                           if ls_archive.enabled(config) else None)
+    # The same three sources the audit uses, in the same order.
     vid, _src = resolve_id(config, cache, platform, entry, nas, None, arch_ids)
     if not vid:
         return {"ran": False, "changed": False, "files": [],
@@ -4119,15 +4093,23 @@ def _witness_findings(timings: dict) -> list[dict]:
     return out
 
 
-def _platform_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
+def _platform_findings(config: dict, cache: list[dict], ids: dict,
+                       entry: dict) -> list[dict]:
     """Does this id name something that exists?
 
-    Answered from the cache rather than from the network. That is not a
-    shortcut — the cache is fed by Helix and yt-dlp and is refreshed by the id
-    resolution that just ran, so it holds the platform's own answer. What it
-    buys is an audit that can be run over two hundred entries without two
-    hundred round trips, and an offline one that still says something useful.
-    `--probe` is the door to a live check when the cached answer is doubted.
+    The cache first and the platform second — see `ls_common.vod_witness`.
+    The cache is fed by Helix and yt-dlp, so a hit holds the platform's own
+    answer and two hundred entries are not two hundred round trips; a miss is
+    now one probe for the one id rather than a shrug.
+
+    That matters most where it used to matter least. An id the cache has never
+    heard of is usually a stream on somebody ELSE's channel, which no amount
+    of refreshing a channel listing will ever produce — so the entries most
+    likely to be wrong were the ones this could say nothing about.
+
+    The id resolution no longer refreshes anything on its way past, which the
+    old note here relied on, and there is no `--probe` flag: that sentence
+    described a door that was never built.
     """
     out = []
     for prefix, platform, label in (("yt", "youtube", "YouTube"),
@@ -4139,13 +4121,18 @@ def _platform_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
             out.append(_finding("warn", "platform", f"no {label} id could be resolved",
                                 platform=prefix, short="no id"))
             continue
-        row = ls_common.find_vod(cache, vid, platform)
+        row, how = ls_common.vod_witness(config, cache, platform, vid)
         if row is None:
-            # Not necessarily wrong: Helix lists a bounded window and an old
-            # entry falls out of it. Worth a word, not an alarm.
+            # Neither cached nor reachable. Three different causes — too old
+            # for Helix's window, deleted, or no network — and this cannot
+            # tell them apart, so it says what it did rather than guessing
+            # which. Still a note and not an alarm: an unanswerable question
+            # is not a wrong id.
             out.append(_finding("note", "platform",
-                                f"{label} {vid} is not in the cache — too old to list, "
-                                f"or never confirmed", platform=prefix, id=vid,
+                                f"{label} {vid} is not cached and the platform "
+                                f"would not answer for it — too old to list, "
+                                f"gone, or nothing could reach it",
+                                platform=prefix, id=vid,
                                 short=f"{vid} unconfirmed"))
         elif ls_common.is_broadcast_row(row):
             # The whole #736 failure in one line: this id is the BROADCAST,
@@ -4166,13 +4153,16 @@ def _platform_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
                                 platform=prefix, id=vid, reason=why,
                                 short=f"{vid} is a BROADCAST id"))
         else:
-            out.append(_finding("ok", "platform", f"{label} {vid} is a known video",
+            out.append(_finding("ok", "platform",
+                                f"{label} {vid} is a known video"
+                                + (" (asked just now)" if how == "live" else ""),
                                 platform=prefix, id=vid, short=f"{vid} exists",
-                                title=row.get("title")))
+                                title=row.get("title"), asked=how))
     return out
 
 
-def _assignment_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict]:
+def _assignment_findings(config: dict, cache: list[dict], ids: dict,
+                         entry: dict) -> list[dict]:
     """Is this capture on the RIGHT broadcast?
 
     The check nothing has performed, and the one that catches the failure that
@@ -4199,7 +4189,13 @@ def _assignment_findings(cache: list[dict], ids: dict, entry: dict) -> list[dict
         vid = (ids.get(platform) or (None, None))[0]
         if not vid:
             continue
-        row = ls_common.find_vod(cache, vid, platform) or {}
+        # LIVE IF NEED BE, and this is the check that earns it. It is the one
+        # that catches a capture filed against the wrong row, and until now it
+        # could only run on an id the cache already held -- so a hand-made
+        # entry, which is where the misfiling happens, was precisely the case
+        # it sat out. `vod_witness` will have cached a probe from
+        # `_platform_findings` a moment ago, so this is normally free.
+        row = (ls_common.vod_witness(config, cache, platform, vid)[0]) or {}
         got_ms = row.get("stream_start_epoch_ms") or row.get("record_start_epoch_ms")
         if not got_ms:
             raw = str(row.get("start_time") or "")
@@ -4552,33 +4548,55 @@ def worst(findings: list[dict]) -> str:
                default="ok")
 
 
-def _entry_from_archive(base: dict, archive: dict | None,
+#  THE ENTRY'S OWN SHAPE, which used to be borrowed. Every caller got it by
+#  running `obsidian_parse_entry` first and handing the miss-shape in as
+#  `base`, so the vault parser was the thing that defined what an entry HAS
+#  even for an entry it had not found. With the parser out of the audit path
+#  there is nobody to borrow from, and passing a bare `{"found": False}`
+#  raised `KeyError: 'checkbox'` out of a renderer three calls away.
+#
+#  Written out here rather than fetched, because fetching it would mean
+#  calling the vault parser to find out what a non-vault entry looks like.
+#  `test_synthentry` diffs this against the parser's own defaults, so the two
+#  drifting apart is a failing assertion rather than a KeyError in a sweep.
+_ENTRY_SHAPE = {
+    "found": False, "checkbox": "[ ]",
+    "date_str": None, "date_obj": None, "tz_str": None,
+    "duration_str": None,
+    "yt_id": None, "tw_id": None,
+    "no_yt": False, "no_tw": False,
+    "yt_video_x": False, "yt_chat_x": False,
+    "tw_video_x": False, "tw_chat_x": False,
+    "notes": [],
+}
+
+
+def _entry_from_archive(base: dict | None, archive: dict | None,
                         arch_ids: dict[str, str]) -> dict | None:
-    """The entry the vault WOULD have carried, built from the archive row.
+    """The entry, built from the archive row. The only entry there is.
 
-    A stream born on the website has no vault line, and `inspect` used to stop
-    at that — which made the one case a person most needs help with the one
-    case that refuses to run: files sitting on the NAS, an id typed into the
-    UI, and no way to ask whether the three agree. Everything needed was
-    already in hand two lines earlier, in the lookup the worker had done
-    anyway.
+    This began as a fallback for a stream born on the website, which had no
+    vault line and so could not be audited at all — files on the NAS, an id
+    typed into the UI, and nothing willing to ask whether the three agreed.
 
-    ONLY for a stream that never had a vault line. `origin` decides, and the
-    distinction is not pedantry: a `web` stream has no line because nobody
-    wrote one, while a `vault` stream with no line has LOST one, and that is a
-    finding rather than a gap to paper over. Synthesising for the second would
-    replace a real alarm with a clean report.
+    It is now the whole of it. The `origin` gate that used to stand here is
+    gone with the vault read it guarded: it existed to tell "no line because
+    nobody wrote one" from "no line because one was LOST", and that question
+    only has stakes while a missing line is an alarm. Nothing reads the vault
+    now, so a line being absent, present or renumbered is equally silent, and
+    a gate on `origin` would only decide which rows refuse to audit.
 
-    Returns None when the archive cannot furnish a date, so the caller's own
-    refusal still happens for a genuinely unknown entry.
+    Returns None when the archive cannot furnish a date, which is now the
+    single reason an audit can fail to get started.
 
-    NOT A VAULT WITNESS. These fields come from the archive, so every
-    archive-against-vault comparison downstream agrees by construction and
-    proves nothing. `_synthetic` is how inspect() knows to say so.
+    NOT AN INDEPENDENT WITNESS, and that costs more than it used to. These
+    fields come from the archive, so every archive-against-entry comparison
+    downstream agrees by construction. What is left to disagree with the
+    archive is the FILESYSTEM — ffprobe, the chat spans, what is on disk — and
+    the PLATFORM, which `_platform_findings` and `_assignment_findings` still
+    ask about by id. Those two are the audit now.
     """
     st = (archive or {}).get("stream") or {}
-    if str(st.get("origin") or "vault").strip().lower() == "vault":
-        return None
     started = st.get("started_at")
     if not started:
         return None
@@ -4594,7 +4612,7 @@ def _entry_from_archive(base: dict, archive: dict | None,
     sign = "-" if tz_min < 0 else "+"
     tz_str = f"(GMT{sign}{hh})" if not mm else f"(GMT{sign}{hh}:{mm:02d})"
 
-    entry = dict(base)
+    entry = {**_ENTRY_SHAPE, **(base or {})}
     entry["found"] = True
     entry["_synthetic"] = True
     entry["date_obj"] = wall
@@ -4610,6 +4628,40 @@ def _entry_from_archive(base: dict, archive: dict | None,
     for key, plat in (("yt_id", "youtube"), ("tw_id", "twitch")):
         if arch_ids.get(plat):
             entry[key] = arch_ids[plat]
+
+    # ── "I DID NOT KEEP THIS", READ BACK OUT OF THE ARCHIVE ──────────────
+    #
+    #  The `.×` in an Obsidian line was a person saying it, and for a long
+    #  time the only record of it anywhere. `_cap_evidence` carries it OUT to
+    #  the archive's `video_state = 'declined'` — its comment says so, and
+    #  says why: "that decision out of the markdown before the markdown goes
+    #  away". The markdown has now gone away, and nothing read it back.
+    #
+    #  Left alone, every deliberately-declined capture would report as a loss
+    #  on every audit: `_disk_findings` asks `entry["tw_video_x"]`, which no
+    #  longer has a source, and would say "Twitch video missing" — a warning,
+    #  for ever, about a file somebody decided not to have. A warning that
+    #  fires on every row is the one people turn off.
+    #
+    #  The data itself was never at risk: a state is only ever ASSERTED by an
+    #  audit (`kept` for a file that is there, `declined` for a vault mark),
+    #  so a missing mark proposed nothing and the column kept its value. This
+    #  is about the findings agreeing with the column.
+    #
+    #  `declined` ONLY. `lost`, `never` and `raw` are the archive's readings of
+    #  a filesystem, not a decision a person made, and turning one of those
+    #  into `×` would tell the audit to stop looking at a file that is merely
+    #  gone. "Nobody ever broadcast here" has its own road, the stream-level
+    #  `no_broadcast` claim, which `_disk_findings` already reads.
+    for cap in (st.get("captures") or []):
+        prefix = {"YT": "yt", "TW": "tw"}.get(
+            str(cap.get("platform") or "").strip().upper())
+        if not prefix:
+            continue
+        if str(cap.get("video_state") or "").strip() == "declined":
+            entry[f"{prefix}_video_x"] = True
+        if str(cap.get("chat_state") or "").strip() == "declined":
+            entry[f"{prefix}_chat_x"] = True
     return entry
 
 
@@ -4629,9 +4681,17 @@ def inspect(config: dict, index: int, *,
            "entry": None, "nas": None, "ids": {}, "block": None,
            "stream_fields": None, "captures": None, "questions": []}
 
-    # What the archive has already been told, if the caller fetched it. Kept
-    # optional so `inspect` still works from a terminal with no archive
-    # reachable — the same reason it takes `cache` rather than loading one.
+    # What the archive has already been told, if the caller fetched it. The
+    # CLAIMS stay optional: they are answers to questions, and an audit with
+    # none of them in hand is quieter but not wrong.
+    #
+    # THE LOOKUP BELOW IS NOT OPTIONAL ANY MORE, and the sentence that used to
+    # stand here -- "kept optional so `inspect` still works from a terminal
+    # with no archive reachable" -- is no longer true of this function. The
+    # vault was the other witness; with it gone there is nothing to run
+    # against, so an unreachable archive is a refusal rather than a degraded
+    # run. A degraded run is the worse outcome: it would report on files and
+    # platforms with no idea what entry it was describing.
     known = _claims_index(claims)
     # And what it holds for the captures, which is where an id entered on the
     # website lives. Fetched here only when the caller did not already have a
@@ -4641,19 +4701,22 @@ def inspect(config: dict, index: int, *,
         archive = ls_archive.lookup(config, idx=int(index))
     arch_ids = archive_ids(archive)
 
-    entry = ls_common.obsidian_parse_entry(config, index)
-    if not entry["found"]:
-        entry = _entry_from_archive(entry, archive, arch_ids)
-        if entry is None:
-            out["reason"] = f"entry #{index} not found"
-            return out
+    # THE VAULT IS NO LONGER READ. `obsidian_parse_entry` stood here and
+    # was the first thing an audit did; it is what made a renumbered note
+    # able to point a run at the wrong row. The archive is the only thing
+    # that now says what #index is.
+    entry = _entry_from_archive({"found": False}, archive, arch_ids)
+    if entry is None:
+        out["reason"] = (f"#{index} is not in the archive, and the vault is no "
+                         f"longer consulted — nothing here can describe it")
+        return out
     entry["_index"] = index
     out["entry"] = entry
-    # Which of the two the fields came from. On the report rather than inferred
-    # from `_synthetic` by every reader in turn, because a caller deciding how
-    # much to trust a clean audit needs this and should not have to know the
-    # private key that carries it.
-    out["entry_source"] = "archive" if entry.get("_synthetic") else "vault"
+    # Kept on the report, and now always "archive". A reader deciding how much
+    # to trust a clean audit still needs to know what stood behind the fields,
+    # and a key that exists only while there are two answers is a key every
+    # caller has to learn twice.
+    out["entry_source"] = "archive"
     if not entry["date_obj"]:
         out["reason"] = f"cannot parse the date for #{index}"
         out["findings"].append(_finding("bad", "assignment", out["reason"],
@@ -4674,21 +4737,16 @@ def inspect(config: dict, index: int, *,
     out["ids"] = ids
 
     out["findings"] = (_disk_findings(config, nas, entry, known, ids)
-                       + _platform_findings(cache, ids, entry)
-                       + _assignment_findings(cache, ids, entry))
-    if entry.get("_synthetic"):
-        # FIRST, and a finding rather than a flag on the side, because the
-        # thing it is warning about is the absence of alarms: three witnesses
-        # became two, so an audit with nothing to say here is quieter than it
-        # has earned. Note and not warn — the setup is legitimate, it is the
-        # reading of a clean result that needs the caveat.
-        out["findings"].insert(0, _finding(
-            "note", "assignment",
-            f"#{entry['_index']} has no vault entry, so the archive stood in "
-            f"for one: its date, timezone and duration were taken as given "
-            f"and only the files and the platforms were checked against them",
-            short="no vault line",
-            entry_source="archive", question=None))
+                       + _platform_findings(config, cache, ids, entry)
+                       + _assignment_findings(config, cache, ids, entry))
+    # THE "no vault line" NOTE IS GONE, and its own argument is why. It warned
+    # that three witnesses had become two, which was worth saying while it was
+    # true of a handful of entries. It is now true of every entry in the
+    # archive, and a note that fires on every row is the thing this file
+    # elsewhere refuses to ship: "a check that fires on every row is worse than
+    # no check, because it is the one people turn off". What it carried lives on
+    # `entry_source` for a caller that wants to reason about it, and in
+    # `_entry_from_archive`'s docstring for a person who wants to know why.
     # Lifted out flat for a caller that wants the questions and not the whole
     # report — the plan that goes home, and eventually the panel. They stay on
     # their findings too, because the finding is where the context is.
@@ -4962,25 +5020,20 @@ def audit(config: dict, index: int,
             print(f"  │ {line}")
         print("  └───────────────────────────────────\n")
 
-    # ONE question, asked here and ANSWERED here — but the write itself waits
-    # until the end of the run. It used to ask twice, once now and once after
-    # the merge, about the same file, with the second answer quietly
-    # overwriting the first; the only way to say "yes, but not that one" was
-    # to not notice you had been asked twice. Deferring the write means the
-    # line that lands is built from what the run actually did, which is what
-    # the second prompt was really for.
-    may_write = (not interactive
-                 or input("  Write to Obsidian? (y/n): ").strip().lower() == "y")
-    if not may_write:
-        print("  Obsidian left alone.")
-
-    def _write_vault(lines):
-        if not may_write:
-            return
-        if ls_common.obsidian_write_entry(config, index, lines):
-            print("  ✓ Obsidian entry written.")
-        else:
-            print("  ✗ Obsidian write failed.")
+    # AN AUDIT NO LONGER WRITES THE VAULT. There was a "Write to Obsidian?
+    # (y/n)" here, and a deferred writer that ran at the end with whatever the
+    # run had settled.
+    #
+    # Both are gone, and not only because nothing reads the note any more. A
+    # writer is the other half of the accident: a run that reconstructs a line
+    # and writes it under a heading is a run that can move one stream's
+    # identity onto another stream's number, from a direction nobody is
+    # watching. The note is now a RECORDING LOG — ls_rec writes one when it
+    # records, and that is the only hand that touches it.
+    #
+    # `build_entry` and its block survive, because `--show` and `-v` print it
+    # and reading a reconstruction beside the findings is still worth doing.
+    # It is a view now, not a write.
     print()
 
     # 6. Missing files → download
@@ -5011,7 +5064,6 @@ def audit(config: dict, index: int,
         nas = scan_nas(config, index)
 
     if not changed:
-        _write_vault(block)
         # Save cache (may have been updated by title lookups)
         ls_common.save_cache(cache)
         if push_archive:
@@ -5047,13 +5099,11 @@ def audit(config: dict, index: int,
             print(f"  │ {line}")
         print("  └────────────────────────────────────────────────────\n")
 
-    # The rebuilt line, using the answer already given.
-    _write_vault(block)
-
     ls_common.save_cache(cache)
 
-    # Last, and only after the vault write: the archive learns what this run
-    # settled, not what it was still deciding.
+    # Last: the archive learns what this run settled, not what it was still
+    # deciding. It used to be sequenced after the vault write for that reason;
+    # with the write gone it is simply the end of the run.
     if push_archive:
         cmd_archive(config, index, entry=entry, nas=nas, cache=cache,
                     yt_id=yt_id, tw_id=tw_id, interactive=interactive)
@@ -5277,9 +5327,14 @@ def cmd_archive(config: dict, index: int, *, entry: dict | None = None,
         return False
     try:
         if entry is None:
-            entry = ls_common.obsidian_parse_entry(config, index)
-            if not entry["found"]:
-                print(f"  ✗ Entry #{index} not found.")
+            # Only reached by `--archive` on its own. From the archive, like
+            # everywhere else now; the lookup below is the same call, so this
+            # path makes one where it used to read a note.
+            entry = _entry_from_archive(
+                {"found": False},
+                ls_archive.lookup(config, idx=index), None)
+            if entry is None:
+                print(f"  ✗ #{index} is not in the archive.")
                 return False
             entry["_index"] = index
         if nas is None:
