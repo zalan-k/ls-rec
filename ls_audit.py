@@ -3793,6 +3793,33 @@ def _asked(kind: str, prefix: str | None, message: str, answers: list[str]) -> d
             "message": message, "answers": answers}
 
 
+def _nothing_broadcast(entry: dict, claims: dict, prefix: str,
+                       platform: str) -> bool:
+    """Did this platform carry no broadcast at all?
+
+    THREE CHECKS ASK THIS AND ONLY ONE USED TO KNOW THE ANSWER. `_disk_findings`
+    read the claims; `_platform_findings` and `_assignment_findings` looked at
+    `entry["no_yt"]` / `no_tw` alone -- so answering "there was no Twitch
+    stream" silenced the missing-file warning and left "no Twitch id could be
+    resolved" standing for ever, on an entry where there was never going to be
+    one. #784 is the example: `no_broadcast` answered for Twitch, and the card
+    still carried a warn nobody could clear.
+
+    It got worse when the vault read came out, which is why this is a function
+    now rather than a fourth copy. `no_yt` / `no_tw` were the VAULT's way of
+    saying it, and `_entry_from_archive` refuses to invent them -- correctly,
+    since the archive is not making that claim. So those keys now have NO
+    source, and the claim is the only road there is. A check still gating on
+    them alone is a check that can never be satisfied.
+
+    `(None, ...)` is the whole broadcast rather than one platform: "there was
+    no stream that day" is something somebody says once, not twice.
+    """
+    return bool(entry.get(f"no_{prefix}")
+                or (None, "no_broadcast") in claims
+                or (platform, "no_broadcast") in claims)
+
+
 def _disk_findings(config: dict, nas: dict, entry: dict,
                    claims: dict | None = None,
                    ids: dict | None = None) -> list[dict]:
@@ -3813,13 +3840,11 @@ def _disk_findings(config: dict, nas: dict, entry: dict,
     # are things somebody says once rather than twice, and the archive has
     # always accepted them — this is where they finally mean something. Without
     # it they were stored, served to this worker, and silently ignored.
-    none_at_all = (None, "no_broadcast") in claims
     all_declined = (None, "declined") in claims
     for prefix, label in (("yt", "YouTube"), ("tw", "Twitch")):
         platform = _PREFIX_PLATFORM[prefix]
-        # The vault's `no_yt` / `no_tw`, or the archive's claim saying the same
-        # thing. A platform that never broadcast has nothing to be missing.
-        if entry.get(f"no_{prefix}") or none_at_all or (platform, "no_broadcast") in claims:
+        # A platform that never broadcast has nothing to be missing.
+        if _nothing_broadcast(entry, claims, prefix, platform):
             continue
         # And the vault's `.×`, or the archive's claim saying the same thing.
         # Checked once here so both the video and the chat branch below can ask
@@ -4103,7 +4128,7 @@ def _witness_findings(timings: dict) -> list[dict]:
 
 
 def _platform_findings(config: dict, cache: list[dict], ids: dict,
-                       entry: dict) -> list[dict]:
+                       entry: dict, claims: dict | None = None) -> list[dict]:
     """Does this id name something that exists?
 
     The cache first and the platform second — see `ls_common.vod_witness`.
@@ -4121,9 +4146,14 @@ def _platform_findings(config: dict, cache: list[dict], ids: dict,
     described a door that was never built.
     """
     out = []
+    claims = claims or {}
     for prefix, platform, label in (("yt", "youtube", "YouTube"),
                                     ("tw", "twitch", "Twitch")):
-        if entry.get(f"no_{prefix}"):
+        #  THROUGH THE CLAIMS NOW, not `no_yt` alone -- see `_nothing_broadcast`.
+        #  "no id could be resolved" is the right warning for a platform that
+        #  broadcast and the wrong one for a platform that did not, and it was
+        #  the only answer this could give to either.
+        if _nothing_broadcast(entry, claims, prefix, platform):
             continue
         vid = (ids.get(platform) or (None, None))[0]
         if not vid:
@@ -4171,7 +4201,7 @@ def _platform_findings(config: dict, cache: list[dict], ids: dict,
 
 
 def _assignment_findings(config: dict, cache: list[dict], ids: dict,
-                         entry: dict) -> list[dict]:
+                         entry: dict, claims: dict | None = None) -> list[dict]:
     """Is this capture on the RIGHT broadcast?
 
     The check nothing has performed, and the one that catches the failure that
@@ -4181,6 +4211,7 @@ def _assignment_findings(config: dict, cache: list[dict], ids: dict,
     the entry's.
     """
     out = []
+    claims = claims or {}
     want = entry.get("date_obj")
     if not want:
         return [_finding("bad", "assignment", "the entry has no parseable date, so "
@@ -4193,7 +4224,10 @@ def _assignment_findings(config: dict, cache: list[dict], ids: dict,
     want_ms = (_vault_epoch(want, _tz_offset_min(entry.get("tz_str"))) or 0) * 1000
     for prefix, platform, label in (("yt", "youtube", "YouTube"),
                                     ("tw", "twitch", "Twitch")):
-        if entry.get(f"no_{prefix}"):
+        #  Same question, same answer. Reached only when an id resolved for a
+        #  platform the archive has been told carried nothing, which is rare --
+        #  but the three checks agreeing by construction is the point.
+        if _nothing_broadcast(entry, claims, prefix, platform):
             continue
         vid = (ids.get(platform) or (None, None))[0]
         if not vid:
@@ -4746,8 +4780,8 @@ def inspect(config: dict, index: int, *,
     out["ids"] = ids
 
     out["findings"] = (_disk_findings(config, nas, entry, known, ids)
-                       + _platform_findings(config, cache, ids, entry)
-                       + _assignment_findings(config, cache, ids, entry))
+                       + _platform_findings(config, cache, ids, entry, known)
+                       + _assignment_findings(config, cache, ids, entry, known))
     # THE "no vault line" NOTE IS GONE, and its own argument is why. It warned
     # that three witnesses had become two, which was worth saying while it was
     # true of a handful of entries. It is now true of every entry in the
