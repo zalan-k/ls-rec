@@ -2732,11 +2732,35 @@ def _backfill_tw_chat(config: dict, item: dict) -> bool:
         print("  ✗ twitch_downloader_cli is not configured; cannot pull.")
         return False
 
-    base = os.path.splitext(item["chat_file"])[0]
+    # `or ""`, AND THE FALLBACK UNDER IT. A bare `item["chat_file"]` is
+    # `os.path.splitext(None)` the moment there is no Twitch capture to be
+    # named after -- `TypeError: expected str, bytes or os.PathLike object,
+    # not NoneType` -- and `repair`'s `force` branch sets `chat_file` straight
+    # off `nas.get("tw_chat")`, which is None whenever the scan found none.
+    # THE NAME IS THE ONLY THING THIS FUNCTION WANTED THE CAPTURE FOR, which
+    # is why deleting a truncated chat before asking for a clean pull made the
+    # repair worse rather than starting it fresh: the file was supplying the
+    # output name and nothing else.
+    base = os.path.splitext(item.get("chat_file") or "")[0]
     # The capture may itself be a pull from an earlier attempt. One tag is
     # enough; two would read as a pull of a pull.
     if base.endswith(ls_common.OFFLINE_PULL_TAG):
         base = base[: -len(ls_common.OFFLINE_PULL_TAG)]
+    # NOTHING TO BE NAMED AFTER, which is the ordinary state and not an edge:
+    # the raw folded into a merged chat and moved to deep storage, or somebody
+    # deleted a truncated capture before asking for a clean one.
+    # THE SAME ANSWER THE YOUTUBE SIDE ALREADY GIVES, lifted here rather than
+    # invented -- `index` rides in the item for precisely this, `repair` puts
+    # it there, and its comment has said why since the rewrite. One of the two
+    # backfills was told and the other was not.
+    if not base:
+        if not item.get("index"):
+            print("  ✗ No chat file and no entry number to name one after.")
+            return False
+        base = _pull_stem(config, item["index"],
+                          ls_common.build_stream_url(config, "twitch",
+                                                     item["video_id"]),
+                          item["video_id"])
     out = os.path.join(nas_path, ls_common.offline_pull_name(base))
     # `.json`, not merely `.tmp`. TwitchDownloaderCLI validates the output
     # extension while it is still parsing its arguments and refuses anything it
@@ -2767,7 +2791,11 @@ def _backfill_tw_chat(config: dict, item: dict) -> bool:
               + (f": {_tdl_said(r)}" if _tdl_said(r)
                  else f" (the downloader exited {r.returncode} without "
                       "writing anything)"))
-        print(f"    It was read out of the filename: {item['chat_file']}")
+        #  ONLY IF THERE WAS ONE. With no capture the id came off the video
+        #  or an archived raw, and "read out of the filename: None" is a
+        #  sentence that sends somebody to look at a file that is not there.
+        if item.get("chat_file"):
+            print(f"    It was read out of the filename: {item['chat_file']}")
         if str(item["video_id"]).startswith("3"):
             print("    That id starts with 3, so it is probably a broadcast id "
                   "rather than a VOD\n    id — `ls-audit --tw-ids` resolves it. "
