@@ -1584,6 +1584,51 @@ IGDB_FIELDS = ("name,slug,summary,first_release_date,game_type,"
 # `prop=pageimages` does work, and returns a portrait for every hit. The
 # infobox's own `image1` is not used: on at least one live page it is a
 # `<gallery>` block rather than a filename.
+# ══════════════════════════════════════════════════════════════════════════
+#  ANILIST
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The third catalogue, and the first one that answers two different questions
+# from one endpoint: `Media(type: ANIME)` for a title and `Character` for a
+# person in one. Which it asks is decided by the TAG'S KIND, which the archive
+# now sends in the payload — the same name means different things on a
+# `copyright` row and a `character` row, and only the archive knows which row
+# the button was pressed on.
+#
+# GraphQL, so it is a POST with a JSON body and one request answers a whole
+# lookup — no search-then-read like the wiki needs. No key and no auth for
+# public reads. Measured against the live API: `X-RateLimit-Limit: 30` per
+# minute, which at one request per lookup is not a ceiling anybody will reach
+# by hand.
+#
+# Covers come from `s4.anilist.co` and are .jpg or .png depending on the
+# entry — which is why the recorder names poster files from their bytes.
+ANILIST_API = "https://graphql.anilist.co"
+ANILIST_ART_HOSTS = ("s4.anilist.co",)
+AL_PAGE = 6
+
+# `sort: SEARCH_MATCH` is AniList's own relevance and is better than anything
+# this worker could compute from a title; the only re-ordering below is to
+# float an EXACT name, which it does not always do.
+AL_MEDIA_Q = """
+query ($q: String, $n: Int) { Page(perPage: $n) {
+  media(search: $q, type: ANIME, sort: SEARCH_MATCH) {
+    siteUrl format episodes averageScore
+    title { romaji english native } synonyms
+    description(asHtml: false)
+    coverImage { extraLarge large }
+    startDate { year }
+    studios(isMain: true) { nodes { name } } } } }"""
+
+AL_CHARA_Q = """
+query ($q: String, $n: Int) { Page(perPage: $n) {
+  characters(search: $q, sort: SEARCH_MATCH) {
+    siteUrl
+    name { full native alternative }
+    image { large }
+    description(asHtml: false)
+    media(perPage: 3, sort: POPULARITY_DESC) { nodes { title { romaji english } } } } } }"""
+
 VTUBER_API = "https://virtualyoutuber.fandom.com/api.php"
 VTUBER_ART_HOSTS = ("static.wikia.nocookie.net",)
 # Eight from the search, because this one is full-text and loose: asking for
@@ -1967,6 +2012,8 @@ HARVEST_SOURCES = {
              "art_hosts": IGDB_ART_HOSTS},
     "vtuber": {"label": "VTuber Wiki", "search": lambda c, p: _harvest_vtuber(c, p),
                "art_hosts": VTUBER_ART_HOSTS},
+    "anilist": {"label": "AniList", "search": lambda c, p: _harvest_anilist(c, p),
+                "art_hosts": ANILIST_ART_HOSTS},
 }
 # What a payload with no `source` means. Every job the archive queued before
 # the picker existed is an IGDB search, so this is back-compatibility and not
@@ -1977,6 +2024,171 @@ DEFAULT_SOURCE = "igdb"
 def _source(pay: dict) -> str:
     s = str(pay.get("source") or "").strip().lower()
     return s if s in HARVEST_SOURCES else DEFAULT_SOURCE
+
+
+def _post_json(url: str, body: dict, timeout: int = 30):
+    """A JSON POST, answered as JSON. None on any failure.
+
+    Same shape and same silence as `_get_json` above: a catalogue not
+    answering is a thing the archive draws as "nothing came back", not an
+    exception for `handle()` to report as a worker crash.
+    """
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"content-type": "application/json", "accept": "application/json",
+                 "user-agent": "ls-rec/jobs"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read(2 << 20).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        # 429 is the one worth naming: AniList allows thirty requests a
+        # minute and says so in a header nobody reads until it bites.
+        logger.warning("harvest POST %s: HTTP %s", url, e.code)
+        return None
+    except Exception as e:
+        logger.warning("harvest POST failed: %s: %s", type(e).__name__, str(e)[:160])
+        return None
+
+
+# ── AniList's descriptions, which are two dialects in one field ────────────
+#
+# An anime's is HTML: `<i>`, `<b>`, `<br><br>` for a paragraph break. A
+# character's is AniList markdown: `__Height:__ 168 cm`, `[Denji](url)`, and a
+# `~!spoiler!~` that can hide most of a plot. Both arrive through the same
+# field, so both are handled here.
+#
+# SPOILERS ARE DROPPED, NOT UNWRAPPED. A tag row is a thing you glance at
+# while filing something else, and that is the worst possible moment to be
+# told how a show ends. The marker is explicit, so this is cheap.
+_AL_SPOIL = re.compile(r"(?s)~!.*?!~")
+_AL_BR = re.compile(r"(?i)<br\s*/?>")
+_AL_TAG = re.compile(r"(?s)<[^>]+>")
+_AL_MDLINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_AL_BOLD = re.compile(r"__([^_]+)__")
+_AL_STAT = re.compile(r"^__[^_]+:__")
+_AL_SPACE = re.compile(r"[ \t\u00a0]+")
+_AL_PUNCT = re.compile(r"\s+([.,;:!?\u2026])")
+
+
+def _al_soften(s: str) -> str:
+    """Markup out, paragraphs kept, and `__Key:__` LEFT ALONE.
+
+    That marker is the only thing telling a stat block from a sentence, and
+    converting it first is what made Makima's height into her description.
+    """
+    if not s:
+        return ""
+    s = _AL_SPOIL.sub(" ", s)
+    s = _AL_BR.sub("\n", s)
+    # Dropped rather than spaced: `<i>Frieren</i>.` must not come out as
+    # `Frieren .`. AniList uses these inline, never as block tags.
+    s = _AL_TAG.sub("", s)
+    s = (s.replace("&amp;", "&").replace("&quot;", '"')
+          .replace("&#039;", "'").replace("&lt;", "<").replace("&gt;", ">"))
+    s = _AL_SPACE.sub(" ", s)
+    return "\n".join(l.strip() for l in s.split("\n")).strip()
+
+
+def _al_inline(s: str) -> str:
+    s = _AL_MDLINK.sub(lambda m: m.group(1), s)
+    s = _AL_BOLD.sub(r"\1", s)
+    return _AL_SPACE.sub(" ", _AL_PUNCT.sub(r"\1", s)).strip()
+
+
+def _al_lead(s: str, cap: int = 1200) -> str:
+    """The first paragraph that is prose. Empty is a real answer here —
+    plenty of minor characters have no description at all."""
+    t = _al_soften(s)
+    if not t:
+        return ""
+    for para in re.split(r"\n\s*\n", t):
+        lines = [l for l in para.split("\n") if l.strip()]
+        if not lines:
+            continue
+        # Nothing but `__Key:__ value` lines is a stat sheet, not a
+        # description; the sentence a person wants is the one after it.
+        if all(_AL_STAT.match(l) for l in lines):
+            continue
+        body = _al_inline(" ".join(lines))
+        if len(body) >= 12 and " " in body:
+            return body[:cap]
+    return ""
+
+
+def _harvest_anilist(config: dict, pay: dict):
+    """An anime, or somebody in one. Which, is the tag's kind."""
+    q = str(pay.get("q") or "").strip()[:120]
+    if not q:
+        return ("failed", None, "the job names nothing to look up", None)
+    # A tag with no kind asks about a title. That is the safer default of the
+    # two: a `copyright` is what this catalogue is mostly for, and a person
+    # searched as a title returns nothing rather than returning somebody else.
+    people = str(pay.get("kind") or "").strip().lower() == "character"
+
+    doc = _post_json(ANILIST_API, {
+        "query": AL_CHARA_Q if people else AL_MEDIA_Q,
+        "variables": {"q": q, "n": AL_PAGE}})
+    if doc is None:
+        return ("failed", None, "AniList did not answer", None)
+    if doc.get("errors"):
+        first = (doc["errors"] or [{}])[0].get("message") or "it refused the query"
+        return ("failed", None, f"AniList said: {str(first)[:160]}", None)
+    page = (doc.get("data") or {}).get("Page") or {}
+    rows = page.get("characters" if people else "media") or []
+
+    out = []
+    for r in rows:
+        if people:
+            nm = r.get("name") or {}
+            names = [nm.get("full"), nm.get("native"), *(nm.get("alternative") or [])]
+            shows = [((t.get("title") or {}).get("english")
+                      or (t.get("title") or {}).get("romaji") or "")
+                     for t in ((r.get("media") or {}).get("nodes") or [])]
+            out.append({
+                "name": nm.get("full") or q,
+                "summary": _al_lead(r.get("description")),
+                "art": (r.get("image") or {}).get("large"),
+                "url": r.get("siteUrl"),
+                # What they are IN, which is the only thing that tells two
+                # people with one name apart.
+                "meta": " · ".join(s for s in dict.fromkeys(shows) if s)[:160],
+                "same": any(_fold(n) == _fold(q) for n in names if n),
+            })
+        else:
+            t = r.get("title") or {}
+            names = [t.get("romaji"), t.get("english"), t.get("native"),
+                     *(r.get("synonyms") or [])]
+            studio = next((s.get("name") for s in
+                           ((r.get("studios") or {}).get("nodes") or [])), None)
+            yr = (r.get("startDate") or {}).get("year")
+            bits = [r.get("format"), str(yr) if yr else None,
+                    f"{r['episodes']} ep" if r.get("episodes") else None,
+                    studio,
+                    f"{r['averageScore']}%" if r.get("averageScore") else None]
+            cover = r.get("coverImage") or {}
+            out.append({
+                # English where there is one, because that is what the rest of
+                # this archive's tags are written in; romaji is the fallback
+                # and is what AniList always has.
+                "name": t.get("english") or t.get("romaji") or t.get("native") or q,
+                "summary": _al_lead(r.get("description")),
+                "art": cover.get("extraLarge") or cover.get("large"),
+                "url": r.get("siteUrl"),
+                "meta": " · ".join(b for b in bits if b)[:160],
+                "same": any(_fold(n) == _fold(q) for n in names if n),
+            })
+
+    # Exact name first; AniList's own SEARCH_MATCH decides the rest, because
+    # its relevance is better than anything computable from a title here.
+    out.sort(key=lambda c: not c["same"])
+    twins = sum(1 for c in out if c["same"])
+    for c in out:
+        c["exact"] = c["same"]
+        c["twins"] = twins
+
+    logger.info("anilist %s %r: %d candidate(s)",
+                "character" if people else "anime", q, len(out))
+    return ("done", None, None, {"candidates": out, "q": q})
 
 
 def do_harvest(config: dict, job: dict):
