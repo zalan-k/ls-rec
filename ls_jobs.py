@@ -864,6 +864,12 @@ _X_TOKEN_PLACES = 24
 #  downloaded, exactly as a pasted link would be. Without this, a spoofed or
 #  compromised response is an arbitrary download with extra steps.
 _X_MEDIA_HOST = "pbs.twimg.com"
+#  A hashtag in the post's own text, for when the index does not list them.
+#  `\w` is Unicode here, which is the whole reason it is `\w` -- the tags on
+#  this archive's posts are as often Japanese as not.
+#  The lookbehind keeps three things out: a word with a hash in the middle, the
+#  `&#8230;` of an HTML entity, and the `/#anchor` of a URL.
+_X_HASHTAG_RE = re.compile(r"(?<![\w&/])#(\w{1,100})")
 
 
 def _is_x(host: str | None) -> bool:
@@ -994,26 +1000,54 @@ def x_post(url: str, *, timeout: int = 20, tries: int = 2) -> dict | None:
 def x_hashtags(doc: dict | None) -> list[str]:
     """The hashtags the post carries, in the order it carries them.
 
-    From `entities`, which is the post's own index of them, rather than from a
-    regex over the text: the endpoint has already decided where a hashtag
-    starts and ends, and the archive is about to look each one up in a table an
-    editor wrote. Guessing differently here would mean guessing differently
-    from X.
+    THE INDEX FIRST, THEN THE TEXT. `entities.hashtags` is the post's own list
+    and is the right answer when it has one: the endpoint has already decided
+    where each tag starts and ends, and reading it means not guessing
+    differently from X.
+
+    But a rule that fires on nothing is indistinguishable from a rule that is
+    wrong, and this read had three ways to come back empty on a post that
+    plainly carries tags -- the key could be `tag` rather than `text` (the
+    newer shapes spell it that way), the array could be present and empty, or
+    `entities` could be missing altogether. This endpoint is undocumented and
+    reverse-engineered, so which of those is true today is not something the
+    archive should depend on. The fallback reads the post's own text, which is
+    the thing a person looking at the post would read.
+
+    Both spellings of the item, too, for the same reason and at the cost of one
+    `or`.
 
     REMOTE DATA, and nothing downstream forgets it. Anybody can put any word in
-    a post. What nobody outside this archive can do is decide what a word
-    MEANS here -- an unmapped hashtag attaches nothing, the rule never mints,
-    and the row it lands on is waiting for review either way. Capped and
-    bounded all the same, because this is somebody else's text.
+    a post -- and the fallback widens that slightly, since a regex is a looser
+    reader than X's own index. What nobody outside this archive can do is
+    decide what a word MEANS here: an unmapped hashtag attaches nothing, the
+    rule never mints, and the row it lands on is waiting for review either way.
+    So a stray match costs nothing and a missed one costs the feature.
     """
     out: list[str] = []
-    for h in ((doc or {}).get("entities") or {}).get("hashtags") or []:
-        if not isinstance(h, dict):
-            continue
-        text = str(h.get("text") or "").strip().lstrip("#")
+
+    def keep(word) -> bool:
+        """True while there is still room."""
+        text = str(word or "").strip().lstrip("#")
         if text and len(text) <= 100 and text.lower() not in (x.lower() for x in out):
             out.append(text)
-        if len(out) >= 60:
+        return len(out) < 60
+
+    for h in ((doc or {}).get("entities") or {}).get("hashtags") or []:
+        #  A dict in every shape seen so far, but a bare string costs one line
+        #  to accept and is the obvious way for this to change.
+        word = h.get("text") or h.get("tag") if isinstance(h, dict) else h
+        if not isinstance(word, (str, type(None))):
+            continue
+        if not keep(word):
+            break
+    if out:
+        return out
+
+    #  Nothing in the index. Read the post.
+    text = (doc or {}).get("text") or (doc or {}).get("full_text") or ""
+    for m in _X_HASHTAG_RE.finditer(str(text)):
+        if not keep(m.group(1)):
             break
     return out
 
@@ -1282,9 +1316,13 @@ def do_fetch(config: dict, job: dict):
             return ("failed", None, "could not name the file safely")
         os.replace(tmp, dest)
         tags = x_hashtags(xdoc)
+        #  The WORDS and not a count. A count of zero and a count of three that
+        #  matched nothing are different problems, and the one line in the log
+        #  is where that gets noticed.
         logger.info(f"fetch {host}: {final}, {_mb(got)}"
                     + (f", {_mmss(secs)}" if secs else "")
-                    + (f", {len(tags)} hashtags" if tags else ""))
+                    + (f", hashtags: {','.join(tags)}" if tags else
+                       (", no hashtags" if xdoc else "")))
         #  Four only when there is something to say. `handle` answers in three
         #  and the loop pads it, so a post with no hashtags on it reports
         #  exactly what it did before.
@@ -1477,6 +1515,45 @@ POSTER_CAP = 8 << 20
 IGDB_FIELDS = ("name,slug,summary,first_release_date,game_type,"
                "cover.image_id,platforms.abbreviation,url,total_rating_count")
 
+# ══════════════════════════════════════════════════════════════════════════
+#  THE VTUBER WIKI
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A second catalogue, because the first one has no people in it. Asking IGDB
+# for `Tenma Maemi` returns games, and asking this wiki for `Darkwood` answers
+# `missingtitle` — they do not overlap at all, which is why the archive now
+# picks the source rather than this worker guessing from the name.
+#
+# TWO REQUESTS FOR A WHOLE LOOKUP, and getting there took three probes against
+# the live site:
+#
+#   · `prop=extracts` IS NOT INSTALLED HERE. Fandom answers "Unrecognized
+#     value for parameter prop: extracts" and ignores exintro/explaintext.
+#     That is the route `_harvest_wiki` below takes, and it is why reading
+#     this wiki with that function returns nothing — it works against
+#     Wikipedia and silently finds no text here.
+#   · `action=parse&section=0` renders the lead, but the lead section of a
+#     VTuber page is a hatnote, a tab bar and an infobox — the prose is in
+#     there but behind a nested `portable-infobox`, and it is one request PER
+#     PAGE, so eight candidates is eight requests at somebody else's expense.
+#   · `prop=revisions&rvsection=0` hands back the raw wikitext for up to
+#     FIFTY titles in one request, and that text carries the lead paragraph
+#     AND the infobox. So: one search, one read.
+#
+# `prop=pageimages` does work, and returns a portrait for every hit. The
+# infobox's own `image1` is not used: on at least one live page it is a
+# `<gallery>` block rather than a filename.
+VTUBER_API = "https://virtualyoutuber.fandom.com/api.php"
+VTUBER_ART_HOSTS = ("static.wikia.nocookie.net",)
+# Eight from the search, because this one is full-text and loose: asking for
+# one person returns their Gallery subpage, their Discography subpage, and a
+# few people who merely mention them. The filtering is below.
+VT_SEARCH = 8
+# Titles per wikitext request. The API's own ceiling is 50 for an
+# unprivileged reader; we never approach it, and the constant is here so a
+# future caller does not discover the limit by being refused.
+VT_TITLES = 50
+
 # `game_type`, and NOT the `category` this was first written against. category
 # is deprecated and simply stops being returned, which does not read as an
 # error — every row came back `None` and that looked exactly like "these are
@@ -1587,6 +1664,280 @@ def _get_json(url: str, timeout: int = 30):
         return None
 
 
+# ── wikitext, because this wiki serves no extracts ─────────────────────────
+#
+# Lossy on purpose and nothing here fetches anything. Tested against real
+# section-0 text from live pages (test_vtuber.py), which is the only kind of
+# fixture worth having here: the two shapes this feature was shelved over were
+# both "what the wiki actually returns is not what we assumed".
+
+# What goes under a candidate's name to tell twins apart, in the order it
+# reads. `affiliation` is the one that earns its place — several people on
+# this wiki share a given name and almost none share an agency.
+VT_META = ("affiliation", "debut_date", "gender")
+
+
+def _tpl_end(s: str, i: int) -> int:
+    r"""Index just past the `}}` closing the `{{` at `i`, or len(s).
+
+    Balanced, and that is not fussiness: the Character template on a real page
+    contains `<ref>{{link|url=...}}</ref>` inside its fields, so a non-greedy
+    `\{\{.*?\}\}` ends at the first INNER `}}` and leaves half an infobox
+    looking like prose.
+    """
+    depth, n = 0, len(s)
+    while i < n:
+        if s.startswith("{{", i):
+            depth += 1
+            i += 2
+        elif s.startswith("}}", i):
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return n
+
+
+def _tpl_fields(body: str):
+    """`|name = value` parts at the template's own depth.
+
+    Splitting on `|` would cut inside `[https://x y]`, inside a nested
+    `{{link|url=...}}` and inside `[[Page|text]]` — all three are in the first
+    real page this was run against.
+    """
+    out, buf, depth, brack = [], [], 0, 0
+    i, n = 0, len(body)
+    while i < n:
+        two = body[i:i + 2]
+        if two in ("{{", "[["):
+            depth += 1
+            buf.append(two)
+            i += 2
+            continue
+        if two in ("}}", "]]"):
+            depth -= 1
+            buf.append(two)
+            i += 2
+            continue
+        c = body[i]
+        if c == "[":
+            brack += 1
+        elif c == "]":
+            brack -= 1
+        if c == "|" and depth <= 0 and brack <= 0:
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+        i += 1
+    out.append("".join(buf))
+    return out
+
+
+# Order matters: refs and nowiki come out before templates, because a ref
+# CONTAINS a template and removing the template first leaves `<ref></ref>`.
+_VT_REF = re.compile(r"(?is)<ref\b[^>]*?/>|<ref\b.*?</ref>")
+_VT_NOWIKI = re.compile(r"(?is)</?nowiki>")
+_VT_GALLERY = re.compile(r"(?is)<gallery\b.*?</gallery>")
+_VT_STRIKE = re.compile(r"(?is)<s>.*?</s>")
+_VT_BR = re.compile(r"(?i)<br\s*/?>")
+_VT_TAG = re.compile(r"(?s)<[^>]+>")
+_VT_EXTLINK = re.compile(r"\[(?:https?:)?//[^\s\]]+\s+([^\]]*)\]")
+_VT_BARELINK = re.compile(r"\[(?:https?:)?//[^\s\]]+\]")
+_VT_WIKILINK = re.compile(r"\[\[([^\]\|]+)(?:\|([^\]]*))?\]\]")
+_VT_QUOTES = re.compile(r"\'{2,5}")
+_VT_SEPRUN = re.compile(r"(?:\s*·\s*){2,}")
+_VT_FILE = re.compile(r"(?i)\[\[\s*(category|file|image)\s*:")
+
+
+def _vt_plain(s: str) -> str:
+    """Wikitext to something a person reads."""
+    if not s:
+        return ""
+    s = _VT_REF.sub(" ", s)
+    s = _VT_GALLERY.sub(" ", s)
+    # Struck-through text is the wiki saying "not this any more" — one live
+    # page gives a height as `<s>13 cm</s> 130 cm`. Keeping it seeds a
+    # contradiction into a description nobody will re-read.
+    s = _VT_STRIKE.sub(" ", s)
+    s = _VT_NOWIKI.sub("", s)
+    s = _VT_BR.sub(" · ", s)
+    i = 0
+    while True:
+        j = s.find("{{", i)
+        if j < 0:
+            break
+        s = s[:j] + " " + s[_tpl_end(s, j):]
+        i = j
+    s = _VT_EXTLINK.sub(r"\1", s)
+    s = _VT_BARELINK.sub("", s)
+    s = _VT_WIKILINK.sub(lambda m: (m.group(2) or m.group(1)), s)
+    s = _VT_QUOTES.sub("", s)
+    s = _VT_TAG.sub(" ", s)
+    s = (s.replace("&nbsp;", " ").replace("&#160;", " ")
+          .replace("&amp;", "&").replace("&quot;", '"'))
+    s = re.sub(r"[ \t\u00a0]+", " ", s)
+    # A struck value at the end of a field leaves `130 cm ·` behind: collapse
+    # the runs and drop the ends rather than leaving punctuation standing in
+    # for text that was deliberately removed.
+    s = _VT_SEPRUN.sub(" · ", s)
+    return s.strip(" ·\t\n")
+
+
+def _vt_infobox(wikitext: str, name: str = "Character") -> dict:
+    """The named template's fields, as plain text. {} if it has none."""
+    m = re.search(r"\{\{\s*" + name + r"\s*[\|\n]", wikitext, re.I)
+    if not m:
+        return {}
+    start = wikitext.rindex("{{", 0, m.end())
+    body = wikitext[start + 2:_tpl_end(wikitext, start) - 2]
+    # GALLERIES AND REFS COME OUT BEFORE THE FIELDS ARE SPLIT, not after.
+    # Both contain bare `|` at the template's own depth — `<gallery>a.png|Main
+    # </gallery>` is a real value of a real `image1` field — so splitting
+    # first cuts a field in half and leaves the back of it looking like the
+    # next field. Caught by the gallery fixture; the ref case is the same
+    # shape and was only working by luck, because its pipes happened to sit
+    # inside a `{{link}}` the depth counter was already tracking.
+    body = _VT_GALLERY.sub(" ", _VT_REF.sub(" ", body))
+    fields = {}
+    for part in _tpl_fields(body)[1:]:          # [0] is the template's name
+        if "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k = k.strip().lower()
+        if k:
+            fields[k] = _vt_plain(v)
+    return fields
+
+
+def _vt_lead(wikitext: str, cap: int = 1200) -> str:
+    """The first real paragraph, every leading template walked past."""
+    s = wikitext.lstrip()
+    while s.startswith("{{"):
+        s = s[_tpl_end(s, 0):].lstrip()
+    for para in re.split(r"\n\s*\n", s):
+        para = para.strip()
+        # BY WHAT THE LINE IS, not by how long it is. A length floor was the
+        # first rule here and it was wrong: a stub page whose whole lead is
+        # "X is a Virtual YouTuber." is a lead, and it would have been thrown
+        # away for exactly the tag that needs it most. The hatnotes it was
+        # meant to catch are not paragraphs in wikitext at all — they are
+        # templates, and the loop above has already walked past them.
+        if not para or para.startswith(("==", "*", "#", "|", "!", "<gallery")):
+            continue
+        if _VT_FILE.match(para):
+            continue
+        text = _vt_plain(para)
+        # Low enough to reject a stray word or a leftover separator, never a
+        # sentence.
+        if len(text) >= 12 and " " in text:
+            return text[:cap]
+    return ""
+
+
+def _harvest_vtuber(config: dict, pay: dict):
+    """Who the VTuber wiki has under a name. Never a verdict, always a list."""
+    q = str(pay.get("q") or "").strip()[:120]
+    if not q:
+        return ("failed", None, "the job names nothing to look up", None)
+
+    # 1. WHO IS THERE. Full-text search, so this is loose on purpose and the
+    #    filtering happens below rather than in the query.
+    hits = _get_json(VTUBER_API + "?" + urllib.parse.urlencode({
+        "action": "query", "format": "json", "formatversion": "2",
+        "redirects": "1", "generator": "search", "gsrsearch": q,
+        "gsrlimit": str(VT_SEARCH), "gsrnamespace": "0",
+        "prop": "pageimages|info", "inprop": "url",
+        "piprop": "thumbnail", "pithumbsize": "600",
+    }))
+    if hits is None:
+        return ("failed", None, "the wiki did not answer", None)
+    pages = ((hits.get("query") or {}).get("pages") or [])
+    if isinstance(pages, dict):          # formatversion=1, if it ever regresses
+        pages = list(pages.values())
+
+    # SUBPAGES ARE DROPPED HERE and not demoted. `Tenma Maemi/Gallery` and
+    # `.../Discography` come back for every person searched and neither is
+    # ever a tag; they also carry no Character template, so they would be
+    # bottom-ranked anyway. Dropping them is what makes a list of eight hits
+    # readable.
+    keep = [p for p in pages if p.get("title") and "/" not in p["title"]]
+    if not keep:
+        logger.info("vtuber %r: nothing", q)
+        return ("done", None, None, {"candidates": [], "q": q})
+
+    # 2. WHAT THEY SAY, every one of them in a single request.
+    titles = [p["title"] for p in keep][:VT_TITLES]
+    doc = _get_json(VTUBER_API + "?" + urllib.parse.urlencode({
+        "action": "query", "format": "json", "formatversion": "2",
+        "redirects": "1", "prop": "revisions", "rvprop": "content",
+        "rvslots": "main", "rvsection": "0", "titles": "|".join(titles),
+    }))
+    text = {}
+    for p in ((doc or {}).get("query") or {}).get("pages") or []:
+        rev = (p.get("revisions") or [{}])[0]
+        body = ((rev.get("slots") or {}).get("main") or {}).get("content") or ""
+        if p.get("title"):
+            text[p["title"]] = body
+    # A missing second answer is a thinner list, not a failed lookup: the
+    # titles, the links and the portraits are already in hand.
+    if doc is None:
+        logger.warning("vtuber %r: no wikitext, candidates will be bare", q)
+
+    out = []
+    for p in keep:
+        title = p["title"]
+        wt = text.get(title, "")
+        box = _vt_infobox(wt)
+        out.append({
+            "name": box.get("title1") or title,
+            "summary": _vt_lead(wt),
+            "art": ((p.get("thumbnail") or {}).get("source")) or None,
+            "url": p.get("fullurl"),
+            "meta": " · ".join(box[f] for f in VT_META if box.get(f))[:160],
+            "same": _fold(box.get("title1") or title) == _fold(q),
+            "_box": 0 if box else 1,
+        })
+
+    # Exact name first, then the pages that are actually about a character.
+    # Search order decides the rest, because the wiki's relevance is better
+    # than anything this worker could compute from a title.
+    out.sort(key=lambda c: (not c["same"], c["_box"]))
+    twins = sum(1 for c in out if c["same"])
+    for c in out:
+        c["exact"] = c["same"]
+        c["twins"] = twins
+        c.pop("_box", None)
+
+    logger.info("vtuber %r: %d candidate(s) of %d hit(s)", q, len(out), len(pages))
+    return ("done", None, None, {"candidates": out, "q": q})
+
+
+# ── which catalogue a search goes to ───────────────────────────────────────
+#
+# A TABLE AND NOT A BRANCH, because there are two more coming — anime and
+# non-VTuber characters — and because the archive draws a picker from its own
+# copy of this list. The ids are the contract between the two; test_vtuber.py
+# asserts this end and the archive's `srcparity` suite asserts the other.
+HARVEST_SOURCES = {
+    "igdb": {"label": "IGDB", "search": lambda c, p: _harvest_search(c, p),
+             "art_hosts": IGDB_ART_HOSTS},
+    "vtuber": {"label": "VTuber Wiki", "search": lambda c, p: _harvest_vtuber(c, p),
+               "art_hosts": VTUBER_ART_HOSTS},
+}
+# What a payload with no `source` means. Every job the archive queued before
+# the picker existed is an IGDB search, so this is back-compatibility and not
+# a preference — the archive sends one explicitly now.
+DEFAULT_SOURCE = "igdb"
+
+
+def _source(pay: dict) -> str:
+    s = str(pay.get("source") or "").strip().lower()
+    return s if s in HARVEST_SOURCES else DEFAULT_SOURCE
+
+
 def do_harvest(config: dict, job: dict):
     """Three errands on one kind. Returns (status, result_path, error, findings).
 
@@ -1613,7 +1964,10 @@ def do_harvest(config: dict, job: dict):
     if str(pay.get("art_url") or "").strip():
         return _harvest_art(config, pay)
     if str(pay.get("q") or "").strip():
-        return _harvest_search(config, pay)
+        # WHICH CATALOGUE, from the payload. A name is not enough to tell:
+        # `Mio` is a person on one wiki and a game on the other, and the
+        # archive knows which kind of tag the person pressed the button on.
+        return HARVEST_SOURCES[_source(pay)]["search"](config, pay)
     return _harvest_wiki(config, pay, job)
 
 
@@ -1691,8 +2045,17 @@ def _harvest_art(config: dict, pay: dict):
     url = str(pay.get("art_url") or "").strip()
     rel = str(pay.get("art_to") or "").strip()
     host = urllib.parse.urlparse(url).hostname or ""
+    # THE SOURCE'S OWN HOSTS, narrowed when the archive says which source the
+    # picture came from. A job queued before the picker existed carries no
+    # `source`, and widening to every registered host for those is the only
+    # thing that keeps an in-flight cover working across the deploy — new
+    # jobs are narrowed to the one CDN their catalogue serves from.
+    if str(pay.get("source") or "").strip().lower() in HARVEST_SOURCES:
+        allowed = HARVEST_SOURCES[_source(pay)]["art_hosts"]
+    else:
+        allowed = tuple(h for s in HARVEST_SOURCES.values() for h in s["art_hosts"])
     if not url.lower().startswith("https://") or not any(
-            host == h or host.endswith("." + h) for h in IGDB_ART_HOSTS):
+            host == h or host.endswith("." + h) for h in allowed):
         return ("failed", None, "this worker does not fetch pictures from there", None)
     target = resolve_name(media_root(config), rel)
     if not target or not re.fullmatch(r"posters/[0-9A-HJKMNP-TV-Z]{26}\.(jpg|png)", rel):
