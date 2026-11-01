@@ -1512,6 +1512,47 @@ IGDB_ART_HOSTS = ("images.igdb.com",)
 # else cannot become this worker's disk problem.
 POSTER_CAP = 8 << 20
 
+# ── WHAT A POSTER MAY BE, AND WHAT IT IS THEREFORE CALLED ──────────────────
+#
+# The same four the archive's own `POSTER_KINDS` can serve, in the same order,
+# and this worker was two of them. That asymmetry was invisible for as long as
+# IGDB was the only catalogue — it serves JPEG and nothing else — and it
+# became the whole feature the day a second one arrived:
+# `static.wikia.nocookie.net` answers WEBP whatever you ask it for. Measured
+# against the live CDN with four different header sets, scaled and unscaled:
+# `image/webp` every time, `Accept: image/png,image/jpeg` included.
+#
+# THE EXTENSION COMES FROM HERE AND NOWHERE ELSE. The archive mints the name —
+# a ULID, because names in the media tree are its to mint — and it has to do
+# that BEFORE anyone has seen a byte, so the extension it guesses is a guess.
+# This keeps the archive's stem and corrects its extension, and the path that
+# comes back is the path that was written. `harvestLanded` at the other end
+# matches on the stem for exactly this reason.
+#
+# A file named for what it is rather than for what its sender claimed is also
+# the only safe thing to serve: the archive serves by extension, so a WEBP
+# called `.png` would go out as `image/png`.
+POSTER_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8", ".jpg"),
+    # RIFF, four bytes of length, THEN the format — a prefix test alone takes
+    # any RIFF container, and a .wav would pass as a picture.
+    (None, ".webp"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+
+def _poster_ext(blob: bytes):
+    """The extension these bytes deserve, or None if it is not a picture."""
+    for magic, ext in POSTER_MAGIC:
+        if magic is None:
+            if len(blob) >= 12 and blob[:4] == b"RIFF" and blob[8:12] == b"WEBP":
+                return ext
+        elif blob.startswith(magic):
+            return ext
+    return None
+
 IGDB_FIELDS = ("name,slug,summary,first_release_date,game_type,"
                "cover.image_id,platforms.abbreviation,url,total_rating_count")
 
@@ -2057,8 +2098,36 @@ def _harvest_art(config: dict, pay: dict):
     if not url.lower().startswith("https://") or not any(
             host == h or host.endswith("." + h) for h in allowed):
         return ("failed", None, "this worker does not fetch pictures from there", None)
+    # THE STEM IS THE ARCHIVE'S, THE EXTENSION IS THE BYTES'. What the archive
+    # sent is a whole filename, but it chose that extension before anything had
+    # been fetched, so only the ULID half of it is a decision anybody could
+    # have made correctly. Checked rather than trusted either way: a stem that
+    # is not a ULID is a worker being asked to write somewhere it was not sent.
+    named = re.fullmatch(r"posters/([0-9A-HJKMNP-TV-Z]{26})\.(jpe?g|png|webp|gif)", rel)
+    if not named:
+        return ("failed", None, "the archive named a file this worker will not write", None)
+    stem = named.group(1)
+    req = urllib.request.Request(url, headers={"user-agent": "ls-rec/jobs"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            blob = r.read(POSTER_CAP + 1)
+    except Exception as e:
+        return ("failed", None, f"could not fetch the cover: {type(e).__name__}", None)
+    if not blob:
+        return ("failed", None, "the cover came back empty", None)
+    if len(blob) > POSTER_CAP:
+        return ("failed", None, f"that cover is over {_mb(POSTER_CAP)}", None)
+    # The bytes decide, not the extension and not the content-type — both of
+    # those are things the sender says, and the archive will serve this file by
+    # the name it now holds. This comment was here before the code did it.
+    ext = _poster_ext(blob)
+    if not ext:
+        return ("failed", None,
+                "that is not a picture this archive can serve — PNG, JPEG, WEBP "
+                "or GIF", None)
+    rel = f"posters/{stem}{ext}"
     target = resolve_name(media_root(config), rel)
-    if not target or not re.fullmatch(r"posters/[0-9A-HJKMNP-TV-Z]{26}\.(jpg|png)", rel):
+    if not target:
         return ("failed", None, "the archive named a file this worker will not write", None)
 
     # Named, and caught. Under `ProtectSystem=strict` the unit only gets to
@@ -2075,21 +2144,6 @@ def _harvest_art(config: dict, pay: dict):
                 f"ls-jobs runs under ProtectSystem=strict, that directory needs "
                 f"a ReadWritePaths entry", None)
     part = target + ".part"
-    req = urllib.request.Request(url, headers={"user-agent": "ls-rec/jobs"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            blob = r.read(POSTER_CAP + 1)
-    except Exception as e:
-        return ("failed", None, f"could not fetch the cover: {type(e).__name__}", None)
-    if not blob:
-        return ("failed", None, "the cover came back empty", None)
-    if len(blob) > POSTER_CAP:
-        return ("failed", None, f"that cover is over {_mb(POSTER_CAP)}", None)
-    # The bytes decide, not the extension and not the content-type — both of
-    # those are things the sender says, and the archive will serve this file by
-    # the name it now holds.
-    if not (blob[:2] == b"\xff\xd8" or blob[:8] == b"\x89PNG\r\n\x1a\n"):
-        return ("failed", None, "that is not a JPEG or a PNG", None)
     try:
         with open(part, "wb") as fh:
             fh.write(blob)
