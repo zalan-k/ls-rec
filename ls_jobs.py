@@ -1079,6 +1079,34 @@ def x_own_media(doc: dict | None) -> set[str] | None:
     return out
 
 
+def x_thin(doc: dict | None) -> bool:
+    """True when the document in hand is NO ANSWER, rather than an answer of
+    nothing.
+
+    THE DISTINCTION B54 MISSED. The up-front ask is brief and single-token,
+    and roughly one post in twenty comes back as a 200 carrying incomplete
+    JSON — a dict, no `mediaDetails`, nothing anybody here reads. It is not a
+    tombstone, so `_x_status` hands it back; `x_own_media` then answers with
+    an empty set, which is falsy, so the photo road is correctly skipped. What
+    was NOT correct is the road after it: re-asking only when `xdoc is None`
+    reads such a document as "asked and answered", and a picture post whose
+    first ask was thin ends up reporting yt-dlp's missing video.
+
+    SO THE GUARD IS ABOUT WHAT THE DOCUMENT SAYS, not whether one exists.
+    `mediaDetails` and `entities.hashtags` are the two things read out of a
+    post anywhere in this file; a document with neither has told us nothing
+    we asked for.
+
+    A GENUINE TEXT-ONLY POST WITH NO TAGS IS THIN BY THIS TEST and will be
+    asked for a second time on the failure road. That is one extra request on
+    a job that has already failed, which is the cheap side of this trade — the
+    expensive side is the one that was shipped.
+    """
+    if not isinstance(doc, dict):
+        return True
+    return not doc.get("mediaDetails") and not (doc.get("entities") or {}).get("hashtags")
+
+
 def x_pictures_in(doc: dict | None, url: str) -> tuple[list[str], str | None]:
     """Every picture on a post already in hand, biggest size -- or why not.
 
@@ -1264,7 +1292,10 @@ def do_fetch(config: dict, job: dict):
         #  function had yesterday. A slow endpoint must not add forty seconds
         #  to every video pull to protect a case that will fall back
         #  correctly anyway. The patient ask is still down on the failure
-        #  road, where it IS the last hope, and `xdoc is None` sends it there.
+        #  road, where it IS the last hope, and `x_thin` sends it there — a
+        #  document that NAMES NOTHING is no answer, and reading one as an
+        #  answer is what made a picture post report a missing video. See
+        #  `x_thin`, which is B54's correction and not a tidy-up.
         #  AND NOT FOR A DIRECT HOST, which names a file rather than a post —
         #  `x_post` would answer None after parsing the path for a `/status/`
         #  that is not there, which is correct and is still a question worth
@@ -1331,8 +1362,13 @@ def do_fetch(config: dict, job: dict):
                 #  post has PICTURES on it as that anything went wrong. That is
                 #  a question yt-dlp cannot answer -- it has no image support
                 #  at all -- and the embed endpoint can.
-                if _is_x(host) and xdoc is None:
-                    xdoc = x_post(url)
+                #  THIN, NOT MERELY ABSENT. The brief ask up top can answer
+                #  with a document that says nothing at all, and `xdoc is
+                #  None` read that as asked-and-answered — which skipped the
+                #  one ask that was going to work. `or xdoc` keeps what we had
+                #  when the second ask does no better, so this can only add.
+                if _is_x(host) and x_thin(xdoc):
+                    xdoc = x_post(url) or xdoc
                 pic, why = x_pictures_in(xdoc, url) if xdoc else ([], None)
                 if why:
                     return ("failed", None, why)
@@ -1358,8 +1394,12 @@ def do_fetch(config: dict, job: dict):
                 #  -- except the post's words, which are a bonus on a job that
                 #  has already succeeded. One try and a short timeout: the
                 #  next job should not wait on a nicety.
-                if _is_x(host) and xdoc is None:
-                    xdoc = x_post(url, timeout=8, tries=1)
+                #  The same correction on the bonus road: a thin document
+                #  means the hashtags were never read either, and asking
+                #  again costs one brief request on a job that has already
+                #  succeeded.
+                if _is_x(host) and x_thin(xdoc):
+                    xdoc = x_post(url, timeout=8, tries=1) or xdoc
 
         ext = os.path.splitext(tmp)[1].lower()
         if ext not in KEEP_EXT:
