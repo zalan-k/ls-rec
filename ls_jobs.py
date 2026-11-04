@@ -1052,6 +1052,33 @@ def x_hashtags(doc: dict | None) -> list[str]:
     return out
 
 
+def x_own_media(doc: dict | None) -> set[str] | None:
+    """What kinds of media are on the post ITSELF: `photo`, `video`,
+    `animated_gif`, or several. `None` means the document could not be read
+    and nothing is being claimed; an empty set means a post carrying no media
+    at all, which is a real answer and a different one.
+
+    `mediaDetails` IS THE POST'S OWN, and the media of a post it QUOTES are
+    not in it. That distinction is the entire reason this exists. yt-dlp does
+    not make it and cannot be asked to: it has no image support, so "is there
+    media here" means "is there a video anywhere on this page", and a picture
+    post quoting a video post answers yes. Reported as exactly that — linking
+    the picture downloaded the quoted video.
+
+    A SET AND NOT A BOOLEAN, because the cases are three rather than two. All
+    photos is the road yt-dlp must not be asked about; anything moving is its
+    road and always was; and a post carrying both is one where the photo road
+    would silently drop the video, so it goes to yt-dlp like any other.
+    """
+    if not isinstance(doc, dict):
+        return None
+    out = set()
+    for m in (doc.get("mediaDetails") or []):
+        if isinstance(m, dict) and m.get("type"):
+            out.add(str(m["type"]))
+    return out
+
+
 def x_pictures_in(doc: dict | None, url: str) -> tuple[list[str], str | None]:
     """Every picture on a post already in hand, biggest size -- or why not.
 
@@ -1222,11 +1249,54 @@ def do_fetch(config: dict, job: dict):
     xdoc = None
 
     try:
+        #  ── WHAT THIS POST ITSELF HAS, ASKED BEFORE ANY DOWNLOADER ───────
+        #  Not an optimisation: it is the only way to tell a picture post
+        #  apart from a picture post that QUOTES a video, and asked after the
+        #  fact there is nothing to tell them apart WITH — yt-dlp will have
+        #  already succeeded on the quoted video. See `x_own_media`.
+        #  THE SAME DOCUMENT THE HASHTAGS ALREADY NEEDED, so this is a reorder
+        #  and not a new request: it was fetched on the success path and on
+        #  the failure path before, just too late to decide anything.
+        #  BRIEFLY, AND THE SAME EIGHT SECONDS THE HASHTAGS ASKED FOR. The
+        #  first version made this patient on the grounds that a decision now
+        #  rests on it — and that is the wrong trade, because the cost of not
+        #  getting an answer here is not a wrong answer, it is the order this
+        #  function had yesterday. A slow endpoint must not add forty seconds
+        #  to every video pull to protect a case that will fall back
+        #  correctly anyway. The patient ask is still down on the failure
+        #  road, where it IS the last hope, and `xdoc is None` sends it there.
+        #  AND NOT FOR A DIRECT HOST, which names a file rather than a post —
+        #  `x_post` would answer None after parsing the path for a `/status/`
+        #  that is not there, which is correct and is still a question worth
+        #  not asking.
+        own = None
+        if _is_x(host) and host not in DIRECT_HOSTS:
+            xdoc = x_post(url, timeout=8, tries=1)
+            own = x_own_media(xdoc)
+
         if host in DIRECT_HOSTS:
             # No page to parse and no duration to ask for: the ceiling is
             # bytes, and the duration is checked once the file is here.
             tmp = stem + _direct_ext(url)
             err = _direct_download(url, tmp, max_bytes, timeout)
+            if err:
+                return ("failed", None, err)
+        elif own and own <= {"photo"}:
+            #  THE POST IS PICTURES, SO YT-DLP IS NEVER ASKED. It would answer
+            #  about the quoted post and be believed, which is the bug this
+            #  branch exists for. `x_pictures_in` still decides WHICH picture
+            #  — a post with four of them wants the one that was tapped, and
+            #  that rule has not moved.
+            pic, why = x_pictures_in(xdoc, url)
+            if why:
+                return ("failed", None, why)
+            if not pic:
+                #  The document named photos and then listed none this worker
+                #  could use. Saying so beats falling through to a downloader
+                #  that will come back talking about videos.
+                return ("failed", None, "that post's pictures could not be read")
+            tmp = stem + _direct_ext(pic[0])
+            err = _direct_download(pic[0], tmp, max_bytes, timeout)
             if err:
                 return ("failed", None, err)
         else:
@@ -1261,7 +1331,7 @@ def do_fetch(config: dict, job: dict):
                 #  post has PICTURES on it as that anything went wrong. That is
                 #  a question yt-dlp cannot answer -- it has no image support
                 #  at all -- and the embed endpoint can.
-                if _is_x(host):
+                if _is_x(host) and xdoc is None:
                     xdoc = x_post(url)
                 pic, why = x_pictures_in(xdoc, url) if xdoc else ([], None)
                 if why:
@@ -1288,7 +1358,7 @@ def do_fetch(config: dict, job: dict):
                 #  -- except the post's words, which are a bonus on a job that
                 #  has already succeeded. One try and a short timeout: the
                 #  next job should not wait on a nicety.
-                if _is_x(host):
+                if _is_x(host) and xdoc is None:
                     xdoc = x_post(url, timeout=8, tries=1)
 
         ext = os.path.splitext(tmp)[1].lower()
