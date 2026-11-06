@@ -71,9 +71,21 @@ GOOD_Z = 5.0
 PROBE_AT = (0.25, 0.75)
 PROBE_S = 60.0
 
-#  Beyond this the two probes are not measuring one constant offset, so there
-#  is a cut or a drift between them and a single number would be a lie.
-MAX_DRIFT_S = 2.0
+#  A CUT IS AN EVENT AND DRIFT IS A RATE, so the disagreement between the two
+#  probes is judged as parts per million of the distance between them rather
+#  than as seconds. The first real pair measured -- two independent captures
+#  of one broadcast, Twitch against YouTube -- disagreed by 2.0s over 5,599s,
+#  which is 360 ppm: ordinary drift between two capture clocks, or a couple of
+#  dropped seconds. A ten-second CUT over the same separation is 1,800 ppm and
+#  a ninety-second one is 16,000. An absolute threshold cannot tell those
+#  apart; this one has a factor of five in hand.
+#
+#  ONE REAL PAIR, which is the same caveat CHATCLOCK.md makes about its own
+#  numbers and for the same reason: re-measure before treating 900 as tuned.
+MAX_DRIFT_PPM = 900.0
+#  And a floor, so a short probe separation cannot make a large absolute
+#  disagreement look like a small rate.
+MAX_DRIFT_S = 30.0
 
 
 def envelope(path: str, start_s: float | None = None,
@@ -183,15 +195,18 @@ def sync(local_path: str, archive_path: str, local_dur_s: float,
 
     deltas = [s["delta_s"] for s in seen]
     drift = round(max(deltas) - min(deltas), 3)
+    apart = abs(seen[-1]["local_s"] - seen[0]["local_s"])
+    ppm = round(drift / apart * 1e6, 1) if apart > 0 else float("inf")
     worst_z = min(s["z"] for s in seen)
     delta = round(float(n.median(deltas)), 3)
 
-    out = {"ok": True, "delta_s": delta, "drift_s": drift,
+    out = {"ok": True, "delta_s": delta, "drift_s": drift, "drift_ppm": ppm,
            "z": round(worst_z, 2), "probes": seen,
-           #  THE DISAGREEMENT IS THE ERROR BAR. Half the spread between two
-           #  probes an hour apart is a measurement of how much this offset
-           #  can be wrong; a constant here would have been a guess wearing a
-           #  number's clothes.
+           #  THE DISAGREEMENT IS THE ERROR BAR, and the median is what makes
+           #  half of it the right figure: anchoring between the two probes
+           #  puts the middle of the file on the mark, so the worst case is at
+           #  the ends and is half the spread. A constant here would have been
+           #  a guess wearing a number's clothes.
            "error_s": round(max(drift / 2, 1 / ENV_HZ), 3)}
 
     good = [s for s in seen if s["z"] >= GOOD_Z]
@@ -210,12 +225,13 @@ def sync(local_path: str, archive_path: str, local_dur_s: float,
             "only one end of the recording is in that upload, so the offset "
             "below is a single measurement with nothing to check it against "
             "— the upload is probably trimmed past it, or ends early"))
-    elif drift > MAX_DRIFT_S:
+    elif drift > MAX_DRIFT_S or ppm > MAX_DRIFT_PPM:
         #  Not a failure of the method: this is the method REPORTING the thing
         #  that would otherwise have corrupted every timestamp on the entry.
         out.update(ok=False, why=(
-            f"the two ends disagree by {drift:.1f}s, so the upload is cut or "
-            f"re-timed somewhere in the middle rather than simply trimmed"))
+            f"the two ends disagree by {drift:.1f}s over {apart / 60:.0f} minutes "
+            f"({ppm:.0f} ppm), which is too much to be two clocks drifting — the "
+            f"upload is cut or re-timed somewhere in the middle"))
     return out
 
 

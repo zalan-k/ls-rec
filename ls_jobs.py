@@ -3292,9 +3292,13 @@ def do_vodsync(config: dict, job: dict):
             got = sorted(glob.glob(os.path.join(td, "arc.*")))
             got = [f for f in got if os.path.getsize(f) > 0]
             if not got:
-                why = (r.stderr or r.stdout or "").strip().splitlines()
+                #  `_tail` rather than the last line by hand: it is what every
+                #  other handler reports a yt-dlp refusal with, it strips the
+                #  ERROR: prefix, and it is the sentence somebody who pasted
+                #  the link can actually act on.
+                why = _tail((r.stderr or "") + "\n" + (r.stdout or ""))
                 return ("failed", None,
-                        f"could not fetch that upload's audio: {why[-1] if why else 'no reason given'}",
+                        f"could not fetch that upload's audio: {why or 'no reason given'}",
                         None)
             out = ls_sync.sync(src, got[0], dur)
     except subprocess.TimeoutExpired:
