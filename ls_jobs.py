@@ -57,6 +57,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -3228,11 +3229,91 @@ def do_pull(config: dict, job: dict):
              "files": out["files"], "why": out.get("why")})
 
 
+def do_vodsync(config: dict, job: dict):
+    """Where our recording sits inside somebody else's upload of it.
+
+    Returns (status, result_path, error, found). No file is produced and
+    nothing is written anywhere the archive can see: the product is a number
+    and the measurements behind it.
+
+    WHY THIS EXISTS. Twitch drops a broadcast after sixty days. When the only
+    surviving copy is an archive channel's re-upload, that upload has an
+    unknown amount trimmed off its head — and nothing free says how much. The
+    filename is theirs, not ours; a re-upload carries no chat of its own; so
+    the ladder in the archive's CHATCLOCK.md has no rung here. The audio is
+    the only witness the two files share.
+
+    THE WHOLE THING IS DOWNLOADED, audio only. Fetching just the two windows
+    with --download-sections would save bandwidth and cost the search: with
+    the whole upload in hand the probe is looked for across all of it, so
+    nothing has to be assumed about where the overlap starts. Audio of a
+    four-hour stream is a couple of hundred megabytes and it is deleted on the
+    way out.
+
+    A REFUSAL IS STILL A MEASUREMENT, so it comes back `done` with its numbers
+    rather than `failed` with a sentence. "The two ends disagree by ninety
+    seconds" tells somebody the upload has a cut in it; a failure would throw
+    that away. Only the things that stop a measurement happening — no url, no
+    file, nothing downloadable — are failures.
+    """
+    pay = job.get("payload") or {}
+    url = str(pay.get("url") or "").strip()
+    if not url:
+        return ("failed", None, "a sync needs the upload's url", None)
+
+    src = resolve_name(media_root(config), pay.get("path"))
+    if not src:
+        return ("failed", None, "the archive named a file this worker will not touch", None)
+    if not os.path.isfile(src):
+        return ("failed", None, "that recording is not on this recorder's mount", None)
+    try:
+        dur = float(pay.get("duration_s"))
+    except (TypeError, ValueError):
+        dur = 0.0
+    if dur <= 0:
+        return ("failed", None, "the archive did not say how long that recording is", None)
+
+    try:
+        import ls_sync
+    except Exception as e:                                   # pragma: no cover
+        return ("failed", None, f"this recorder cannot measure audio yet: {e}", None)
+
+    #  NOT /tmp. On a Pi that is often RAM, and this writes a couple of
+    #  hundred megabytes. The quarantine volume is the one place this worker
+    #  is allowed to write and has room; the dot keeps the working directory
+    #  out of anything that lists that folder.
+    scratch = quarantine_dir(config) or os.path.dirname(src)
+    timeout = max(300, int(setting(config, "archive_music_timeout_s") or 900))
+    try:
+        with tempfile.TemporaryDirectory(prefix=".vodsync-", dir=scratch) as td:
+            r = _ytdlp_run(config, ["-f", "bestaudio/best", "--no-playlist",
+                                    "-o", os.path.join(td, "arc.%(ext)s"), url],
+                           timeout=timeout)
+            got = sorted(glob.glob(os.path.join(td, "arc.*")))
+            got = [f for f in got if os.path.getsize(f) > 0]
+            if not got:
+                why = (r.stderr or r.stdout or "").strip().splitlines()
+                return ("failed", None,
+                        f"could not fetch that upload's audio: {why[-1] if why else 'no reason given'}",
+                        None)
+            out = ls_sync.sync(src, got[0], dur)
+    except subprocess.TimeoutExpired:
+        return ("failed", None, f"fetching that upload took longer than {timeout}s", None)
+    except OSError as e:
+        return ("failed", None, f"could not work on that upload: {e.strerror or e}", None)
+
+    out["url"] = url
+    logger.info("vodsync %s: delta %s z %s", url,
+                out.get("delta_s"), out.get("z"))
+    return ("done", None, None, out)
+
+
 HANDLERS = {"fetch": do_fetch, "promote": do_promote, "purge": do_purge,
             "rescan": do_rescan, "harvest": do_harvest,
             "music_probe": do_music_probe, "music_fetch": do_music_fetch,
             "clip": do_clip, "audit": do_audit, "probe": do_probe,
-            "chat_repair": do_chat_repair, "pull": do_pull}
+            "chat_repair": do_chat_repair, "pull": do_pull,
+            "vodsync": do_vodsync}
 
 _stop = False
 
