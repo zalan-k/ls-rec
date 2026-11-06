@@ -3498,6 +3498,23 @@ def run(config: dict, *, kinds, once: bool = False, interval: int | None = None)
     done = 0
     logger.info(f"ls-jobs: {worker} polling for {','.join(kinds)}, holding each "
                 f"claim open up to {min(idle, 25)}s")
+    #  THE THREE LISTS, COMPARED OUT LOUD. A kind with a handler that is not
+    #  in `ls_archive.PI_KINDS` is filtered out of every claim this process
+    #  makes -- the job waits for ever and nothing says why, which is exactly
+    #  what `vodsync` did. Said here rather than raised: a recorder that
+    #  refused to start over a list it could simply tell you about would be
+    #  the worse of the two failures.
+    mute = sorted(set(HANDLERS) - set(ls_archive.PI_KINDS))
+    if mute:
+        logger.warning("ls-jobs: this recorder can do %s and will never ask for "
+                       "%s — add to ls_archive.PI_KINDS",
+                       ",".join(mute), "it" if len(mute) == 1 else "them")
+    #  And the other way: asked for and undoable is a claim that takes a job
+    #  this process will fail on arrival.
+    deaf = sorted(set(kinds) - set(HANDLERS))
+    if deaf:
+        logger.warning("ls-jobs: asking for %s with no handler for %s",
+                       ",".join(deaf), "it" if len(deaf) == 1 else "them")
     while not _stop:
         # Before claiming, not after: a spooled report is about a job whose
         # lease may be about to lapse, and saying it is finished is what stops

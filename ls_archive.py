@@ -1053,7 +1053,15 @@ PI_KINDS = ("fetch", "promote", "purge", "rescan", "harvest",
             # URL and nothing more; `chat_repair` cannot touch it, because
             # everything it does is relative to a capture already on the NAS.
             # This one starts from the id and writes the first copy.
-            "pull")
+            "pull",
+            # Where our recording sits inside somebody else's upload of it,
+            # measured from the sound. Twitch drops a broadcast after sixty
+            # days, and where there was no simulstream the only surviving copy
+            # is an archive channel's re-upload with an unknown amount trimmed
+            # off its head -- no filename of ours, no chat of its own, so the
+            # audio is the only witness the two files share. This machine's
+            # because it downloads, and because the master is on its mount.
+            "vodsync")
 
 JOB_TIMEOUT = 15     # longer than TIMEOUT: a claim writes, and may wait on a lock
 
