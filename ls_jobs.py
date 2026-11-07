@@ -791,10 +791,9 @@ def _tail(text: str, n: int = 300) -> str:
 # is to say so and name the way round it: download it yourself and upload it.
 _EXPLAIN = (
     (r"No video could be found in this tweet",
-     "there is no video on that post. If it is a picture you want, right-click "
-     "the image and copy the IMAGE address — a pbs.twimg.com link — and paste "
-     "that. If the post does have a video, X is stonewalling this recorder, and "
-     "saving the file yourself and uploading it is the way through."),
+     "there is no video on that post, and the embed endpoint listed no pictures "
+     "on it either — check the link points at the post the media is in, rather "
+     "than at a reply, a quoted post or a profile."),
     (r"NSFW tweet requires authentication|Requires authentication",
      "that post is behind a sign-in wall this recorder's cookies did not get "
      "past. Save the file yourself and upload it instead."),
@@ -1374,6 +1373,24 @@ def do_fetch(config: dict, job: dict):
                 if why:
                     return ("failed", None, why)
                 if not pic:
+                    #  WHICH SENTENCE, decided here rather than left to
+                    #  `_explain`. Two asks of the embed endpoint have already
+                    #  happened above, and it answers for an ordinary post and
+                    #  comes back empty for the NSFW, age-gated, protected and
+                    #  deleted ones -- see the block at the top of this
+                    #  section, which says so. So a document STILL thin is not
+                    #  "there is no video on that post", it is "this post is
+                    #  not visible from here", and saying the first was S36.
+                    if _is_x(host) and x_thin(xdoc):
+                        return ("failed", None,
+                                "this recorder cannot see that post. X serves "
+                                "nothing to a signed-out caller for one that is "
+                                "NSFW, age-restricted, protected or deleted, and "
+                                "the embed endpoint came back empty twice. If it "
+                                "is a picture you want, right-click it, copy the "
+                                "IMAGE address \u2014 a pbs.twimg.com link \u2014 "
+                                "and paste that: a direct media link is not "
+                                "behind the wall.")
                     return ("failed", None, _explain(said))
                 tmp = stem + _direct_ext(pic[0])
                 err = _direct_download(pic[0], tmp, max_bytes, timeout)
