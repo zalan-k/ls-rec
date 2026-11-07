@@ -3184,10 +3184,23 @@ def do_chat_repair(config: dict, job: dict):
     # A repair that came back empty-handed is a FAILED job, not a quiet one:
     # somebody clicked a button and is owed an answer either way, and "the
     # replay chat is not ready yet" is a thing they can act on by waiting.
-    # The no-op — nothing was short any more — is a success, because the
-    # entry is in the state they asked for.
-    if not out["ran"] and out.get("why") and "no longer short" not in out["why"]:
-        return ("failed", None, out["why"], None)
+    #
+    # ON THE WORK DONE, not on the sentence. This used to read the `why` for
+    # the words "no longer short" and call that one a success — which it is,
+    # when something was merged. The road that reaches it having fetched
+    # nothing AND merged nothing reaches it too, and on an already-merged
+    # entry that was every single repair asked for from the audit's own
+    # question: #796 finished clean having done nothing at all. A `done` job
+    # is only shown as done, so the reason never left the Pi.
+    #
+    # A repair that did not run fails, UNLESS it was an honest no-op that
+    # merged something anyway — `noop` is the field that tells those apart,
+    # because "there was nothing to do" and "the download did not come back"
+    # both arrive as `ran: False` with a sentence attached.
+    if not out["ran"] and (not out.get("noop") or not out["changed"]):
+        return ("failed", None,
+                out.get("why") or "the repair did nothing and said nothing",
+                None)
     return ("done", None, None,
             {"idx": idx, "platform": platform, "action": action,
              "ran": out["ran"], "merged": out["changed"], "why": out.get("why")})

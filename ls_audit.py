@@ -4945,7 +4945,30 @@ def repair(config: dict, index: int, platform: str,
                       f"VOD {fixed}.")
                 tw_id = fixed
         short = _tw_chat_shortfall(config, cache, nas, tw_id, index)
-    if not short and force:
+
+    #  THE SHORTFALL CHECKS CANNOT SEE AN ALREADY-MERGED ENTRY, and a repair
+    #  that trusts them on one is a button that reports success and does
+    #  nothing. Both checks open on `nas[<p>_chat]` — the raw capture on the
+    #  NAS ROOT — and the merge moves the raws it consumed to deep storage. So
+    #  on every entry that has been merged once, the raw is not where either
+    #  check looks, both answer "nothing is short", and the repair declines a
+    #  chat that is as short as it ever was.
+    #
+    #  That is the same blind spot `force` was written for and documented with
+    #  #778, except `force` only arrives from the panel's own Fetch button.
+    #  ANSWERING THE AUDIT'S OWN QUESTION sends none, so the one road the
+    #  audit itself offers was the one road this was broken on. Entry #796:
+    #  6h of a 12h Twitch chat, a repair asked for and granted, and a job that
+    #  finished clean having fetched nothing.
+    #
+    #  Narrow on purpose: only when there is no raw to measure AND something
+    #  says this platform's chat was once here. A raw that IS on the root and
+    #  reads healthy still means "no longer short", which is the truth.
+    pre = "yt" if platform == "youtube" else "tw"
+    folded = (not nas.get(f"{pre}_chat")
+              and bool(nas.get(f"{pre}_chats_archived")
+                       or (nas.get("merged_chat") and nas.get(f"{pre}_video"))))
+    if not short and (force or folded):
         #  A PERSON PRESSED THE BUTTON. The shortfall checks decide whether the
         #  audit should ASK about a chat; they were never fit to decide whether
         #  somebody may fetch one. `_yt_chat_shortfall`'s only measurement is
@@ -4956,7 +4979,6 @@ def repair(config: dict, index: int, platform: str,
         #
         #  Entry #778: 1h32m of waiting room sitting in the replay, a Fetch
         #  that returned `ran: False`, and nothing on screen saying so.
-        pre = "yt" if platform == "youtube" else "tw"
         vid = yt_id if platform == "youtube" else tw_id
         #  THE ID, WHEREVER IT STILL IS. `yt_id` above is read from the live
         #  chat file's name, and once that raw has been folded into a merged
@@ -4988,10 +5010,24 @@ def repair(config: dict, index: int, platform: str,
     if not short:
         # Not a failure. The entry is in the state the asker wanted it in, and
         # the merge below may still have something to do.
+        #
+        # WHICH no-op, because they are not the same news and the caller is
+        # what tells somebody. A raw on the root that reads healthy is the
+        # answer the asker wanted; no raw and nothing saying there ever was
+        # one is this road admitting it has nothing to work relative to, and
+        # `pull` is the errand for that.
         done = finish(config, index, cache=cache)
-        return {"ran": False, "changed": done["changed"],
-                "deferred": done["deferred"],
-                "why": f"the {platform} chat is no longer short"}
+        why = (f"the {platform} chat is no longer short"
+               if nas.get(f"{pre}_chat")
+               else f"there is no {platform} chat here to repair "
+                    "— nothing on the NAS and nothing in deep storage")
+        #  `noop` is the honest no-run, told apart from the failed one by a
+        #  FIELD and not by reading the sentence. The worker has to decide
+        #  whether somebody is owed a failure, and "there was nothing to do"
+        #  and "the download did not come back" are opposite answers that both
+        #  arrive as `ran: False` with a `why`.
+        return {"ran": False, "noop": True, "changed": done["changed"],
+                "deferred": done["deferred"], "why": why}
 
     #  The entry number travels with the item. A backfill that has no capture
     #  to sit beside — the raw folded in and archived — has nothing else to
@@ -5005,9 +5041,19 @@ def repair(config: dict, index: int, platform: str,
     # pull re-merges to the full thing — and a YouTube one that failed will
     # block it there, which is `_pipeline`'s call and not this function's.
     done = finish(config, index, cache=cache)
+    #  A FETCH THAT LANDED AND THEN MERGED NOTHING still owes an answer. The
+    #  merge has several reasons to decline — a source with no derivable zero,
+    #  a merged file whose header will not parse — and each of them says so to
+    #  this machine's log and to nobody else, so the capture sits on the NAS
+    #  while the entry reports the chat it had before.
+    why = None
+    if not ok:
+        why = f"the {platform} repair did not come back"
+    elif not done["changed"]:
+        why = (f"the {platform} chat was fetched but the merge did not run "
+               "— see this recorder's log for which step declined")
     return {"ran": ok, "changed": done["changed"],
-            "deferred": done["deferred"],
-            "why": None if ok else f"the {platform} repair did not come back"}
+            "deferred": done["deferred"], "why": why}
 
 
 def give_up_chat(index: int, platform: str) -> dict:
