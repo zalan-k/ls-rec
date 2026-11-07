@@ -3275,8 +3275,11 @@ def do_vodsync(config: dict, job: dict):
     """
     pay = job.get("payload") or {}
     url = str(pay.get("url") or "").strip()
-    if not url:
-        return ("failed", None, "a sync needs the upload's url", None)
+    other = str(pay.get("other_path") or "").strip()
+    if not url and not other:
+        return ("failed", None,
+                "a sync needs an upload's url, or a second recording to measure "
+                "against", None)
 
     src = resolve_name(media_root(config), pay.get("path"))
     if not src:
@@ -3294,6 +3297,30 @@ def do_vodsync(config: dict, job: dict):
         import ls_sync
     except Exception as e:                                   # pragma: no cover
         return ("failed", None, f"this recorder cannot measure audio yet: {e}", None)
+
+    #  ── BOTH SIDES ALREADY HERE ──────────────────────────────────────────
+    #  Two of OUR recordings of one broadcast, which is the same measurement
+    #  with nothing to fetch. The case: the two platforms' clocks disagree, so
+    #  a moment in one file is not the same moment in the other, and every
+    #  timestamp carried between them is out by that much.
+    #
+    #  NOTHING IS DOWNLOADED AND NOTHING IS WRITTEN. The product is a number
+    #  and the archive decides what to do with it -- which for a clock is not
+    #  this worker's call, because the correction lands on a row somebody has
+    #  to be able to refuse.
+    if other:
+        dst = resolve_name(media_root(config), other)
+        if not dst:
+            return ("failed", None,
+                    "the archive named a second file this worker will not touch", None)
+        if not os.path.isfile(dst):
+            return ("failed", None,
+                    "that second recording is not on this recorder's mount", None)
+        out = ls_sync.sync(src, dst, dur)
+        out["other_path"] = other
+        logger.info("vodsync %s vs %s: delta %s z %s", pay.get("path"), other,
+                    out.get("delta_s"), out.get("z"))
+        return ("done", None, None, out)
 
     #  NOT /tmp. On a Pi that is often RAM, and this writes a couple of
     #  hundred megabytes. The quarantine volume is the one place this worker
