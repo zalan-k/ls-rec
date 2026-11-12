@@ -303,6 +303,8 @@ def ytdlp_live_cmd(config: dict, url: str, platform: str, output_template: str,
         ]
         if from_start:
             extra = ["--live-from-start"] + extra
+            if config.get("yt_refresh_plugin"):
+                extra += ["--plugin-dirs", os.path.join(SCRIPT_DIR, "ytdlp_plugins")]
     
     else:  # twitch
         fmt = "best"

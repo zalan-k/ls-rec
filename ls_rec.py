@@ -1521,7 +1521,8 @@ class LivestreamRecorder:
                             f"Part {part_num:02d} rc=0 instantly and its merged "
                             f"file is already on disk — a restart cannot add "
                             f"to it. Completing: {title}")
-                        self._handle_completion(stream_key)
+                        if not self._abandon_video(stream_key, title):
+                            self._handle_completion(stream_key)
                         return
                     # Pathological: rc=0 within seconds while still live = the
                     # 642 "already downloaded" loop. Charge the budget and back
@@ -1529,7 +1530,8 @@ class LivestreamRecorder:
                     stream["_restart_count"] = stream.get("_restart_count", 0) + 1
                     if stream["_restart_count"] >= RESTART_MAX:
                         logger.error(f"Part {part_num:02d} rc=0 instant-looping {RESTART_MAX}x; stopping: {title}")
-                        self._handle_completion(stream_key)
+                        if not self._abandon_video(stream_key, title):
+                            self._handle_completion(stream_key)
                         return
                     logger.warning(f"Part {part_num:02d} rc=0 after {elapsed:.0f}s, still live; backoff {stream['_restart_count']}/{RESTART_MAX}: {title}")
                     time.sleep(RESTART_DELAY_S)
@@ -1615,16 +1617,8 @@ class LivestreamRecorder:
             # could not get video threw away a whole stream's chat three
             # minutes in. Video and chat fail independently; let chat run on
             # and finish the capture when the broadcast actually ends.
-            chat = stream.get("chat_thread")
-            if chat and chat.is_alive() and self._source_still_live(stream):
-                logger.warning(
-                    f"Video abandoned but {title} is still live; chat keeps "
-                    f"recording until the stream ends")
-                stream["_video_abandoned"] = True
-                threading.Thread(target=self._wait_chat_then_complete,
-                                 args=(stream_key,), daemon=True).start()
-                return
-            self._handle_completion(stream_key)
+            if not self._abandon_video(stream_key, title):
+                self._handle_completion(stream_key)
             return
 
         stream["_restart_count"] = restart_count + 1
@@ -2617,6 +2611,17 @@ class LivestreamRecorder:
     # see the broadcast end by itself, so liveness is what ends this, and the
     # cap is only a backstop against a probe that never gives a clear answer.
     ABANDONED_MAX_S = 12 * 3600
+
+    def _abandon_video(self, stream_key: str, title: str) -> bool:
+        stream = self.active_streams.get(stream_key)
+        chat = stream and stream.get("chat_thread")
+        if not (chat and chat.is_alive() and self._source_still_live(stream)):
+            return False
+        logger.warning(f"Video abandoned but {title} is still live; chat keeps "
+                       f"recording until the stream ends")
+        threading.Thread(target=self._wait_chat_then_complete,
+                         args=(stream_key,), daemon=True).start()
+        return True
 
     def _wait_chat_then_complete(self, stream_key: str):
         """
